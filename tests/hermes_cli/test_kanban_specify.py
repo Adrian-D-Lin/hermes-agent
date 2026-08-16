@@ -19,6 +19,12 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_specify as spec
 
 
+def _orchestrator_authority():
+    return kb._scoped_mutation_authority(
+        kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+    )
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -77,7 +83,7 @@ def test_specify_task_happy_path(kanban_home):
         "body": "**Goal**\nA concrete goal.",
     })
     p, _ = _patch_aux_client(content)
-    with p:
+    with p, _orchestrator_authority():
         outcome = spec.specify_task(tid, author="ace")
 
     assert outcome.ok is True
@@ -111,7 +117,7 @@ def _run_cli(*argv: str) -> int:
 
 
 
-def test_cli_specify_tenant_filter(kanban_home, capsys):
+def test_cli_specify_does_not_bypass_triage_authority(kanban_home, capsys):
     with kb.connect() as conn:
         outside = kb.create_task(conn, title="outside", triage=True)
         inside = kb.create_task(
@@ -122,19 +128,26 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
     p, _ = _patch_aux_client(content)
     with p:
         rc = _run_cli("specify", "--all", "--tenant", "proj-a", "--json")
-    assert rc == 0
+    assert rc == 1
     lines = [
         jsonlib.loads(l)
         for l in capsys.readouterr().out.strip().splitlines()
         if l
     ]
-    ids = {row["task_id"] for row in lines}
-    assert ids == {inside}
+    assert lines == [{
+        "task_id": inside,
+        "ok": False,
+        "reason": (
+            "triage acceptance requires the authenticated dashboard or "
+            "dispatcher orchestrator"
+        ),
+        "new_title": None,
+    }]
 
     # The outside task stays in triage.
     with kb.connect() as conn:
         assert kb.get_task(conn, outside).status == "triage"
-        # The inside task was promoted.
-        assert kb.get_task(conn, inside).status in {"todo", "ready"}
+        # Ordinary CLI use cannot promote a triage task.
+        assert kb.get_task(conn, inside).status == "triage"
 
 

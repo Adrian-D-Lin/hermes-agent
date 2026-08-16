@@ -17,6 +17,12 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
 
 
+def _orchestrator_authority():
+    return kb._scoped_mutation_authority(
+        kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+    )
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -92,7 +98,11 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body():
+        with (
+            _patch_aux_client(llm_payload),
+            _patch_extra_body(),
+            _orchestrator_authority(),
+        ):
             outcome = decomp.decompose_task(tid, author="me")
     finally:
         for p in patches:
@@ -129,9 +139,14 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
-            "hermes_cli.kanban_decompose._load_config",
-            return_value={"kanban": {"default_assignee": "fallback"}},
+        with (
+            _patch_aux_client(llm_payload),
+            _patch_extra_body(),
+            patch(
+                "hermes_cli.kanban_decompose._load_config",
+                return_value={"kanban": {"default_assignee": "fallback"}},
+            ),
+            _orchestrator_authority(),
         ):
             outcome = decomp.decompose_task(tid, author="me")
     finally:
@@ -147,13 +162,16 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x")  # ready, not triage
+        with _orchestrator_authority():
+            tid = kb.create_task(conn, title="x", assignee="orchestrator")
+        assert kb.get_task(conn, tid).status == "ready"
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:
         p.start()
     try:
-        outcome = decomp.decompose_task(tid, author="me")
+        with _orchestrator_authority():
+            outcome = decomp.decompose_task(tid, author="me")
     finally:
         for p in patches:
             p.stop()
