@@ -102,6 +102,48 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Creation and discretionary triage-exit authority is deliberately separate
+# from ``created_by`` / ``author``.  Those are audit labels supplied by callers;
+# they must never become authorization inputs.  The default is fail-closed so
+# CLI, cron, webhook, script, and direct first-party imports create proposals.
+_MUTATION_AUTHORITY_UNTRUSTED = "untrusted"
+_MUTATION_AUTHORITY_HUMAN_DASHBOARD = "human_dashboard"
+_MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR = "dispatcher_orchestrator"
+_TRIAGE_EXIT_AUTHORITIES = frozenset({
+    _MUTATION_AUTHORITY_HUMAN_DASHBOARD,
+    _MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR,
+})
+_MUTATION_AUTHORITY: ContextVar[str] = ContextVar(
+    "kanban_mutation_authority", default=_MUTATION_AUTHORITY_UNTRUSTED
+)
+
+
+@contextlib.contextmanager
+def _scoped_mutation_authority(authority: str):
+    """Temporarily establish authority from an already-verified internal boundary.
+
+    This private helper is intentionally not part of the public Kanban domain
+    API. Dashboard and dispatcher adapters establish it only after their own
+    verified boundary checks; ordinary persistence callers remain untrusted.
+    """
+    if authority not in _TRIAGE_EXIT_AUTHORITIES:
+        raise ValueError(f"unknown Kanban mutation authority: {authority!r}")
+    token = _MUTATION_AUTHORITY.set(authority)
+    try:
+        yield
+    finally:
+        _MUTATION_AUTHORITY.reset(token)
+
+
+def _mutation_authority() -> str:
+    """Return the current execution-scoped authority (untrusted by default)."""
+    return _MUTATION_AUTHORITY.get()
+
+
+def can_exit_triage() -> bool:
+    """True only for the dashboard or dispatcher-established orchestrator."""
+    return _mutation_authority() in _TRIAGE_EXIT_AUTHORITIES
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -3393,20 +3435,14 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+    # The creation policy applies before the idempotency fast path. An
+    # untrusted duplicate may reuse an existing triage proposal, but it must
+    # never resolve to a legacy or trusted runnable task with the same key.
+    # This depends on authority, not on the requested ``triage`` flag: an
+    # untrusted caller can supply ``triage=True`` but remains untrusted.
+    untrusted_caller = not can_exit_triage()
+    forced_to_triage = untrusted_caller and not triage
+    effective_triage = bool(triage) or untrusted_caller
 
     now = int(time.time())
 
@@ -3438,17 +3474,36 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
-                # Determine task status from parent status, unless the caller
-                # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
-                if initial_status == "blocked":
+                # This lookup shares the writer transaction with the insert.
+                # A pre-transaction lookup races a concurrent trusted creator
+                # using the same key and could let an untrusted proposal bypass
+                # the non-triage collision guard.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id, status FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        if untrusted_caller and row["status"] != "triage":
+                            raise ValueError(
+                                "untrusted idempotency key resolves to a non-triage task; "
+                                "use a distinct key to submit a proposal"
+                            )
+                        return row["id"]
+
+                # Untrusted creation is always a triage proposal. Trusted
+                # callers retain the existing blocked/triage/parent-gated
+                # creation choices.
+                if effective_triage:
+                    task_status = "triage"
+                elif initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
-                    task_status = "triage"
                 else:
                     task_status = "ready"
                     if parents:
@@ -3465,7 +3520,7 @@ def create_task(
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
-                if triage and parents:
+                if effective_triage and parents:
                     missing = _find_missing_parents(conn, parents)
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
@@ -3552,6 +3607,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "creation_policy": "forced_triage" if forced_to_triage else None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -7130,6 +7186,8 @@ def specify_triage_task(
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
     """
+    if not can_exit_triage():
+        return False
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
@@ -7231,6 +7289,8 @@ def decompose_triage_task(
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
     """
+    if not can_exit_triage():
+        return None
     if not children:
         return None
     if root_assignee is not None:
@@ -7431,6 +7491,15 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        # A triage proposal remains visible for dashboard/default assessment.
+        # An untrusted submitter cannot discard it as an alternate egress path.
+        if row["status"] == "triage" and not can_exit_triage():
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7492,6 +7561,15 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        # Match archive_task: an untrusted caller cannot erase a triage
+        # proposal instead of submitting it for dashboard/default assessment.
+        if row["status"] == "triage" and not can_exit_triage():
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

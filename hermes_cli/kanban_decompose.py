@@ -281,6 +281,11 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
+    if not kb.can_exit_triage():
+        return DecomposeOutcome(
+            task_id, False,
+            "triage acceptance requires the authenticated dashboard or dispatcher orchestrator",
+        )
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
     if task is None:

@@ -152,6 +152,11 @@ def specify_task(
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
+    if not kb.can_exit_triage():
+        return SpecifyOutcome(
+            task_id, False,
+            "triage acceptance requires the authenticated dashboard or dispatcher orchestrator",
+        )
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
     if task is None:

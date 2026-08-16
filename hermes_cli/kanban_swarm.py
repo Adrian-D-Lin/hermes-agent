@@ -143,6 +143,10 @@ def create_swarm(
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
+    if not kb.can_exit_triage():
+        raise PermissionError(
+            "swarm graph creation requires the authenticated dashboard or dispatcher orchestrator"
+        )
     activation_summary = (
         "Swarm topology planned; root remains the shared blackboard."
     )

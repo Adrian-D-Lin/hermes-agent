@@ -9,6 +9,14 @@ from hermes_cli.kanban_swarm import (
 )
 
 
+@pytest.fixture(autouse=True)
+def orchestrator_authority():
+    with kb._scoped_mutation_authority(
+        kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+    ):
+        yield
+
+
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:
