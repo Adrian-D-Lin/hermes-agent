@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import contextlib
+import time
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -131,13 +133,83 @@ def _check_kanban_orchestrator_mode() -> bool:
     if _is_delegated_child_context():
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
-        return False
+        return _is_dispatcher_orchestrator()
     return _profile_has_kanban_toolset()
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def _configured_orchestrator_profile() -> str:
+    try:
+        cfg = load_config() or {}
+        value = ((cfg.get("kanban") or {}).get("orchestrator_profile") or "").strip()
+        return value or "default"
+    except Exception:
+        return "default"
+
+
+def _is_dispatcher_orchestrator() -> bool:
+    """True only for the live dispatcher claim of the configured orchestrator.
+
+    ``HERMES_PROFILE`` is audit/session state and deliberately not an authority
+    input.  The task's persisted assignee, active run, and claim token must all
+    match the dispatcher-owned worker context.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if (
+        not task_id
+        or not raw_run_id
+        or not claim_lock
+        or _is_delegated_child_context()
+        or not _is_dispatcher_owned_worker()
+    ):
+        return False
+    try:
+        run_id = int(raw_run_id)
+        from hermes_cli.profiles import normalize_profile_name
+
+        kb, conn = _connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
+        try:
+            task = kb.get_task(conn, task_id)
+            run = conn.execute(
+                "SELECT task_id, status, claim_lock, claim_expires "
+                "FROM task_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if (
+            task is None
+            or not task.assignee
+            or task.status != "running"
+            or task.current_run_id != run_id
+            or task.claim_lock != claim_lock
+            or task.claim_expires is None
+            or task.claim_expires < int(time.time())
+            or run is None
+            or run["task_id"] != task_id
+            or run["status"] != "running"
+            or run["claim_lock"] != claim_lock
+            or run["claim_expires"] != task.claim_expires
+        ):
+            return False
+        return normalize_profile_name(task.assignee) == normalize_profile_name(
+            _configured_orchestrator_profile()
+        )
+    except (TypeError, ValueError):
+        return False
+    except Exception:
+        logger.debug("could not verify dispatcher orchestrator claim", exc_info=True)
+        return False
+
+
+def _check_dispatcher_orchestrator_mode() -> bool:
+    """Expose triage-acceptance tools only to the verified dispatcher lane."""
+    return _is_dispatcher_orchestrator()
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
@@ -465,19 +537,22 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
 
 
 def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
-    """Belt-and-suspenders runtime guard for orchestrator-only handlers.
-
-    The check_fn (`_check_kanban_orchestrator_mode`) keeps these tools
-    out of the worker schema entirely, but in case a stale registration
-    or test harness routes a worker to one of them anyway, return a
-    structured tool_error so the model gets a clear refusal instead of
-    silently mutating board state from a worker context.
-    """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    """Belt-and-suspenders runtime guard for existing orchestrator-only tools."""
+    if os.environ.get("HERMES_KANBAN_TASK") and not _is_dispatcher_orchestrator():
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
             "kanban_comment for their assigned task."
+        )
+    return None
+
+
+def _require_dispatcher_orchestrator(tool_name: str) -> Optional[str]:
+    """Require the verified dispatcher/default proposal-acceptance lane."""
+    if not _is_dispatcher_orchestrator():
+        return tool_error(
+            f"{tool_name} requires the dispatcher-owned configured Kanban "
+            "orchestrator task; use the authenticated dashboard to accept a proposal."
         )
     return None
 
@@ -1433,35 +1508,42 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
-            new_tid = kb.create_task(
-                conn,
-                title=str(title).strip(),
-                body=body,
-                assignee=str(assignee),
-                parents=tuple(parents),
-                tenant=tenant,
-                priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
-                workspace_path=workspace_path,
-                project_id=project_id,
-                project_source_task_id=project_source_task_id,
-                triage=triage,
-                idempotency_key=idempotency_key,
-                max_runtime_seconds=(
-                    int(max_runtime_seconds)
-                    if max_runtime_seconds is not None else None
-                ),
-                skills=skills,
-                model_override=model_override,
-                provider_override=provider_override,
-                goal_mode=goal_mode,
-                goal_max_turns=(
-                    int(goal_max_turns) if goal_max_turns is not None else None
-                ),
-                initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
-                session_id=session_id,
+            authority = (
+                kb._scoped_mutation_authority(
+                    kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+                )
+                if _is_dispatcher_orchestrator() else contextlib.nullcontext()
             )
+            with authority:
+                new_tid = kb.create_task(
+                    conn,
+                    title=str(title).strip(),
+                    body=body,
+                    assignee=str(assignee),
+                    parents=tuple(parents),
+                    tenant=tenant,
+                    priority=int(priority) if priority is not None else 0,
+                    workspace_kind=str(workspace_kind),
+                    workspace_path=workspace_path,
+                    project_id=project_id,
+                    project_source_task_id=project_source_task_id,
+                    triage=triage,
+                    idempotency_key=idempotency_key,
+                    max_runtime_seconds=(
+                        int(max_runtime_seconds)
+                        if max_runtime_seconds is not None else None
+                    ),
+                    skills=skills,
+                    model_override=model_override,
+                    provider_override=provider_override,
+                    goal_mode=goal_mode,
+                    goal_max_turns=(
+                        int(goal_max_turns) if goal_max_turns is not None else None
+                    ),
+                    initial_status=str(initial_status),
+                    created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                    session_id=session_id,
+                )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1660,6 +1742,70 @@ def _handle_link(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_link failed")
         return tool_error(f"kanban_link: {e}")
+
+
+def _handle_specify(args: dict, **kw) -> str:
+    """Accept and specify a triage proposal (configured dispatcher orchestrator only)."""
+    guard = _require_dispatcher_orchestrator("kanban_specify")
+    if guard:
+        return guard
+    task_id = args.get("task_id")
+    if not task_id:
+        return tool_error("task_id is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        conn.close()
+        from hermes_cli import kanban_specify
+        with kb.scoped_current_board(board or kb.get_current_board()):
+            with kb._scoped_mutation_authority(
+                kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+            ):
+                outcome = kanban_specify.specify_task(
+                    str(task_id), author=os.environ.get("HERMES_PROFILE") or "default"
+                )
+        return _ok(
+            task_id=outcome.task_id,
+            specified=bool(outcome.ok),
+            reason=outcome.reason,
+            new_title=outcome.new_title,
+        )
+    except Exception as e:
+        logger.exception("kanban_specify failed")
+        return tool_error(f"kanban_specify: {e}")
+
+
+def _handle_decompose(args: dict, **kw) -> str:
+    """Accept and fan out a triage proposal (configured dispatcher orchestrator only)."""
+    guard = _require_dispatcher_orchestrator("kanban_decompose")
+    if guard:
+        return guard
+    task_id = args.get("task_id")
+    if not task_id:
+        return tool_error("task_id is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        conn.close()
+        from hermes_cli import kanban_decompose
+        with kb.scoped_current_board(board or kb.get_current_board()):
+            with kb._scoped_mutation_authority(
+                kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+            ):
+                outcome = kanban_decompose.decompose_task(
+                    str(task_id), author=os.environ.get("HERMES_PROFILE") or "default"
+                )
+        return _ok(
+            task_id=outcome.task_id,
+            decomposed=bool(outcome.ok),
+            reason=outcome.reason,
+            fanout=bool(outcome.fanout),
+            child_ids=outcome.child_ids or [],
+            new_title=outcome.new_title,
+        )
+    except Exception as e:
+        logger.exception("kanban_decompose failed")
+        return tool_error(f"kanban_decompose: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -2326,6 +2472,39 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SPECIFY_SCHEMA = {
+    "name": "kanban_specify",
+    "description": (
+        "Accept a triage proposal by fleshing it out with the configured "
+        "specifier and releasing it into ordinary scheduling. Orchestrator-only; "
+        "this does not authorize any filesystem or Write-Gate exception."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Triage task id to accept."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
+KANBAN_DECOMPOSE_SCHEMA = {
+    "name": "kanban_decompose",
+    "description": (
+        "Accept a triage proposal and fan it out into dependency-gated work. "
+        "Orchestrator-only; this does not authorize any filesystem or Write-Gate exception."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Triage task id to accept and decompose."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -2464,6 +2643,24 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_specify",
+    toolset="kanban",
+    schema=KANBAN_SPECIFY_SCHEMA,
+    handler=_handle_specify,
+    check_fn=_check_dispatcher_orchestrator_mode,
+    emoji="📝",
+)
+
+registry.register(
+    name="kanban_decompose",
+    toolset="kanban",
+    schema=KANBAN_DECOMPOSE_SCHEMA,
+    handler=_handle_decompose,
+    check_fn=_check_dispatcher_orchestrator_mode,
+    emoji="🧩",
 )
 
 registry.register(

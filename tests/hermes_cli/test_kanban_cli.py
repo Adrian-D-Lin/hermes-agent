@@ -57,6 +57,62 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_cli_swarm_rejects_blank_goal(kanban_home, capsys):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args([
+        "kanban", "swarm", "   ", "--worker", "researcher:scan:find facts",
+        "--verifier", "reviewer", "--synthesizer", "writer",
+    ])
+    assert kc.kanban_command(args) == 2
+    assert "goal must not be blank" in capsys.readouterr().err
+
+
+def test_cli_swarm_creates_one_triage_proposal_and_namespaces_idempotency(kanban_home, capsys):
+    """Untrusted CLI swarm submission is a proposal, never a runnable graph."""
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    argv = [
+        "kanban", "swarm", "research market", "--worker",
+        "researcher:scan:find facts", "--verifier", "reviewer",
+        "--synthesizer", "writer", "--idempotency-key", "collision",
+    ]
+
+    # A legacy runnable task using the caller key must not be reused.
+    with kb.connect() as conn:
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            kb.create_task(
+                conn, title="legacy", assignee="default", idempotency_key="collision"
+            )
+
+    assert kc.kanban_command(parser.parse_args(argv)) == 0
+    capsys.readouterr()
+    with kb.connect() as conn:
+        proposals = conn.execute(
+            "SELECT id, status, idempotency_key FROM tasks "
+            "WHERE idempotency_key = ?",
+            ("swarm-proposal:collision",),
+        ).fetchall()
+    assert len(proposals) == 1
+    assert proposals[0]["status"] == "triage"
+    proposal_id = proposals[0]["id"]
+
+    assert kc.kanban_command(parser.parse_args(argv)) == 0
+    capsys.readouterr()
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ?",
+            ("swarm-proposal:collision",),
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["id"] == proposal_id
+    assert rows[0]["status"] == "triage"
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

@@ -404,7 +404,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
-        help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)",
+        help="Submit one triage proposal for a Kanban Swarm v1 graph",
     )
     p_swarm.add_argument("goal", help="Swarm goal / final outcome")
     p_swarm.add_argument(
@@ -1588,6 +1588,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:
+    if not (args.goal or "").strip():
+        print("kanban swarm: goal must not be blank", file=sys.stderr)
+        return 2
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
     except ValueError as exc:
@@ -1596,25 +1599,63 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
+    proposal = {
+        "goal": args.goal,
+        "workers": [
+            {
+                "profile": worker.profile,
+                "title": worker.title,
+                "body": worker.body,
+                "skills": worker.skills,
+                "priority": worker.priority,
+                "max_runtime_seconds": worker.max_runtime_seconds,
+            }
+            for worker in workers
+        ],
+        "verifier_assignee": args.verifier,
+        "synthesizer_assignee": args.synthesizer,
+        "priority": args.priority,
+        "tenant": args.tenant,
+    }
+    author = args.created_by or _profile_author()
+    raw_idempotency_key = getattr(args, "idempotency_key", None)
+    proposal_idempotency_key = (
+        f"swarm-proposal:{raw_idempotency_key}"
+        if raw_idempotency_key
+        else None
+    )
     with kb.connect_closing() as conn:
-        created = ks.create_swarm(
+        proposal_id = kb.create_task(
             conn,
-            goal=args.goal,
-            workers=workers,
-            verifier_assignee=args.verifier,
-            synthesizer_assignee=args.synthesizer,
+            title=f"Swarm proposal: {args.goal.splitlines()[0][:80]}",
+            body=(
+                "Untrusted swarm submission. The authenticated dashboard or "
+                "dispatcher orchestrator must accept and decompose this proposal.\n\n"
+                "```json\n" + json.dumps(proposal, ensure_ascii=False, indent=2) + "\n```"
+            ),
+            assignee=author,
+            created_by=author,
             tenant=args.tenant,
-            created_by=args.created_by or _profile_author(),
             priority=args.priority,
-            idempotency_key=getattr(args, "idempotency_key", None),
+            triage=True,
+            idempotency_key=proposal_idempotency_key,
         )
+        task = kb.get_task(conn, proposal_id)
+    if (
+        task is None
+        or task.status != "triage"
+        or not (task.title or "").startswith("Swarm proposal:")
+        or task.idempotency_key != proposal_idempotency_key
+    ):
+        print(
+            "kanban swarm: proposal idempotency key resolved to an incompatible task",
+            file=sys.stderr,
+        )
+        return 1
     if getattr(args, "json", False):
-        print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
+        print(json.dumps({"proposal_id": proposal_id, "status": task.status if task else None}, indent=2, ensure_ascii=False))
     else:
-        print(f"Swarm root: {created.root_id}")
-        print("Workers: " + ", ".join(created.worker_ids))
-        print(f"Verifier: {created.verifier_id}")
-        print(f"Synthesizer: {created.synthesizer_id}")
+        print(f"Created swarm proposal {proposal_id} ({task.status if task else 'unknown'})")
     return 0
 
 

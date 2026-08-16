@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import sqlite3
@@ -54,6 +55,23 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _human_dashboard_route(handler):
+    """Mark an existing HTTP-authenticated dashboard mutation as human control.
+
+    Plugin routes are already behind the dashboard's canonical HTTP auth
+    middleware.  Keeping this wrapper here deliberately avoids a second auth
+    system while carrying that established authority into the shared domain
+    layer for the duration of a mutation.
+    """
+    @functools.wraps(handler)
+    def wrapped(*args, **kwargs):
+        with kanban_db._scoped_mutation_authority(
+            kanban_db._MUTATION_AUTHORITY_HUMAN_DASHBOARD
+        ):
+            return handler(*args, **kwargs)
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +639,7 @@ class CreateTaskBody(BaseModel):
 
 
 @router.post("/tasks")
+@_human_dashboard_route
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -867,6 +886,7 @@ def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
 
 
 @router.patch("/tasks/{task_id}")
+@_human_dashboard_route
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -1047,6 +1067,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 # ---------------------------------------------------------------------------
 
 @router.delete("/tasks/{task_id}")
+@_human_dashboard_route
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -1127,6 +1148,12 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if (
+            prev["status"] == "triage"
+            and new_status != "triage"
+            and not kanban_db.can_exit_triage()
+        ):
             return False
 
         if prev["status"] == "running" and new_status == "ready":
@@ -1301,6 +1328,7 @@ class BulkTaskBody(BaseModel):
 
 
 @router.post("/tasks/bulk")
+@_human_dashboard_route
 def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     """Apply the same patch to every id in ``payload.ids``.
 
@@ -1779,6 +1807,7 @@ class SpecifyBody(BaseModel):
 
 
 @router.post("/tasks/{task_id}/specify")
+@_human_dashboard_route
 def specify_task_endpoint(
     task_id: str,
     payload: SpecifyBody,
@@ -2706,6 +2735,7 @@ class DecomposeBody(BaseModel):
 
 
 @router.post("/tasks/{task_id}/decompose")
+@_human_dashboard_route
 def decompose_task_endpoint(
     task_id: str,
     payload: DecomposeBody,
@@ -2768,7 +2798,7 @@ def get_orchestration_settings():
     kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
     explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
     explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
-    auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
+    auto_decompose = bool(kanban_cfg.get("auto_decompose", False))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
 
     # Resolve fallbacks the same way the decomposer does.

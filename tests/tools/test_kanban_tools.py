@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,12 +62,59 @@ def worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        claimed = kb.claim_task(conn, tid, claimer="worker-test-claim")
+        assert claimed is not None
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "worker-test-claim")
     return tid
+
+
+def test_dispatcher_orchestrator_requires_live_matching_claim(monkeypatch, tmp_path):
+    """Profile/env labels alone cannot unlock proposal acceptance."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb.init_db()
+    with kb.connect() as conn:
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            default_task = kb.create_task(conn, title="default", assignee="default")
+            specialist_task = kb.create_task(conn, title="specialist", assignee="specialist")
+        default_claim = kb.claim_task(conn, default_task, claimer="default-claim")
+        specialist_claim = kb.claim_task(conn, specialist_task, claimer="specialist-claim")
+        assert default_claim is not None and specialist_claim is not None
+        default_row = kb.get_task(conn, default_task)
+        specialist_row = kb.get_task(conn, specialist_task)
+        assert default_row is not None and default_row.current_run_id is not None
+        assert specialist_row is not None and specialist_row.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", default_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(default_row.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "default-claim")
+    monkeypatch.setenv("HERMES_PROFILE", "specialist")
+    assert kt._is_dispatcher_orchestrator() is True
+
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "forged")
+    assert kt._is_dispatcher_orchestrator() is False
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", specialist_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(specialist_row.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "specialist-claim")
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    assert kt._is_dispatcher_orchestrator() is False
 
 
 def test_show_defaults_to_env_task_id(worker_env):
@@ -86,9 +134,12 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="alpha", assignee="factory", priority=5)
-        b = kb.create_task(conn, title="beta", assignee="reviewer")
-        c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other")
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            a = kb.create_task(conn, title="alpha", assignee="factory", priority=5)
+            b = kb.create_task(conn, title="beta", assignee="reviewer")
+            c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other")
     finally:
         conn.close()
 
@@ -179,10 +230,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        goal_task_id = kb.create_task(
-            conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
-        )
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            goal_task_id = kb.create_task(
+                conn, title="goal-mode-test", assignee="test-worker",
+                body="Must achieve X with verified evidence.", goal_mode=True
+            )
         kb.claim_task(conn, goal_task_id)
     finally:
         conn.close()
@@ -245,10 +299,13 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        goal_task_id = kb.create_task(
-            conn, title="goal-mode-block-test", assignee="test-worker",
-            body="Must achieve X.", goal_mode=True,
-        )
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            goal_task_id = kb.create_task(
+                conn, title="goal-mode-block-test", assignee="test-worker",
+                body="Must achieve X.", goal_mode=True,
+            )
         kb.claim_task(conn, goal_task_id)
     finally:
         conn.close()
@@ -405,7 +462,7 @@ def test_create_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["task_id"]
-    assert d["status"] == "todo"  # parent isn't done yet
+    assert d["status"] == "triage"  # specialist creation is a proposal
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -435,7 +492,10 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="blocked", assignee="worker")
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            tid = kb.create_task(conn, title="blocked", assignee="worker")
         kb.block_task(conn, tid, reason="waiting")
     finally:
         conn.close()
@@ -467,8 +527,11 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            parent = kb.create_task(conn, title="parent", assignee="worker")
+            child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
         conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
         conn.commit()
     finally:
@@ -531,11 +594,11 @@ def test_worker_lifecycle_through_tools(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.metadata == {"child_task": child_out["task_id"]}
-        # Child is todo (parent just finished, but recompute_ready may
-        # have promoted it — complete_task runs recompute internally).
+        # A specialist-created child is a triage proposal, not runnable work;
+        # completing its parent cannot promote it.
         child = kb.get_task(conn, child_out["task_id"])
-        assert child.status == "ready", (
-            f"child should be ready after parent done, got {child.status}"
+        assert child.status == "triage", (
+            f"specialist child should remain triage, got {child.status}"
         )
         # Comment is visible
         assert len(kb.list_comments(conn, worker_env)) == 1
@@ -668,7 +731,10 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="blocked sibling", assignee="peer")
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            other = kb.create_task(conn, title="blocked sibling", assignee="peer")
         kb.block_task(conn, other, reason="waiting")
     finally:
         conn.close()
@@ -703,9 +769,10 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="child to close out")
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
-        conn.commit()
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            tid = kb.create_task(conn, title="child to close out")
     finally:
         conn.close()
 
@@ -753,17 +820,23 @@ def multi_board_env(monkeypatch, tmp_path):
     # Default board — implicit
     conn = kb.connect()
     try:
-        seed_default = kb.create_task(
-            conn, title="seed-default", assignee="worker-d"
-        )
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            seed_default = kb.create_task(
+                conn, title="seed-default", assignee="worker-d"
+            )
     finally:
         conn.close()
     # Alt board — explicit slug routes the connection to a separate DB
     conn = kb.connect(board="alt")
     try:
-        seed_alt = kb.create_task(
-            conn, title="seed-alt", assignee="worker-a"
-        )
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            seed_alt = kb.create_task(
+                conn, title="seed-alt", assignee="worker-a"
+            )
     finally:
         conn.close()
     return {
@@ -793,6 +866,66 @@ def test_board_param_none_falls_back_to_env(worker_env):
     # 'alt' board path. Confirms the override path was not silently
     # forced.
     assert kb.kanban_db_path() == kb.kanban_db_path(board="default")
+
+
+def test_specify_omitted_board_preserves_active_board(monkeypatch, multi_board_env):
+    """Acceptance must not redirect an omitted board argument to default."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_specify
+    from tools import kanban_tools as kt
+
+    seen = []
+    monkeypatch.setattr(kt, "_require_dispatcher_orchestrator", lambda _name: None)
+    monkeypatch.setattr(
+        kanban_specify,
+        "specify_task",
+        lambda task_id, **_kw: (
+            seen.append(kb.get_current_board())
+            or SimpleNamespace(
+                task_id=task_id,
+                ok=True,
+                reason="specified",
+                new_title=None,
+            )
+        ),
+    )
+
+    with kb.scoped_current_board("alt"):
+        out = json.loads(kt._handle_specify({"task_id": multi_board_env["alt_seed"]}))
+
+    assert out["ok"] is True
+    assert seen == ["alt"]
+
+
+def test_decompose_omitted_board_preserves_active_board(monkeypatch, multi_board_env):
+    """Acceptance must not redirect an omitted board argument to default."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_decompose
+    from tools import kanban_tools as kt
+
+    seen = []
+    monkeypatch.setattr(kt, "_require_dispatcher_orchestrator", lambda _name: None)
+    monkeypatch.setattr(
+        kanban_decompose,
+        "decompose_task",
+        lambda task_id, **_kw: (
+            seen.append(kb.get_current_board())
+            or SimpleNamespace(
+                task_id=task_id,
+                ok=True,
+                reason="decomposed",
+                fanout=False,
+                child_ids=[],
+                new_title=None,
+            )
+        ),
+    )
+
+    with kb.scoped_current_board("alt"):
+        out = json.loads(kt._handle_decompose({"task_id": multi_board_env["alt_seed"]}))
+
+    assert out["ok"] is True
+    assert seen == ["alt"]
 
 
 # ---------------------------------------------------------------------------

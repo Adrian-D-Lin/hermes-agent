@@ -76,16 +76,19 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
         )
         conn.commit()
 
-        child_ids = kb.decompose_triage_task(
-            conn,
-            root,
-            root_assignee="orchestrator",
-            children=[
-                {"title": "spec it", "assignee": "alice", "parents": []},
-                {"title": "implement it", "assignee": "bob", "parents": [0]},
-            ],
-            author="decomposer",
-        )
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            child_ids = kb.decompose_triage_task(
+                conn,
+                root,
+                root_assignee="orchestrator",
+                children=[
+                    {"title": "spec it", "assignee": "alice", "parents": []},
+                    {"title": "implement it", "assignee": "bob", "parents": [0]},
+                ],
+                author="decomposer",
+            )
         assert child_ids is not None and len(child_ids) == 2
 
         for cid in child_ids:

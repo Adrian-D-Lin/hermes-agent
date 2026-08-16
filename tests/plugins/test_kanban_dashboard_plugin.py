@@ -62,8 +62,20 @@ def client(kanban_home):
 
 
 # ---------------------------------------------------------------------------
-# GET /board on an empty DB
+# GET /orchestration and GET /board on an empty DB
 # ---------------------------------------------------------------------------
+
+
+def test_orchestration_settings_default_to_manual_when_key_absent(client, monkeypatch):
+    """The dashboard must report the same default as the gateway resolver."""
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"kanban": {}})
+
+    response = client.get("/api/plugins/kanban/orchestration")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["auto_decompose"] is False
 
 
 def test_board_empty(client):
@@ -312,20 +324,26 @@ def test_reopening_parent_demotes_ready_child(client):
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kb.connect() as conn:
-        parent_id = kb.create_task(conn, title="parent", assignee="planner")
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            parent_id = kb.create_task(conn, title="parent", assignee="planner")
         assert kb.complete_task(conn, parent_id)
-        child_id = kb.create_task(
-            conn,
-            title="child in review",
-            assignee="reviewer",
-            parents=[parent_id],
-        )
-        grandchild_id = kb.create_task(
-            conn,
-            title="downstream",
-            assignee="writer",
-            parents=[child_id],
-        )
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            child_id = kb.create_task(
+                conn,
+                title="child in review",
+                assignee="reviewer",
+                parents=[parent_id],
+            )
+            grandchild_id = kb.create_task(
+                conn,
+                title="downstream",
+                assignee="writer",
+                parents=[child_id],
+            )
         implementation = kb.claim_task(conn, child_id)
         assert implementation is not None
         assert kb.request_review(
@@ -381,21 +399,30 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
 
 def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
     with kb.connect() as conn:
-        parent_id = kb.create_task(conn, title="root", assignee="planner")
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            parent_id = kb.create_task(conn, title="root", assignee="planner")
         assert kb.complete_task(conn, parent_id)
-        child_id = kb.create_task(
-            conn,
-            title="accepted child",
-            assignee="builder",
-            parents=[parent_id],
-        )
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            child_id = kb.create_task(
+                conn,
+                title="accepted child",
+                assignee="builder",
+                parents=[parent_id],
+            )
         assert kb.complete_task(conn, child_id)
-        grandchild_id = kb.create_task(
-            conn,
-            title="running grandchild",
-            assignee="writer",
-            parents=[child_id],
-        )
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            grandchild_id = kb.create_task(
+                conn,
+                title="running grandchild",
+                assignee="writer",
+                parents=[child_id],
+            )
         grandchild_run = kb.claim_task(conn, grandchild_id)
         assert grandchild_run is not None
 
@@ -430,7 +457,10 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="active review", assignee="reviewer")
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            task_id = kb.create_task(conn, title="active review", assignee="reviewer")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         assert kb.request_review(
@@ -862,8 +892,11 @@ def test_reassign_endpoint_switches_profile(client):
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="alice")
-        real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
+        with kb._scoped_mutation_authority(
+            kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+        ):
+            parent = kb.create_task(conn, title="parent", assignee="alice")
+            real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
         import pytest as _pytest
         with _pytest.raises(kb.HallucinatedCardsError):
             kb.complete_task(

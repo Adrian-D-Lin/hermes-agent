@@ -11,6 +11,12 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _orchestrator_authority():
+    return kb._scoped_mutation_authority(
+        kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+    )
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -42,13 +48,14 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         {"title": "build it", "body": "write code", "assignee": "engineer", "parents": [0]},
     ]
     with kb.connect() as conn:
-        child_ids = kb.decompose_triage_task(
-            conn,
-            tid,
-            root_assignee="orchestrator",
-            children=children,
-            author="decomposer",
-        )
+        with _orchestrator_authority():
+            child_ids = kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=children,
+                author="decomposer",
+            )
     assert child_ids is not None
     assert len(child_ids) == 2
 
@@ -71,13 +78,14 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
-        child_ids = kb.decompose_triage_task(
-            conn,
-            tid,
-            root_assignee="orch",
-            children=[{"title": "task A", "assignee": "researcher"}],
-            author="alice",
-        )
+        with _orchestrator_authority():
+            child_ids = kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=[{"title": "task A", "assignee": "researcher"}],
+                author="alice",
+            )
     assert child_ids is not None
 
     with kb.connect() as conn:
@@ -86,6 +94,18 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
 
     assert any("Decomposed into" in (c.body or "") for c in comments)
     assert any(ev.kind == "decomposed" for ev in events)
+
+
+def test_decompose_refuses_untrusted_caller(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        assert kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "task A", "assignee": "researcher"}],
+        ) is None
+        assert kb.get_task(conn, tid).status == "triage"
 
 
 
