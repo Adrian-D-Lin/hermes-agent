@@ -11,6 +11,7 @@ Covers ``writegate/enforcement.py`` and
 """
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -203,3 +204,62 @@ def test_pre_tool_call_unknown_kanban_name_still_requires_session_id(plugin):
     )
     assert block is not None
     assert block.get("action") == "block"
+
+
+def test_present_approval_preserves_host_reference_and_timestamp(
+    monkeypatch, mods
+):
+    """The tool must not collapse the host approval to a bare string: the
+    lease audit needs the exact host reference and decision clock."""
+    expected = {
+        "approved": True,
+        "decision": "once",
+        "approval_reference": "host-approval-42",
+        "decision_at": "2026-09-01T10:20:30+00:00",
+    }
+    monkeypatch.setattr(
+        "tools.approval.request_write_gate_approval",
+        lambda **kwargs: dict(expected),
+    )
+    result = mods.tool._present_and_get_decision(
+        {
+            "request_id": "wg-tool-label",
+            "session_id": "sess-1",
+            "stated_outcome": "update one file",
+        },
+        kind="WRITE_GATE_EXCEPTION",
+    )
+    assert result == expected
+
+
+def test_exception_lease_receives_host_approval_metadata(
+    monkeypatch, reg, mods, tmp_path
+):
+    """The structured host decision is the lease authority record."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    reg.create_binding(session_id="sess-1", worktree_path=str(worktree))
+    expected_at = "2026-09-01T10:20:30+00:00"
+    monkeypatch.setattr(
+        mods.tool,
+        "_present_and_get_decision",
+        lambda *args, **kwargs: {
+            "approved": True,
+            "decision": "once",
+            "approval_reference": "host-approval-42",
+            "decision_at": expected_at,
+        },
+    )
+
+    result = json.loads(mods.tool._handle_request_exception(
+        "sess-1",
+        {
+            "affected_files": [str(worktree / "Canon" / "policy.md")],
+            "stated_outcome": "update policy",
+        },
+    ))
+    assert result["status"] == "lease_created"
+    lease = reg.get_lease(result["lease"]["lease_id"])
+    assert lease is not None
+    assert lease.approval_reference == "host-approval-42"
+    assert lease.approved_at == expected_at
