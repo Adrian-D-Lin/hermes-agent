@@ -1,36 +1,76 @@
 # Write-Gate Deployment Runbook
 
 > **Scope.** This document is the production deployment runbook for the
-> Write-Gate host-owned integration. It records every approval, verification,
-> and operational step required to deploy the host-owned Write-Gate package
-> into a live Hermes agent runtime. Each section names the source of the
-> requirement, the exact command or code path exercised, and the evidence that
-> it must produce. It is written for a cold operator who has read no prior
-> conversation.
+> Write-Gate host-owned integration. It records the runtime facts an operator
+> must know to enable, verify, and roll back the Write-Gate package in a live
+> Hermes agent runtime. Every command is executable; every security property is
+> backed by a command or by an exact reference to an already-green test.
 >
-> **Ratified policy source.**
-> `/home/progenitor/AI-main/orchestrator/Canon/design-lifecycle.md`
->
-> **Repository root.**
-> `/home/progenitor/AI-main/hermes-startup-writegate-build`
->
-> **Branch.**
-> `integration/startup-writegate-runtime`
+> **Do not edit this runbook to match source text.** The Write-Gate behaviour is
+> verified by the test suite, not by grepping source. Sections that assert a
+> security property point at the test that covers it.
 
 ---
 
-## A1. Pre-deployment environment check
+## Runtime facts (read first)
 
-**Source requirement.** The Write-Gate package must be importable from the
-host process before any tool call can be intercepted. The host process is the
-same Python process that runs the agent loop; it must have the repository
-root on its `sys.path` or the package must be installed into the active
-virtualenv.
+These are the actual runtime locations and keys. The runbook commands below are
+built on them.
 
-**Verification command.**
+| Concept | Actual value | Source |
+| --- | --- | --- |
+| Session store (per profile) | `<profile>/state.db` | `hermes_state.DEFAULT_DB_PATH` |
+| Trusted lineage read | `SessionDB(state.db, read_only=True)` | `writegate/lineage.py::_open_ro_session_db` |
+| Central security registry | `get_default_hermes_root()/write-gate.db` (cross-profile) | `writegate/registry.py::resolve_registry_path` |
+| Plugin enable / kill-switch | `security.write_gate.enabled` (absent = disabled, fail closed) | `plugins/write-gate/__init__.py::_write_gate_enabled` |
+| Plugin discovery allow-list | `plugins.enabled` (opt-in; plugin loads only when listed) | `hermes_cli/plugins.py::_get_enabled_plugins` |
+| Enforcement hook | `pre_tool_call` -> `_on_pre_tool_call` | `plugins/write-gate/__init__.py` |
+| Host process | `hermes-gateway.service` and `hermes-serve.service` | systemd unit names |
+| Live code under service | `/home/progenitor/.hermes/hermes-agent` | systemd unit WorkingDirectory |
+| Test interpreter (has pytest) | `/home/progenitor/.hermes/hermes-agent/.venv/bin/python` | venv probe |
+
+**Two independent gates, not one.** Enabling Write-Gate requires **both** keys:
+
+1. `plugins.enabled` must list `write-gate`, otherwise the plugin manager never
+   collects the manifest and `register()` never runs — the hook is absent
+   regardless of the security flag. This is the standard opt-in plugin gate
+   (`plugins.enabled` is an allow-list; absent or `[]` = nothing loads).
+2. `security.write_gate.enabled` must be `true`, otherwise `register()` returns
+   before arming the `pre_tool_call` hook or the `write_gate` tool.
+
+Both keys are read from the **active profile's** `config.yaml`
+(`<profile>/config.yaml`), because plugin discovery reads the profile config.
+The `write-gate.db` registry, by contrast, is central
+(`get_default_hermes_root()/write-gate.db`) and is shared by every profile.
+
+**Why the two databases are not the same.** `state.db` is each profile's
+conversation store; the lineage resolver opens it **read-only** to classify how
+a session came to exist (branch / delegate / compression child). The
+`write-gate.db` registry is the single cross-profile security store of
+bindings, exception requests, and leases; it is deliberately *not* per-profile.
+A runbook that conflates them (e.g. "SessionDB is write-gate.db") would point an
+operator at the wrong file.
+
+**Test interpreter.** The worktree's own `.venv` has **no pytest installed** (the
+release venv it inherits from ships `bin/activate` but not pytest). Use the live
+developer venv:
 
 ```bash
-cd /home/progenitor/AI-main/hermes-startup-writegate-build
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python   # has pytest 9.x
+```
+
+`scripts/run_tests.sh` probes `.venv` → `venv` → `$HOME/.hermes/hermes-agent/venv`
+and only selects a venv that actually imports pytest, so it will skip the
+worktree `.venv` and use the live one when `HERMES_PYTHON` points at it.
+
+---
+
+## 1. Preflight
+
+Confirm the Write-Gate package imports under the live interpreter and that the
+registry path resolves to a writable location.
+
+```bash
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "import writegate.registry, writegate.enforcement, writegate.tool, \
        writegate.lineage, writegate.binding, writegate.approval, \
@@ -38,716 +78,354 @@ HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
        print('all writegate modules importable')"
 ```
 
-**Expected evidence.**
-`all writegate modules importable` on stdout, exit code 0.
-
-**Failure mode.**
-If the import fails, the active virtualenv does not have the repository root
-on its path. Either activate the correct virtualenv or install the package:
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -m pip install -e /home/progenitor/AI-main/hermes-startup-writegate-build
-```
-
----
-
-## A2. Registry path resolution
-
-**Source requirement.** The Write-Gate registry stores its SQLite database at
-a single, process-wide path resolved by `writegate.registry.resolve_registry_path()`.
-The path is deterministic: it is the host profile's home directory joined with
-`write-gate.db`. Tests override this via `set_registry_for_path()`.
-
-**Verification command.**
+**Expected.** `all writegate modules importable` on stdout, exit code 0.
 
 ```bash
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "from writegate.registry import resolve_registry_path; \
-       print(resolve_registry_path())"
+       import os; p = resolve_registry_path(); \
+       d = os.path.dirname(p); \
+       open(os.path.join(d, '.wg-write-test'), 'w').close(); \
+       print('registry path writable:', d); \
+       os.remove(os.path.join(d, '.wg-write-test'))"
 ```
 
-**Expected evidence.**
-A path string ending in `write-gate.db` under the active Hermes profile home,
-exit code 0.
+**Expected.** The directory holding `write-gate.db` printed, exit code 0. If the
+path is not writable, the registry cannot initialize and the hook fails closed.
 
-**Failure mode.**
-If the path resolves to a non-writable location, the registry will fail to
-initialize. Confirm the profile home is writable:
+---
+
+## 2. Integration: fast-forward the live checkout from this branch
+
+The worktree branch `integration/startup-writegate-runtime` is a **direct
+fast-forward descendant** of the live Primus baseline `c30942e9` (which itself
+descends from main `ff3835a6`). The live checkout at
+`/home/progenitor/.hermes/hermes-agent` has **existing local modifications**
+that are not part of the Write-Gate integration and must be preserved. Integrate
+by fast-forwarding the live tree from this branch — never per-file copy or
+cherry-pick, which would strand those local changes.
+
+**2a. Name a recoverable rollback ref on the live checkout.**
 
 ```bash
-touch "$(HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "from writegate.registry import resolve_registry_path; \
-       import os; print(os.path.dirname(resolve_registry_path()))")/write-test" \
-  && rm -f "$(HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "from writegate.registry import resolve_registry_path; \
-       import os; print(os.path.dirname(resolve_registry_path()))")/write-test"
+LIVE=/home/progenitor/.hermes/hermes-agent
+cd "$LIVE"
+git branch write-gate-rollback-$(date +%Y%m%d-%H%M%S) HEAD
+git rev-parse --short HEAD   # record the pre-integration SHA
+```
+
+This ref points at the current live state, so the integration can be undone with
+one command at any point through live acceptance.
+
+**2b. Preserve the local modifications as a stash.**
+
+```bash
+cd "$LIVE"
+git stash push -u -m "write-gate-integration: preserve local mods"
+git status --short           # must be clean now
+```
+
+`-u` also stashes the untracked local files. Verify the tree is clean before
+continuing; a dirty tree cannot fast-forward cleanly.
+
+**2c. Verify the worktree branch is a fast-forward of the live HEAD.**
+
+```bash
+cd /home/progenitor/AI-main/hermes-startup-writegate-build
+git merge-base --is-ancestor $(git rev-parse c30942e9) HEAD && \
+  echo "integration branch is a fast-forward of the live baseline c30942e9"
+```
+
+**2d. Fast-forward the live checkout.**
+
+```bash
+cd "$LIVE"
+git merge --ff-only integration/startup-writegate-runtime
+git log --oneline -1
+```
+
+**Expected.** The live HEAD advances to `27e06615` (the integration tip) with no
+merge commit, and the stat shows the full Write-Gate package plus the runbook.
+
+**2e. Restore the preserved local modifications.**
+
+```bash
+cd "$LIVE"
+git stash pop
+git status --short           # local mods back, tree no longer clean is expected
+```
+
+If `pop` reports a conflict, recover the pre-integration state:
+
+```bash
+cd "$LIVE"
+git checkout -- .            # or: git reset --hard write-gate-rollback-<ts>
+git stash clear
+```
+
+Keep the `write-gate-rollback-<ts>` branch and the stash until live acceptance
+is green (see §6 smoke tests and §11 monitoring). To fully undo the integration:
+
+```bash
+cd "$LIVE"
+git reset --hard write-gate-rollback-<ts>
+git branch -D write-gate-rollback-<ts>
 ```
 
 ---
 
-## A3. SessionDB read-only lineage resolver
+## 3. Cutover: remove the legacy pre_tool_call hook
 
-**Source requirement.** `writegate.lineage.resolve_lineage(session_id,
-profile_dir=None)` opens the profile's `hermes.db` with `read_only=True` and
-returns a verified lineage record for the session. It must not mutate session
-state. The resolver is bounded: it returns `None` when the session is not
-found, the DB is unavailable, or the lineage cannot be resolved to a trusted
-worktree.
+The live configs currently carry a **legacy** Write-Gate enforcement hook wired
+as a `hooks.pre_tool_call` command:
 
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "from writegate.lineage import resolve_lineage; \
-       result = resolve_lineage('nonexistent-session-id'); \
-       assert result is None, f'expected None, got {result!r}'; \
-       print('lineage resolver: bounded read-only verified')"
+```
+/home/progenitor/.hermes/agent-hooks/write-gate-enforcement.py
 ```
 
-**Expected evidence.**
-`lineage resolver: bounded read-only verified` on stdout, exit code 0.
+The new plugin registers its **own** `pre_tool_call` hook. Both must not be
+active at once — that would run two enforcement paths on the same write. The
+independent `hooks.pre_llm_call` session-startup-checklist hook is unrelated and
+stays.
 
-**Failure mode.**
-If the resolver returns a non-`None` value for a nonexistent session, the
-resolver is leaking state. Inspect `writegate/lineage.py` for accidental
-write paths.
+**Production targets.** Every production agent home, because discovery and hook
+resolution read the active profile config:
 
----
+- global: `/home/progenitor/.hermes/config.yaml`
+- `/home/progenitor/.hermes/profiles/builder-tester/config.yaml`
+- `/home/progenitor/.hermes/profiles/independent-reviewer/config.yaml`
+- `/home/progenitor/.hermes/profiles/test-authority-reviewer/config.yaml`
 
-## A4. Plugin hook registration
+The temporary `qwen-build-*` audit profiles are **not** production targets.
 
-**Source requirement.** The Write-Gate plugin registers a `pre_tool_call` hook
-via the Hermes plugin system. The hook is called before every tool invocation
-and returns `None` (allow) or a `Decision` (block/allow-with-lease). The hook
-must be registered by the plugin's `register()` function and must not require
-any host-side configuration beyond the plugin being present in the plugins
-directory.
+This cutover runs under the dual-PGX master plan. Two rules matter:
 
-**Verification command.**
+* **Never store backups beside the active config.** Put all four backups under a
+  single timestamped, permission-restricted directory.
+* **Never leave a half-cutover state** (plugin enabled but legacy hook still
+  present, or legacy hook gone but plugin not yet enabled). Services are stopped
+  for the whole edit, so there is no ungoverned window.
+
+**3a. Create the timestamped backup root and back up all four configs.**
+
+```bash
+TS=$(date +%Y%m%d-%H%M%S)
+ROOT=/srv/pgx-production/backups/$TS/writegate-hermes
+mkdir -m 700 "$ROOT"
+for f in \
+  /home/progenitor/.hermes/config.yaml \
+  /home/progenitor/.hermes/profiles/builder-tester/config.yaml \
+  /home/progenitor/.hermes/profiles/independent-reviewer/config.yaml \
+  /home/progenitor/.hermes/profiles/test-authority-reviewer/config.yaml; do
+  cp -a "$f" "$ROOT/$(basename "$f")"
+  chmod 600 "$ROOT/$(basename "$f")"
+done
+ls -la "$ROOT"
+```
+
+**3b. Stop the services so no enforcement path runs during the edit.**
+
+```bash
+sudo systemctl stop hermes-gateway.service hermes-serve.service
+systemctl is-active hermes-gateway.service hermes-serve.service   # expect "inactive"
+```
+
+With the services down there is no window in which governed writes are
+ungoverned: the gateway is simply not serving.
+
+**3c. Render the four `config.next` files.** For each config, write the
+post-cutover YAML to a `config.next` sibling:
+
+* set `security.write_gate.enabled: true` and add `write-gate` to
+  `plugins.enabled`;
+* **remove** the entire `hooks.pre_tool_call` entry (the legacy
+  `write-gate-enforcement.py` command);
+* **retain** `hooks.pre_llm_call` (`session-startup-checklist.py`) unchanged.
+
+Edit each `config.next` by hand or with a small script; do not edit the live
+`config.yaml` in place yet.
+
+**3d. Validate every `config.next` before install.** Each must parse, enable the
+plugin, and carry no `pre_tool_call` entry:
 
 ```bash
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location(
-    'write_gate_plugin',
-    '/home/progenitor/AI-main/hermes-startup-writegate-build/plugins/write-gate/__init__.py'
-)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-assert hasattr(mod, 'register'), 'plugin has no register()'
-assert callable(mod.register)
-print('plugin register() present and callable')
+import yaml
+files = [
+  '/home/progenitor/.hermes/config.next',
+  '/home/progenitor/.hermes/profiles/builder-tester/config.next',
+  '/home/progenitor/.hermes/profiles/independent-reviewer/config.next',
+  '/home/progenitor/.hermes/profiles/test-authority-reviewer/config.next',
+]
+for f in files:
+    c = yaml.safe_load(open(f)) or {}
+    pl = c.get('plugins', {})
+    sec = c.get('security', {})
+    wg = sec.get('write_gate', {})
+    hooks = c.get('hooks', {})
+    assert pl.get('enabled') and 'write-gate' in pl['enabled'], f'{f}: plugin not enabled'
+    assert wg.get('enabled') is True, f'{f}: security flag not true'
+    assert 'pre_tool_call' not in hooks, f'{f}: legacy pre_tool_call not removed'
+    assert 'pre_llm_call' in hooks, f'{f}: pre_llm_call startup hook missing'
+    print(f'{f}: OK (plugin enabled, security flag on, legacy hook removed, pre_llm_call retained)')
 "
 ```
 
-**Expected evidence.**
-`plugin register() present and callable` on stdout, exit code 0.
+**3e. Install all four as one maintenance change.** Swap each validated
+`config.next` over the live `config.yaml` atomically:
 
-**Failure mode.**
-If `register` is missing or not callable, the plugin will not be loaded by the
-Hermes plugin manager. Check `plugins/write-gate/__init__.py` for a `register`
-function that accepts a `PluginManager` instance.
+```bash
+for f in \
+  /home/progenitor/.hermes/config.yaml \
+  /home/progenitor/.hermes/profiles/builder-tester/config.yaml \
+  /home/progenitor/.hermes/profiles/independent-reviewer/config.yaml \
+  /home/progenitor/.hermes/profiles/test-authority-reviewer/config.yaml; do
+  mv "${f}.next" "$f"
+done
+```
+
+**3f. Restart the services.**
+
+```bash
+sudo systemctl start hermes-gateway.service hermes-serve.service
+systemctl is-active hermes-gateway.service hermes-serve.service   # expect "active"
+```
+
+The cutover is complete: the plugin is the sole `pre_tool_call` enforcement path,
+`pre_llm_call` startup is retained, and there was never a half-cutover state.
 
 ---
 
-## A5. Pre-tool-call hook: fail-closed without host session id
+## 4. Enable Write-Gate
 
-**Source requirement.** When `_on_pre_tool_call` is called with no `session_id`
-or `session` keyword argument, the hook must fail closed for any governed
-write tool. A model-supplied session id is never trusted as the host identity.
+The kill-switch key is `security.write_gate.enabled`. Absent or `false` = the
+plugin is inert (fail closed). Set it on the **live** profile config, not the
+worktree:
 
-**Verification command.**
+```bash
+hermes config set security.write_gate.enabled true
+```
+
+Verify the key resolves on the live profile:
+
+```bash
+HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+  -c "from hermes_cli.config import load_config_readonly; \
+       c = load_config_readonly() or {}; \
+       v = c.get('security', {}).get('write_gate', {}).get('enabled'); \
+       print('security.write_gate.enabled =', v); \
+       assert v is True, 'Write-Gate is not enabled'"
+```
+
+**Expected.** `security.write_gate.enabled = True`, exit code 0.
+
+> The old runbook named `plugins.write-gate.enabled`. That key is **not** read by
+> the plugin; the plugin reads `security.write_gate.enabled`. Using the wrong
+> key would leave the plugin inert and give a false impression that it was on.
+
+---
+
+## 5. Controlled service restart
+
+Restart the Hermes services so the live process picks up the enabled plugin and
+the `pre_tool_call` hook.
+
+```bash
+sudo systemctl restart hermes-gateway.service
+sudo systemctl restart hermes-serve.service
+```
+
+Wait for readiness, then confirm the service is running:
+
+```bash
+systemctl is-active hermes-gateway.service hermes-serve.service
+```
+
+**Expected.** `active` for both.
+
+---
+
+## 6. Smoke tests (CLI / GUI / Kanban)
+
+These exercise the three surfaces an operator can watch. Each asserts a
+security-relevant behaviour end-to-end against the live code.
+
+### 5a. Fail-closed without a host session id
+
+A governed write with no host-owned session id **must** block. `None` (allow) is
+**not** an acceptable result here.
 
 ```bash
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
-import importlib.util, sys, json
+import importlib.util
 spec = importlib.util.spec_from_file_location(
     'write_gate_plugin',
-    '/home/progenitor/AI-main/hermes-startup-writegate-build/plugins/write-gate/__init__.py'
-)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-result = mod._on_pre_tool_call(
-    tool_name='write_file',
-    args={'path': '/tmp/should-block.md'},
-    session_id='',
-)
+    '/home/progenitor/AI-main/hermes-startup-writegate-build/plugins/write-gate/__init__.py')
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+result = mod._on_pre_tool_call(tool_name='write_file',
+    args={'path': '/tmp/should-block.md'}, session_id='')
 assert result is not None, 'hook returned None (allow) for unbound session'
+assert result.get('action') == 'block', f'unexpected allow: {result!r}'
 print('fail-closed verified:', result)
 "
 ```
 
-**Expected evidence.**
-A `Decision` object with `allowed=False` on stdout, exit code 0.
+**Expected.** A block directive on stdout, exit code 0. `None` is rejected by the
+assertion.
 
-**Failure mode.**
-If the hook returns `None` (allow) when no session id is present, the
-fail-closed guarantee is broken. Check `plugins/write-gate/__init__.py`
-`_on_pre_tool_call` for the session-id guard.
+### 5b. Reads and Kanban are exempt before binding
 
----
-
-## A6. Lazy lineage derivation via hook
-
-**Source requirement.** When a governed write tool is called with a valid host
-session id but no active binding, the hook must attempt to derive a binding
-from the session's lineage (via `resolve_lineage` + `derive_binding`). If the
-lineage is trusted and resolves to a worktree, the binding is created and the
-write is allowed. If the lineage is untrusted or unresolvable, the write is
-blocked.
-
-**Verification command.**
+Read and Kanban tools return `None` (allow) even with no binding.
 
 ```bash
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
-import importlib.util, sys, json, os, tempfile
+import importlib.util
 spec = importlib.util.spec_from_file_location(
     'write_gate_plugin',
-    '/home/progenitor/AI-main/hermes-startup-writegate-build/plugins/write-gate/__init__.py'
-)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
-# Simulate a session with a trusted lineage to an existing worktree
-tmpdir = tempfile.mkdtemp()
-worktree = os.path.join(tmpdir, 'worktree')
-os.makedirs(worktree)
-
-# Create a registry pointing at a temp DB
-from writegate import registry as R
-reg = R.set_registry_for_path(os.path.join(tmpdir, 'wg.db'))
-
-# Call the hook with a session that has no binding yet
-# The hook should attempt lazy derivation
-result = mod._on_pre_tool_call(
-    tool_name='write_file',
-    args={'path': os.path.join(worktree, 'test.md')},
-    session_id='test-lazy-session',
-    _writegate_profile_dir=tmpdir,
-)
-# If no lineage exists for this session, result should be None (allow, no binding)
-# or a blocked Decision. Both are acceptable here — the key is no crash.
-print('lazy derive hook called without crash:', result)
+    '/home/progenitor/AI-main/hermes-startup-writegate-build/plugins/write-gate/__init__.py')
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+r1 = mod._on_pre_tool_call(tool_name='read_file', args={'path': '/tmp/x.md'}, session_id='exempt')
+r2 = mod._on_pre_tool_call(tool_name='kanban_show', args={}, session_id='exempt')
+assert r1 is None, f'read blocked: {r1!r}'
+assert r2 is None, f'kanban blocked: {r2!r}'
+print('reads + kanban exempt before binding: verified')
 "
 ```
 
-**Expected evidence.**
-`lazy derive hook called without crash:` followed by either `None` or a
-`Decision` object, exit code 0.
+**Expected.** `reads + kanban exempt before binding: verified`, exit code 0.
 
-**Failure mode.**
-If the hook raises an exception, the lineage resolver or binding derivation
-has a bug. Check `writegate/lineage.py` and `writegate/binding.py` for the
-specific traceback.
-
----
-
-## A7. Compression-child session inheritance
-
-**Source requirement.** When a session is created via compression (context
-compression), the child session's lineage must inherit the parent's binding.
-The compression classifier in `hermes_state.py` must not strip the binding
-evidence from the child session's record.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.lineage as L
-import inspect
-# Confirm the lineage resolver handles compression-child sessions
-src = inspect.getsource(L.resolve_lineage)
-assert 'compression' in src.lower() or '_reset_from' in src, \
-    'lineage resolver does not handle compression-child sessions'
-print('compression-child lineage handling present in resolver')
-"
-```
-
-**Expected evidence.**
-`compression-child lineage handling present in resolver` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the resolver does not handle compression-child
-sessions. Inspect `writegate/lineage.py` for the `_reset_from` or
-`compression` handling path.
-
----
-
-## A8. Delegate session: same-worktree inheritance
-
-**Source requirement.** When a delegate subagent is spawned in the same
-worktree as the parent session, the delegate's session must inherit the
-parent's binding. The delegate's `session_id` is distinct from the parent's,
-but the lineage resolver must resolve it to the same worktree.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.lineage as L
-import inspect
-src = inspect.getsource(L.resolve_lineage)
-# The resolver must check the delegate_from field or equivalent
-assert 'delegate' in src.lower() or '_delegate_from' in src, \
-    'lineage resolver does not handle delegate sessions'
-print('delegate session lineage handling present')
-"
-```
-
-**Expected evidence.**
-`delegate session lineage handling present` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the resolver does not handle delegate sessions.
-Inspect `writegate/lineage.py` for the delegate-handling path.
-
----
-
-## A9. Delegate session: isolated-worktree rejection
-
-**Source requirement.** When a delegate subagent is spawned in a different
-worktree than the parent session, the delegate's binding must NOT inherit the
-parent's binding. The lineage resolver must return `None` (no binding) for a
-delegate whose worktree differs from the parent's.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.lineage as L
-import inspect
-src = inspect.getsource(L.resolve_lineage)
-# The resolver must check worktree equality for delegates
-assert 'worktree' in src.lower(), \
-    'lineage resolver does not check worktree for delegates'
-print('delegate worktree isolation handling present')
-"
-```
-
-**Expected evidence.**
-`delegate worktree isolation handling present` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the resolver does not isolate delegate worktrees.
-Inspect `writegate/lineage.py` for the worktree-equality check.
-
----
-
-## A10. Kill switch: plugin disabled via config
-
-**Source requirement.** Setting `plugins.write-gate.enabled: false` in
-`config.yaml` must disable the Write-Gate plugin entirely. No hooks are
-registered, no tool calls are intercepted, and all writes proceed without
-governance. This is the operational kill switch for emergency rollback.
-
-**Verification command.**
+### 5c. Kill switch via config disables the plugin
 
 ```bash
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
 import yaml, tempfile, os
-# Write a config that disables the plugin
-cfg = {
-    'plugins': {
-        'write-gate': {'enabled': False}
-    }
-}
-tmp = tempfile.mktemp(suffix='.yaml')
-with open(tmp, 'w') as f:
-    yaml.dump(cfg, f)
-
-# Load the config and verify the plugin is disabled
 from hermes_cli.config import load_config_readonly
-loaded = load_config_readonly(tmp)
-assert loaded['plugins']['write-gate']['enabled'] is False
-print('kill switch verified: plugin disabled via config')
+cfg = {'security': {'write_gate': {'enabled': False}}}
+tmp = tempfile.mktemp(suffix='.yaml')
+with open(tmp, 'w') as f: yaml.dump(cfg, f)
+loaded = load_config_readonly(tmp) or {}
+v = loaded.get('security', {}).get('write_gate', {}).get('enabled')
+assert v is False, 'kill switch did not disable'
+print('kill switch verified: security.write_gate.enabled disables the plugin')
 "
 ```
 
-**Expected evidence.**
-`kill switch verified: plugin disabled via config` on stdout, exit code 0.
+**Expected.** `kill switch verified...`, exit code 0.
 
-**Failure mode.**
-If the config does not disable the plugin, check the plugin's `register()`
-function for the config-gate check. The plugin must read
-`plugins.write-gate.enabled` from the config and return early (without
-registering hooks) when it is `False`.
+> These three probes are the executable form of the security properties that the
+> focused test suite already covers. Prefer the suite for regression; run the
+> probes when you need a quick live confirmation without pytest.
 
 ---
 
-## A11. Spawn-failure fail-closed
+## 7. Verification by the test suite
 
-**Source requirement.** If the terminal tool fails to spawn a subprocess
-(e.g., the binary is missing or the shell is unavailable), the Write-Gate
-hook must fail closed: the write is blocked and the error is surfaced to the
-model. The hook must not allow the write to proceed on a spawn failure.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location(
-    'write_gate_plugin',
-    '/home/progenitor/AI-main/hermes-startup-writegate-build/plugins/write-gate/__init__.py'
-)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
-# Simulate a terminal spawn failure: the hook should block the write
-result = mod._on_pre_tool_call(
-    tool_name='terminal',
-    args={'command': 'rm -rf /nonexistent'},
-    session_id='test-spawn-failure',
-)
-# The hook should return a blocked Decision or None (allow reads, block writes)
-# For a terminal tool with a destructive command, expect a blocked Decision
-print('spawn-fail...:', result)
-"
-```
-
-**Expected evidence.**
-A `Decision` object with `allowed=False` on stdout, exit code 0.
-
-**Failure mode.**
-If the hook returns `None` (allow) for a destructive terminal command with no
-session binding, the fail-closed guarantee is broken. Check
-`plugins/write-gate/__init__.py` for the terminal-tool governance path.
-
----
-
-## A12. `/new` with parent: binding retention
-
-**Source requirement.** When a user runs `/new` (new session) with a parent
-session reference, the new session's lineage must inherit the parent's
-binding if the parent's lineage is trusted and resolves to the same worktree.
-The new session starts with the parent's binding active.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.lineage as L
-import inspect
-src = inspect.getsource(L.resolve_lineage)
-assert '_reset_from' in src or 'parent' in src.lower(), \
-    'lineage resolver does not handle /new-with-parent sessions'
-print('/new-with-parent lineage handling present')
-"
-```
-
-**Expected evidence.**
-`/new-with-parent lineage handling present` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the resolver does not handle `/new`-with-parent
-sessions. Inspect `writegate/lineage.py` for the `_reset_from` handling path.
-
----
-
-## A13. Spoofed identity rejection
-
-**Source requirement.** A model-supplied session id in the `write_gate` tool
-arguments must never be used as the host identity. The tool must use the
-host-provided session id (from the hook context) and reject any attempt to
-spoof the session identity via the tool arguments.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.tool as T
-import inspect
-src = inspect.getsource(T.write_gate_tool)
-assert 'session_id' in src, 'write_gate_tool does not handle session_id'
-print('spoofed identity guard present in write_gate_tool')
-"
-```
-
-**Expected evidence.**
-`spoofed identity guard present in write_gate_tool` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the tool does not guard against spoofed session ids.
-Inspect `writegate/tool.py` for the session-id validation path.
-
----
-
-## A14. Lease expiry: five-minute window
-
-**Source requirement.** An exception lease is valid for exactly five minutes
-from the approval timestamp. After the five-minute window expires, the same
-target blocks again. The lease expiry is enforced by `list_active_leases`
-filtering out leases whose `expires_at` is in the past.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.registry as R
-import inspect
-src = inspect.getsource(R.Registry.list_active_leases)
-assert 'expires_at' in src or 'lease_is_live' in src, \
-    'list_active_leases does not filter by expiry'
-print('lease expiry enforcement present in list_active_leases')
-"
-```
-
-**Expected evidence.**
-`lease expiry enforcement present in list_active_leases` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the lease expiry is not enforced. Inspect
-`writegate/registry.py` for the `list_active_leases` expiry filter.
-
----
-
-## A15. Host approval authority in leases
-
-**Source requirement.** The lease record must carry the host-owned approval
-reference (the approval id from the host's approval transport), not a
-model-supplied value. The `approval_reference` field in the lease record must
-match the host's approval reference, not any value the model could have
-supplied in the tool arguments.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.approval as A
-import inspect
-src = inspect.getsource(A.mint_lease)
-assert 'approval_reference' in src, 'mint_lease does not store approval_reference'
-print('host approval authority in leases verified')
-"
-```
-
-**Expected evidence.**
-`host approval authority in leases verified` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the lease does not carry the host approval reference.
-Inspect `writegate/approval.py` for the `mint_lease` function.
-
----
-
-## A16. Reads and kanban exempt before binding
-
-**Source requirement.** Read-only tools and kanban tools must be exempt from
-Write-Gate enforcement even before a binding exists. A read tool call with no
-binding must not be blocked. A kanban tool call with no binding must not be
-blocked. Only governed write tools (write_file, patch, terminal with write
-side effects) require a binding or lease.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location(
-    'write_gate_plugin',
-    '/home/progenitor/AI-main/hermes-startup-writegate-build/plugins/write-gate/__init__.py'
-)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
-# Read tool with no binding: should return None (allow)
-result_read = mod._on_pre_tool_call(
-    tool_name='read_file',
-    args={'path': '/tmp/test.md'},
-    session_id='test-exempt',
-)
-assert result_read is None, f'read tool blocked: {result_read}'
-
-# Kanban tool with no binding: should return None (allow)
-result_kanban = mod._on_pre_tool_call(
-    tool_name='kanban_show',
-    args={},
-    session_id='test-exempt',
-)
-assert result_kanban is None, f'kanban tool blocked: {result_kanban}'
-
-print('reads and kanban exempt before binding: verified')
-"
-```
-
-**Expected evidence.**
-`reads and kanban exempt before binding: verified` on stdout, exit code 0.
-
-**Failure mode.**
-If a read or kanban tool is blocked when no binding exists, the exemption is
-broken. Check `plugins/write-gate/__init__.py` for the tool-name exemption
-list.
-
----
-
-## A17. Symlink-escape defense
-
-**Source requirement.** A target that resolves outside the project root
-through a symlink must be rejected even if it is within the bound worktree
-path. The symlink-escape check is a defense-in-depth layer: it runs after the
-containment check and rejects any target whose `realpath` is outside the
-project root.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.containment as C
-import inspect
-src = inspect.getsource(C.resolve_symlink_escape)
-assert 'realpath' in src, 'resolve_symlink_escape does not use realpath'
-print('symlink-escape defense present in containment module')
-"
-```
-
-**Expected evidence.**
-`symlink-escape defense present in containment module` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the symlink-escape check does not use `realpath`.
-Inspect `writegate/containment.py` for the `resolve_symlink_escape` function.
-
----
-
-## A18. Enforcement cache
-
-**Source requirement.** The enforcement layer caches decisions per
-(session_id, tool_name, canonical_targets) tuple to avoid redundant SQLite
-queries on the hot path. The cache is invalidated when the binding or lease
-state changes. The cache must not serve a stale `allowed` decision after a
-lease has expired.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.enforcement as E
-import inspect
-src = inspect.getsource(E.decide)
-assert '_cache_set' in src or '_cache_get' in src, \
-    'decide() does not use enforcement cache'
-print('enforcement cache present in decide()')
-"
-```
-
-**Expected evidence.**
-`enforcement cache present in decide()` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the enforcement cache is not used. Inspect
-`writegate/enforcement.py` for the cache implementation.
-
----
-
-## A19. Recovery snapshot before leased edit
-
-**Source requirement.** Before allowing a leased edit, the enforcement layer
-must take a recovery snapshot of the target file. The snapshot is written by
-the recovery writer factory and must be verified before the edit proceeds.
-If the snapshot fails, the edit is blocked.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.enforcement as E
-import inspect
-src = inspect.getsource(E.decide)
-assert 'recovery_writer_factory' in src, \
-    'decide() does not use recovery_writer_factory'
-print('recovery snapshot before leased edit: verified')
-"
-```
-
-**Expected evidence.**
-`recovery snapshot before leased edit: verified` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, the recovery snapshot is not taken before a leased
-edit. Inspect `writegate/enforcement.py` for the recovery-writer path.
-
----
-
-## A20. Multi-target governance
-
-**Source requirement.** When a tool call affects multiple files, all targets
-must be governed individually. If any target is blocked (outside worktree
-without a lease, protected location, symlink escape), the entire call is
-blocked. A partial allow is never returned.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.enforcement as E
-import inspect
-src = inspect.getsource(E.decide)
-assert 'blocked_targets' in src, \
-    'decide() does not track blocked_targets'
-print('multi-target governance verified')
-"
-```
-
-**Expected evidence.**
-`multi-target governance verified` on stdout, exit code 0.
-
-**Failure mode.**
-If the assertion fails, multi-target governance does not track blocked
-targets. Inspect `writegate/enforcement.py` for the multi-target path.
-
----
-
-## A21. Plugin loader integration
-
-**Source requirement.** The Write-Gate plugin must be discovered and loaded
-by the Hermes plugin manager at startup. The plugin directory must be present
-under the Hermes home's `plugins/` directory and must contain a valid
-`__init__.py` with a `register()` function.
-
-**Verification command.**
-
-```bash
-ls -la /home/progenitor/AI-main/hermes-startup-writegate-build/plugins/write-gate/__init__.py \
-  && echo "plugin file present"
-```
-
-**Expected evidence.**
-A directory listing showing `__init__.py` and `plugin file present` on stdout,
-exit code 0.
-
-**Failure mode.**
-If the file is missing, the plugin will not be loaded. Check the plugin
-directory structure.
-
----
-
-## A22. Test suite: focused startup binding
-
-**Source requirement.** The focused test suite
-`tests/plugins/test_writegate_startup_binding.py` must pass in full. This
-suite covers: binding derivation, compression-child inheritance, delegate
-session inheritance, `/new`-with-parent retention, read/kanban exemption,
-fail-closed without session id, lazy lineage derivation, and the kill switch.
-
-**Verification command.**
+The authoritative evidence is the committed test suite, run with the live
+interpreter. Run each Write-Gate suite; every one must pass.
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
@@ -755,122 +433,58 @@ HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   scripts/run_tests.sh tests/plugins/test_writegate_startup_binding.py
 ```
 
-**Expected evidence.**
-`=== Summary: 1 files, 42 tests passed, 0 failed (100% complete) ===` on
-stdout, exit code 0.
+**Expected (focused suite).** `=== Summary: 1 files, 42 tests passed, 0 failed (100% complete) ===`
 
-**Failure mode.**
-If any test fails, inspect the specific test's assertion error and the
-relevant module. The test suite is the primary verification gate before
-deployment.
-
----
-
-## A23. Test suite: enforcement
-
-**Source requirement.** The enforcement test suite
-`tests/plugins/test_writegate_enforcement.py` must pass in full. This suite
-covers: containment, protected locations, symlink-escape rejection, lease
-matching, and the recovery snapshot path.
-
-**Verification command.**
+This suite covers: binding derivation, compression-child inheritance, delegate
+session inheritance, `/new`-with-parent retention, read/kanban exemption,
+fail-closed without session id, lazy lineage derivation, and the kill switch.
 
 ```bash
-cd /home/progenitor/AI-main/hermes-startup-writegate-build
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  scripts/run_tests.sh tests/plugins/test_writegate_enforcement.py
+  scripts/run_tests.sh tests/plugins/test_writegate_enforcement.py \
+                    tests/plugins/test_writegate_registry.py \
+                    tests/plugins/test_writegate_lineage.py \
+                    tests/plugins/test_writegate_multitarget.py \
+                    tests/plugins/test_writegate_recovery.py \
+                    tests/plugins/test_writegate_host_owned_import.py \
+                    tests/plugins/test_writegate_plugin_register.py
 ```
 
-**Expected evidence.**
-A summary line showing 0 failed tests, exit code 0.
+**Expected (affected suites).** A summary line with 0 failed tests. Together
+these cover containment, protected locations, symlink-escape rejection, lease
+matching + expiry, recovery snapshot, multi-target governance, host-owned
+import, and plugin registration.
 
-**Failure mode.**
-If any test fails, inspect the specific test's assertion error.
-
----
-
-## A24. Test suite: registry
-
-**Source requirement.** The registry test suite
-`tests/plugins/test_writegate_registry.py` must pass in full. This suite
-covers: binding creation, lease minting, lease expiry, and the registry's
-SQLite schema.
-
-**Verification command.**
-
-```bash
-cd /home/progenitor/AI-main/hermes-startup-writegate-build
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  scripts/run_tests.sh tests/plugins/test_writegate_registry.py
-```
-
-**Expected evidence.**
-A summary line showing 0 failed tests, exit code 0.
-
-**Failure mode.**
-If any test fails, inspect the specific test's assertion error.
+**Do not replace these with source-text greps.** A check that greps source for
+the word `realpath` or `_cache_set` passes even when the code path is dead or
+wired wrong, and fails on a pure refactor that preserves behaviour. The suite
+executes the real path. If a security property is not yet covered by a test,
+that is a gap to surface — not to paper over with a string check.
 
 ---
 
-## A25. Test suite: lineage
+## 8. Broad regression check
 
-**Source requirement.** The lineage test suite
-`tests/plugins/test_writegate_lineage.py` must pass in full. This suite
-covers: read-only SessionDB access, compression-child lineage, delegate
-session lineage, and `/new`-with-parent lineage.
-
-**Verification command.**
-
-```bash
-cd /home/progenitor/AI-main/hermes-startup-writegate-build
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  scripts/run_tests.sh tests/plugins/test_writegate_lineage.py
-```
-
-**Expected evidence.**
-A summary line showing 0 failed tests, exit code 0.
-
-**Failure mode.**
-If any test fails, inspect the specific test's assertion error.
-
----
-
-## A26. Test suite: broad plugin suite
-
-**Source requirement.** The full `tests/plugins/` suite must pass, with the
-exception of pre-existing failures in `tests/plugins/video_gen/` and
-`tests/plugins/memory/` that are unrelated to the Write-Gate integration.
-
-**Verification command.**
+The Write-Gate change must not widen the pre-existing plugin failure set. The
+baseline (commit `ba55ae29`) failure set is the reference: run the full
+`tests/plugins/` suite and confirm the failures are exactly the documented
+pre-existing ones (and the optional-dependency files that cannot run), with no
+new `writegate` failure and no new failures elsewhere.
 
 ```bash
-cd /home/progenitor/AI-main/hermes-startup-writegate-build
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   scripts/run_tests.sh tests/plugins/
 ```
 
-**Expected evidence.**
-A summary line showing 0 failed tests in any `test_writegate_*.py` file.
-Pre-existing failures in `test_fal_plugin.py` and
-`test_hindsight_provider.py` are acceptable and documented as unrelated.
-
-**Failure mode.**
-If a `test_writegate_*.py` file fails, inspect the specific test. Pre-existing
-failures in non-writegate files are not a deployment blocker.
+**Expected.** All `test_writegate_*.py` files green. Any failures outside the
+Write-Gate files must match the `ba55ae29` baseline (documented pre-existing
+failures) — a new failure is a regression to investigate.
 
 ---
 
-## A27. Commit evidence
+## 9. Commit evidence
 
-**Source requirement.** All changes must be committed to the
-`integration/startup-writegate-runtime` branch with a descriptive commit
-message. The commit must include: the new `writegate/lineage.py` module, the
-modified `plugins/write-gate/__init__.py`, the modified
-`writegate/enforcement.py`, the modified `writegate/binding.py`, the modified
-`writegate/tool.py`, and the new
-`tests/plugins/test_writegate_startup_binding.py` test file.
-
-**Verification command.**
+The runbook revision is the only change to commit on this branch.
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
@@ -878,187 +492,91 @@ git log --oneline -1
 git show --stat HEAD
 ```
 
-**Expected evidence.**
-A commit on the `integration/startup-writegate-runtime` branch with a message
-describing the startup integration changes, and a stat showing all expected
-files.
-
-**Failure mode.**
-If the commit is missing files, check `git status` for uncommitted changes
-and amend the commit.
+**Expected.** A commit on `integration/startup-writegate-runtime` whose stat
+shows only `WRITE_GATE_DEPLOYMENT.md`.
 
 ---
 
-## A28. Rollback procedure
+## 10. Rollback procedure
 
-**Source requirement.** To roll back the Write-Gate integration: disable the
-plugin via `plugins.write-gate.enabled: false` in `config.yaml`, restart the
-agent process, and verify that no hooks are registered. The registry database
-(`write-gate.db`) may be left in place; it will not be accessed when the
-plugin is disabled.
+To roll back the Write-Gate integration at runtime, reverse the cutover as one
+maintenance change while the services are stopped (no ungoverned window):
 
-**Verification command.**
+1. Stop the services:
+   ```bash
+   sudo systemctl stop hermes-gateway.service hermes-serve.service
+   ```
+2. Restore the four live configs from the timestamped backup root created in §3a
+   (each `config.yaml` has a validated `config.next` that superseded it):
+   ```bash
+   for f in \
+     /home/progenitor/.hermes/config.yaml \
+     /home/progenitor/.hermes/profiles/builder-tester/config.yaml \
+     /home/progenitor/.hermes/profiles/independent-reviewer/config.yaml \
+     /home/progenitor/.hermes/profiles/test-authority-reviewer/config.yaml; do
+     mv "${f}.next" "$f" 2>/dev/null || true
+   done
+   ```
+   The restored configs carry the legacy `hooks.pre_tool_call` hook and the
+   security flag `false`, so governed writes fall back to the pre-plugin path.
+   Confirm:
+   ```bash
+   grep -rn "write-gate-enforcement" /home/progenitor/.hermes/config.yaml \
+     /home/progenitor/.hermes/profiles/*/config.yaml
+   ```
+3. Start the services:
+   ```bash
+   sudo systemctl start hermes-gateway.service hermes-serve.service
+   ```
+4. Confirm the plugin is inert. With `security.write_gate.enabled` false, the
+   plugin's `register()` returns before registering the tool or the
+   `pre_tool_call` hook, so writes are governed by the restored legacy hook.
 
-```bash
-# After setting plugins.write-gate.enabled: false in config.yaml:
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-from hermes_cli.config import load_config_readonly
-import yaml, tempfile
-# Verify the config disables the plugin
-cfg = {'plugins': {'write-gate': {'enabled': False}}}
-tmp = tempfile.mktemp(suffix='.yaml')
-with open(tmp, 'w') as f:
-    yaml.dump(cfg, f)
-loaded = load_config_readonly(tmp)
-assert loaded['plugins']['write-gate']['enabled'] is False
-print('rollback verified: plugin disabled')
-"
-```
-
-**Expected evidence.**
-`rollback verified: plugin disabled` on stdout, exit code 0.
-
-**Failure mode.**
-If the plugin is still active after disabling it in config, check the plugin
-manager's cache and restart the process.
+Verify the config key is false after restart (see §6c). The recoverable rollback
+ref and stash from §2 let you restore any live-tree changes if the rollback
+touched anything beyond config.
 
 ---
 
-## A29. Operational monitoring
+## 11. Operational monitoring
 
-**Source requirement.** The Write-Gate registry database (`write-gate.db`)
-should be monitored for unexpected growth or corruption. The registry stores
-bindings, leases, and exception requests. A healthy registry has a small,
-bounded number of active bindings and leases.
-
-**Verification command.**
+The central registry (`write-gate.db`) stores bindings, exception requests, and
+leases. A healthy registry has a small, bounded number of active rows.
 
 ```bash
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
 import sqlite3, os
-db_path = os.path.join(os.path.expanduser('~'), '.hermes', 'write-gate.db')
+db_path = '/home/progenitor/.hermes/write-gate.db'
 if not os.path.exists(db_path):
     print('registry DB not found (expected before first use)')
 else:
     conn = sqlite3.connect(db_path)
-    bindings = conn.execute('SELECT COUNT(*) FROM write_gate_bindings').fetchone()[0]
-    leases = conn.execute('SELECT COUNT(*) FROM write_gate_leases').fetchone()[0]
-    requests = conn.execute('SELECT COUNT(*) FROM write_gate_requests').fetchone()[0]
-    print(f'registry: {bindings} bindings, {leases} leases, {requests} requests')
+    bindings = conn.execute('SELECT COUNT(*) FROM write_gate_bindings WHERE status = ?').fetchone()[0]
+    leases   = conn.execute('SELECT COUNT(*) FROM write_gate_leases WHERE status = ?').fetchone()[0]
+    print(f'registry: {bindings} active bindings, {leases} active leases')
     conn.close()
 "
 ```
 
-**Expected evidence.**
-A count of bindings, leases, and requests on stdout, exit code 0.
-
-**Failure mode.**
-If the registry DB is corrupted, the SQLite connection will fail. Back up the
-DB and recreate it: the registry will re-derive bindings from session lineage
-on the next tool call.
+**Expected.** Small non-negative counts, exit code 0. The five-minute lease
+window is a deliberate design choice (a session-bound approval window, not a
+byte-exact or single-use approval); expired leases simply stop matching and the
+target blocks again.
 
 ---
 
-## A30. Lease expiry operational check
+## Quick final gate
 
-**Source requirement.** An active lease must expire exactly five minutes after
-the approval timestamp. After expiry, the same target blocks again. This is
-the five-minute, session-bound approval window that is a deliberate design
-choice — not a byte-exact or single-use approval.
-
-**Verification command.**
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import writegate.registry as R
-import inspect
-# Verify the five-minute window is the expiry logic
-src = inspect.getsource(R.Registry.list_active_leases)
-assert 'lease_is_live' in src or 'expires_at' in src
-print('lease expiry operational check: present in list_active_leases')
-"
-```
-
-**Expected evidence.**
-`lease expiry operational check: present in list_active_leases` on stdout,
-exit code 0.
-
-**Failure mode.**
-If the expiry logic is missing, leases will never expire and the five-minute
-window is not enforced. Inspect `writegate/registry.py` for the
-`_lease_is_live` method.
-
----
-
-## A31. Final deployment gate
-
-**Source requirement.** Before declaring the Write-Gate integration deployed,
-all of the following must be verified:
-
-1. All writegate modules import (A1).
-2. Registry path resolves correctly (A2).
-3. Lineage resolver is bounded and read-only (A3).
-4. Plugin hook is registered (A4).
-5. Fail-closed without session id (A5).
-6. Lazy lineage derivation works (A6).
-7. Compression-child inheritance (A7).
-8. Delegate same-worktree inheritance (A8).
-9. Delegate isolated-worktree rejection (A9).
-10. Kill switch works (A10).
-11. Spawn-failure fail-closed (A11).
-12. `/new`-with-parent retention (A12).
-13. Spoofed identity rejection (A13).
-14. Lease expiry: five-minute window (A14).
-15. Host approval authority in leases (A15).
-16. Reads and kanban exempt before binding (A16).
-17. Symlink-escape defense (A17).
-18. Enforcement cache (A18).
-19. Recovery snapshot before leased edit (A19).
-20. Multi-target governance (A20).
-21. Plugin loader integration (A21).
-22. Focused test suite passes: 42/42 (A22).
-23. Enforcement test suite passes (A23).
-24. Registry test suite passes (A24).
-25. Lineage test suite passes (A25).
-26. Broad plugin suite passes (writegate files green) (A26).
-27. Commit evidence present (A27).
-28. Rollback procedure verified (A28).
-29. Operational monitoring command works (A29).
-30. Lease expiry operational check (A30).
-
-**Verification command.**
+Run the focused suite and confirm the commit is the runbook-only change:
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
-echo "=== A1: import check ===" && \
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "import writegate.registry, writegate.enforcement, writegate.tool, \
-       writegate.lineage, writegate.binding, writegate.approval, \
-       writegate.recovery, writegate.containment; \
-       print('A1 OK')" && \
-echo "=== A22: focused test suite ===" && \
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   scripts/run_tests.sh tests/plugins/test_writegate_startup_binding.py \
-  2>&1 | grep "Summary" && \
-echo "=== A27: commit evidence ===" && \
-git log --oneline -1 && \
-echo "=== A31: FINAL GATE PASSED ==="
+  2>&1 | grep "Summary"
+git log --oneline -1
 ```
 
-**Expected evidence.**
-```
-=== A1: import check ===
-A1 OK
-=== A22: focused test suite ===
-=== Summary: 1 files, 42 tests passed, 0 failed (100% complete) in ... ===
-=== A27: commit evidence ===
-<commit-hash> <commit-message>
-=== A31: FINAL GATE PASSED ===
-```
-
-**Failure mode.**
-If any step fails, stop the deployment and investigate the specific failure
-before proceeding.
+**Expected.** A `=== Summary: 1 files, 42 tests passed, 0 failed ===` line and a
+commit whose stat shows only `WRITE_GATE_DEPLOYMENT.md`.
