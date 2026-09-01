@@ -28,6 +28,11 @@ The `session_id` is **host-owned**. `model_tools` forwards it into
 `profile`, `lease_id`, `request_id`, or `recovery_location` as authority — those
 values are ignored when they appear in the model's argument payload.
 
+When the `pre_tool_call` hook fires with no host-owned `session_id` (the model
+cannot supply one), it returns a **block** directive rather than falling
+through to allow — a governed write with no trusted session identity is
+fail-closed (Gate 2).
+
 ### Security review gate (build brief)
 
 * `tools/registry.py` `dispatch()` forwards the **host-owned** `session_id`

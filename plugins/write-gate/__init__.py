@@ -172,7 +172,9 @@ def _on_pre_tool_call(
             kwargs.get("session") or ""
         )
         if not session_id:
-            return None
+            # No host-owned session id: fail closed. A governed write with no
+            # trusted session identity must be blocked, not allowed through.
+            return {"action": "block", "message": "Write-Gate: no host-owned session id; fail-closed block"}
         reg = _registry.get_registry()
         project_root = _resolve_project_root(reg, session_id)
         decision = _enforcement.decide(
