@@ -172,3 +172,34 @@ def test_pre_tool_call_blocks_without_session_id(plugin):
     assert block is not None
     assert block.get("action") == "block"
     assert "session" in block.get("message", "").lower()
+
+
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        ("read_file", {"path": "/some/path.txt"}),
+        ("search_files", {"query": "needle"}),
+        ("write_gate", {"action": "status"}),
+        ("kanban_show", {"task_id": "task-1"}),
+    ],
+)
+def test_pre_tool_call_exempt_routes_do_not_require_session_id(
+    plugin, tool_name, args
+):
+    """Reads and canonical control-plane operations remain usable before
+    Session Startup has supplied a host-owned session id.
+
+    The Write-Gate governs mutations; it must not become a general read gate
+    or deadlock the startup/control tools that establish its authority.
+    """
+    assert plugin._on_pre_tool_call(tool_name=tool_name, args=args) is None
+
+
+def test_pre_tool_call_unknown_kanban_name_still_requires_session_id(plugin):
+    """The exemption is an exact allow-list, never a ``kanban_*`` wildcard."""
+    block = plugin._on_pre_tool_call(
+        tool_name="kanban_unrecognized_operation",
+        args={"path": "/some/path.txt"},
+    )
+    assert block is not None
+    assert block.get("action") == "block"
