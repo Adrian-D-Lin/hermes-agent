@@ -60,24 +60,30 @@ def _get_reg() -> _registry.Registry:
     return _registry.get_registry()
 
 
-def write_gate_tool(action: str = "", session_id: str = "", **kwargs: Any) -> str:
+def write_gate_tool(action: str = "", session_id: str = "", task_id: str = "", **kwargs: Any) -> str:
     """Entry point for the ``write_gate`` tool.  Returns a JSON status string.
 
     ``session_id`` is the **host-owned** value forwarded by ``model_tools``
     through ``registry.dispatch`` kwargs.  Any ``session_id`` (or other
     authority field) present in the model's argument payload is ignored.
+
+    ``task_id`` is the trusted top-level session key the runtime forwards
+    through the same kwargs.  The per-session CWD record that drives top-level
+    binding is keyed by the task id (not the possibly-diverged agent
+    ``session_id``), so it is threaded into the derivation.  A model-supplied
+    ``task_id`` is ignored — only the runtime-forwarded value is trusted.
     """
     try:
         import json
         # Unknown action is reported regardless of session state, so callers get
         # a precise error. The trusted session_id is only required for the
         # real actions, which resolve authority from host-owned state.
-        if action not in ("confirm_binding", "request_exception", "status"):
+        if action not in ("confirm_binding", "reanchor", "request_exception", "status"):
             return json.dumps({
                 "success": False,
                 "error": (
                     f"write_gate: unknown action {action!r}. "
-                    "Use 'confirm_binding', 'request_exception', or 'status'."
+                    "Use 'confirm_binding', 'reanchor', 'request_exception', or 'status'."
                 ),
             })
         if not session_id:
@@ -89,7 +95,9 @@ def write_gate_tool(action: str = "", session_id: str = "", **kwargs: Any) -> st
                 ),
             })
         if action == "confirm_binding":
-            return _handle_confirm_binding(session_id)
+            return _handle_confirm_binding(session_id, task_id)
+        if action == "reanchor":
+            return _handle_reanchor(session_id, task_id)
         if action == "request_exception":
             return _handle_request_exception(session_id, kwargs)
         if action == "status":
@@ -113,6 +121,9 @@ def _build_binding_candidate(
     reg: "_registry.Registry",
     session_id: str,
     model_args: Dict[str, Any],
+    *,
+    task_id: Optional[str] = None,
+    reanchor: bool = False,
 ) -> Optional["_binding.BindingCandidate"]:
     """Derive the binding candidate from **trusted** state, never a model path.
 
@@ -120,34 +131,48 @@ def _build_binding_candidate(
     ``project``, ``board``, ``profile``, etc. supplied by the model are
     ignored: the authoritative candidate is resolved from trusted
     project/board/task state when available (via the dispatcher-owned lineage
-    on the central registry), otherwise from the runtime's current real Git
-    worktree.  A model-selected arbitrary path is rejected.
+    on the central registry), then from the host-owned session cwd record
+    (:func:`tools.terminal_tool.get_session_cwd`) resolved to its real Git
+    worktree root, otherwise from the runtime's current real Git worktree.  A
+    model-selected arbitrary path is rejected.
+
+    ``reanchor=True`` re-derives from the current trusted source (the host-owned
+    session cwd record) even when the session already has an active binding, so
+    a re-anchor of a changed worktree supersedes the old one rather than
+    re-presenting it.  A normal ``confirm_binding`` on an already-bound session
+    short-circuits to ``already_bound`` before this is reached.
     """
     producer = _binding.TrustedBindingProducer(reg)
 
+    # A model-supplied ``confirmed_worktree`` is diagnostic evidence only: it is
+    # compared against the trusted candidate but never selects the worktree.
+    # Adopting it here would let the model supply the binding path, so the
+    # branch is intentionally absent -- see the trust-boundary note below.
+
     # Prefer a trusted dispatcher-derived binding already recorded for this
     # session (the Kanban worker preassignment path).  When one exists it is
-    # authoritative; the model cannot override it.
+    # authoritative; the model cannot override it.  A re-anchor deliberately
+    # re-derives from the current trusted source instead.
     existing = reg.get_active_binding(session_id)
 
-    # The only model-provided value we will even look at is a diagnostic hint
-    # for the worktree; it is never written and never authoritative.
-    diagnostic_worktree = str(model_args.get("confirmed_worktree") or "").strip() or None
-
     # Resolve the authoritative worktree from trusted state: an existing
-    # binding's worktree, or the current real Git worktree.
+    # binding's worktree, the host-owned session cwd record resolved to its
+    # real Git worktree root, or the current real Git worktree.
     worktree_path = ""
     source = "derived-from-card"
-    if existing is not None and existing.worktree_path:
+    if existing is not None and existing.worktree_path and not reanchor:
         worktree_path = existing.worktree_path
         source = "derived-from-card"
-    elif diagnostic_worktree:
-        # A model hint is only usable when it resolves to a real directory that
-        # is also the runtime's current real Git worktree.
-        candidate = _canonicalize_safe(diagnostic_worktree)
-        if candidate is not None:
-            worktree_path = candidate
-            source = "derived-from-worktree"
+    else:
+        # The trusted top-level candidate: derive from the host-owned session
+        # cwd record (resolved to its real Git worktree root) when present.
+        trusted = _binding.resolve_trusted_worktree(
+            session_id, task_id=task_id,
+            profile=existing.profile if existing else None,
+        )
+        if trusted:
+            worktree_path = trusted
+            source = "derived-from-session-cwd"
 
     if not worktree_path:
         return None
@@ -161,14 +186,14 @@ def _build_binding_candidate(
         git_branch=existing.git_branch if existing else None,
         profile=existing.profile if existing else None,
         source=source,
-        model_supplied_path=diagnostic_worktree,
+        model_supplied_path=None,
     )
     if candidate is None:
         return None
     return candidate
 
 
-def _handle_confirm_binding(session_id: str) -> str:
+def _handle_confirm_binding(session_id: str, task_id: Optional[str] = None) -> str:
     import json
     reg = _get_reg()
 
@@ -193,7 +218,7 @@ def _handle_confirm_binding(session_id: str) -> str:
 
     # Present the derived candidate to the human via the approval transport.
     # The transport returns a decision; only a ``once`` decision persists.
-    candidate = _build_binding_candidate(reg, session_id, {})
+    candidate = _build_binding_candidate(reg, session_id, {}, task_id=task_id)
     if candidate is None:
         return json.dumps({
             "success": False,
@@ -217,6 +242,69 @@ def _handle_confirm_binding(session_id: str) -> str:
     return json.dumps({"success": True, "status": "bound", "binding": record.to_dict()})
 
 
+def _handle_reanchor(session_id: str, task_id: Optional[str] = None) -> str:
+    """Explicit re-anchor: a second human confirmation that supersedes the
+    prior active binding and preserves a coherent supersession history.
+
+    The candidate is derived from the same trusted state as ``confirm_binding``
+    (the host-owned session cwd record resolved to its real Git worktree root,
+    or the existing binding's worktree).  The model may not supply a path; the
+    approval supersedes the prior active binding, and a deny/timeout leaves the
+    old binding active.
+    """
+    import json
+    reg = _get_reg()
+
+    existing = reg.get_active_binding(session_id)
+    if existing is None:
+        # No prior binding to re-anchor: re-anchor is a privileged operation on
+        # an already-bound session. A fresh top-level binding is the
+        # ``confirm_binding`` path, not re-anchor.
+        return json.dumps({
+            "success": False,
+            "error": (
+                "write_gate: reanchor requires an already-bound session; use "
+                "confirm_binding to establish the initial binding."
+            ),
+        })
+
+    # Re-derive from trusted state. The diagnostic hint is ignored as authority.
+    candidate = _build_binding_candidate(reg, session_id, {}, task_id=task_id, reanchor=True)
+    if candidate is None:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "write_gate: cannot re-anchor — the worktree must be derived "
+                "from trusted project/board/task state, not a model-selected path."
+            ),
+        })
+
+    approval = _present_and_get_decision(
+        candidate.to_presentation(), kind="CONFIRMED_WORKTREE_BINDING"
+    )
+    # Fail closed: only an explicit confirmed decision persists/supersedes. A
+    # deny / timeout persists nothing and leaves the prior binding active.
+    producer = _binding.TrustedBindingProducer(reg)
+    record = producer.confirm(
+        candidate, confirmed=bool(approval["approved"]), profile=candidate.profile,
+    )
+    if record is None:
+        return json.dumps({
+            "success": True,
+            "status": "declined",
+            "note": "No binding persisted (declined / timed out / denied). The prior binding stays active.",
+        })
+    return json.dumps({
+        "success": True,
+        "status": "reanchored",
+        "binding": record.to_dict(),
+        "note": (
+            "Re-anchored: the prior active binding was superseded and a "
+            "coherent supersession history is preserved."
+        ),
+    })
+
+
 def _handle_request_exception(session_id: str, model_args: Dict[str, Any]) -> str:
     import json
     reg = _get_reg()
@@ -229,9 +317,25 @@ def _handle_request_exception(session_id: str, model_args: Dict[str, Any]) -> st
         })
     outcome = str(model_args.get("stated_outcome") or "").strip()
 
-    # Resolve the worktree from trusted state, never from the model.
+    # A current active binding is required before minting external/protected
+    # authority.  Falling back to ``worktree="."`` (the ambient process cwd)
+    # would let an unbound session lease out-of-worktree / protected writes
+    # relative to wherever the process happens to run — an unbound session has
+    # no confirmed worktree to scope a lease to.  Require the binding;
+    # otherwise return a structured bind-first denial and create no request or
+    # lease row.
     existing = reg.get_active_binding(session_id)
-    worktree = existing.worktree_path if (existing and existing.worktree_path) else "."
+    if existing is None or not existing.worktree_path:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "write_gate: request_exception requires a confirmed worktree "
+                "binding; confirm or re-anchor the session first via "
+                "confirm_binding / reanchor. An unbound session cannot mint "
+                "out-of-worktree authority."
+            ),
+        })
+    worktree = existing.worktree_path
 
     lease_id = uuid.uuid4().hex
     recovery_location = _approval.compute_recovery_location(

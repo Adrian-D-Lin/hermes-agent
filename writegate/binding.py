@@ -23,6 +23,7 @@ plain ``confirmed: bool`` result from it.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -186,10 +187,167 @@ class TrustedBindingProducer:
         return self.confirm(candidate, confirmed=True, profile=profile)
 
 
+def resolve_trusted_worktree(
+    session_id: str,
+    *,
+    task_id: Optional[str] = None,
+    profile: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the **host-owned** candidate worktree for an interactive session.
+
+    The ordinary top-level session has no central binding and no model-supplied
+    authority path, so the only trusted source for its interactive candidate is
+    the per-session working-directory record Hermes maintains in
+    :func:`tools.terminal_tool.get_session_cwd`. That host record -- not a model
+    argument and not the ambient process cwd -- is the authoritative starting
+    point.
+
+    The recorded cwd is a *subdirectory* of the repo in general, so it is
+    resolved up to the real Git worktree root (``git rev-parse
+    --show-toplevel``) when the record sits inside a Git project. A record that
+    does not resolve to a real Git worktree is rejected (``None``): a plain
+    directory, a missing record, or a symlink/relative path yields no binding
+    candidate.
+
+    The CWD record is keyed by the **host task id** (the top-level session
+    key), not the agent's possibly-diverged ``session_id``. Pass the trusted
+    ``task_id`` and it is checked first; ``session_id`` is the fallback so a
+    session that never recorded a task id still resolves. GUI/CLI initial
+    equality holds, but compression/gateway continuations can diverge, so the
+    trusted task id is authoritative.
+
+    Remote / container / backend cwd records must never silently become local
+    write authority. A record that is a host path (not usable inside the
+    session's container) or that is recorded under a container/ssh/modal backend
+    is rejected, so a sandboxed session cannot bind the host filesystem.
+
+    Returns the canonical absolute worktree path, or ``None`` when no trusted
+    local candidate exists. The model may not influence this resolution.
+    """
+    try:
+        from tools.terminal_tool import get_session_cwd
+    except Exception:
+        return None
+
+    recorded = None
+    try:
+        # The CWD record is keyed by the host task id (top-level session key),
+        # which is the authoritative identity for the interactive session. The
+        # agent's ``session_id`` may diverge under compression/gateway
+        # continuation, so it is only the fallback.
+        #
+        # Fail-closed: ``get_session_cwd(None)`` intentionally reads the shared
+        # ``"default"`` record, which belongs to some other unkeyed session.
+        # Never call it with a missing task id — that would let an unkeyed or
+        # default record authorize this session. Only use the trusted task id
+        # when it is a non-empty string.
+        if task_id:
+            recorded = get_session_cwd(task_id)
+        if not recorded:
+            recorded = get_session_cwd(session_id)
+    except Exception:
+        return None
+
+    if not recorded or not isinstance(recorded, str) or not recorded.strip():
+        # No host cwd record -> nothing to derive from.
+        return None
+
+    # Reject a record that is a host path unusable inside a container backend,
+    # or that was recorded for a non-local backend (ssh / docker / modal / ...).
+    # A remote/container cwd must not silently become local write authority.
+    if _is_untrusted_remote_cwd(session_id, recorded):
+        return None
+
+    # Resolve the record to a real, existing directory.
+    candidate = canonicalize_target(recorded, must_exist=True)
+    if candidate is None:
+        return None
+
+    # Walk up to the real Git worktree root when the record sits inside one.
+    worktree = _resolve_git_worktree_root(candidate)
+    if worktree is None:
+        # The record is a real directory but not inside a Git project. There is
+        # no Git worktree to bind; reject rather than binding an arbitrary path.
+        return None
+
+    return worktree
+
+
+def _is_untrusted_remote_cwd(session_id: str, cwd: str) -> bool:
+    """Return True when the recorded cwd must not become local write authority.
+
+    A container/ssh/modal backend records a *host* path that is unusable inside
+    the sandbox; binding it would let a remote session claim the host
+    filesystem. The trusted signal is the session's process backend
+    classification (``env_type`` from the smallest equivalent of
+    :func:`tools.terminal_tool._get_env_config`): a non-local backend
+    (docker / ssh / modal / daytona / singularity / ...) is rejected.
+
+    The host-owned ``get_session_cwd`` record plus the real Git-root validation
+    are sufficient for a local session; a valid session worktree commonly sits
+    outside the gateway/worker process cwd, so we never reject on cwd-vs-pwd
+    ancestry. Any ambiguity here fails closed (reject the candidate).
+    """
+    try:
+        env_type = None
+        try:
+            from tools.terminal_tool import _get_env_config
+            env_type = (_get_env_config() or {}).get("env_type")
+        except Exception:
+            env_type = os.environ.get("TERMINAL_ENV")
+        if not env_type:
+            env_type = os.environ.get("TERMINAL_ENV", "local")
+        # A non-local backend is a remote session: reject so it cannot bind the
+        # host filesystem. ``local`` (or absent, which defaults to local) is
+        # trusted.
+        if env_type and str(env_type).strip().lower() not in ("", "local"):
+            return True
+    except Exception:
+        # Any failure here is ambiguous -> fail closed (reject the candidate).
+        return True
+    return False
+
+
+def _resolve_git_worktree_root(candidate: str) -> Optional[str]:
+    """Return the canonical Git worktree root containing *candidate*, or ``None``.
+
+    Best-effort: shells out to ``git rev-parse --show-toplevel`` from the
+    candidate directory. A non-zero exit (not in a repo) yields ``None``; an
+    error (git missing, permission denied) also yields ``None`` so the caller
+    fails closed rather than binding an unverified path. The returned root is
+    canonicalized (``realpath``) so a symlinked repo resolves to its true
+    identity.
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=candidate,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    root = result.stdout.strip()
+    if not root:
+        return None
+    # Canonicalize the resolved root to its true identity before trusting it.
+    canonical = canonicalize_target(root, must_exist=True)
+    if canonical is None:
+        return None
+    return canonical
+
+
 def derive_binding(
     reg: _registry.Registry,
     *,
     session_id: str,
+    task_id: Optional[str] = None,
     profile_session_row: Optional[Dict[str, Any]] = None,
     parent_session_id: Optional[str] = None,
     parent_is_bound: bool = False,

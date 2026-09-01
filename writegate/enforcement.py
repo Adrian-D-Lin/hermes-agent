@@ -278,51 +278,56 @@ def decide(
             return _traversal_or_unresolvable(t)
         # Containment within the bound worktree.
         within = is_within(canonical, worktree)
-        # Symlink-escape defense in depth.  The escape boundary is the
-        # *project root* (the only boundary a lease can legitimately extend
-        # beyond the bound worktree); an out-of-worktree target authorized by
-        # a matching lease is *not* a symlink escape.
-        esc = resolve_symlink_escape(canonical, project_root) if project_root else False
         # Protected-location check (relative to the project root).
         protected = _is_protected(canonical, project_root)
-        if esc:
-            return _traversal_or_unresolvable(t)
-        if within and not protected:
-            # Ordinary in-worktree write: allowed without a lease (§4).
-            continue
         # Out-of-worktree or protected: a matching active lease is required.
-        leased_call = True
-        lease = _matching_lease(reg, session_id=session_id, worktree=worktree,
-                                  target=canonical, project_root=project_root)
-        if lease is None:
-            return Decision(
-                allowed=False,
-                reason=(
-                    f"Write-Gate: {canonical!r} is outside the bound worktree "
-                    f"{worktree!r}" + (
-                        f" (protected location) " if protected else " "
-                    ) + "and has no matching active lease."
-                ),
-                blocked_targets=[t],
-                remediation=(
-                    "Submit write_gate(action='request_exception') for this "
-                    "target; the human approves a five-minute, folder-scoped "
-                    "lease and the recovery snapshot is taken before the edit."
-                ),
-            )
-        # Leased path: snapshot evidence immediately for **every** governed
-        # target before allowing execution; the whole call fails if any
-        # target's recovery evidence cannot be written or verified.  Retries
-        # are idempotent because each retry re-snapshots the same target.
-        if recovery_writer_factory is not None:
-            writer = recovery_writer_factory(worktree, session_id, lease.lease_id)
-            outcome = _recovery_for_target(writer, t, canonical)
-            if not outcome.ok:
+        # A matching active lease is the human's folder-scoped authority for
+        # the target (a five-minute, folder-scoped approval), and the
+        # symlink-escape check is deliberately evaluated against the
+        # *project root*, the only boundary a lease can legitimately extend
+        # beyond the bound worktree.  An out-of-worktree target authorized by
+        # a matching lease is *not* a symlink escape; an in-worktree target
+        # that escapes the project root through a symlink still is.
+        if not within or protected:
+            leased_call = True
+            lease = _matching_lease(reg, session_id=session_id, worktree=worktree,
+                                    target=canonical, project_root=project_root)
+            if lease is None:
                 return Decision(
                     allowed=False,
-                    reason=f"Write-Gate: recovery evidence could not be written or verified: {outcome.error}",
+                    reason=(
+                        f"Write-Gate: {canonical!r} is outside the bound worktree "
+                        f"{worktree!r}" + (
+                            f" (protected location) " if protected else " "
+                        ) + "and has no matching active lease."
+                    ),
                     blocked_targets=[t],
+                    remediation=(
+                        "Submit write_gate(action='request_exception') for this "
+                        "target; the human approves a five-minute, folder-scoped "
+                        "lease and the recovery snapshot is taken before the edit."
+                    ),
                 )
+            # Leased path: snapshot evidence immediately for **every** governed
+            # target before allowing execution; the whole call fails if any
+            # target's recovery evidence cannot be written or verified.  Retries
+            # are idempotent because each retry re-snapshots the same target.
+            if recovery_writer_factory is not None:
+                writer = recovery_writer_factory(worktree, session_id, lease.lease_id)
+                outcome = _recovery_for_target(writer, t, canonical)
+                if not outcome.ok:
+                    return Decision(
+                        allowed=False,
+                        reason=f"Write-Gate: recovery evidence could not be written or verified: {outcome.error}",
+                        blocked_targets=[t],
+                    )
+            continue
+        # Ordinary in-worktree write: allowed without a lease (§4).  Symlink
+        # escapes (a target that resolves outside the project root through a
+        # symlink) are still rejected in depth — a lease cannot authorize them.
+        esc = resolve_symlink_escape(canonical, project_root) if project_root else False
+        if esc:
+            return _traversal_or_unresolvable(t)
     decision = Decision(allowed=True, leased=leased_call)
     _cache_set(session_id, tool_name, canonical_targets, decision)
     return decision
