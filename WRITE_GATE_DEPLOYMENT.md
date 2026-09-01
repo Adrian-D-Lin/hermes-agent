@@ -5,7 +5,7 @@
 > must know to enable, verify, and roll back the Write-Gate package in a live
 > Hermes agent runtime. Every command is executable; every security property is
 > backed by a command or by an exact reference to an already-green test.
->
+
 > **Do not edit this runbook to match source text.** The Write-Gate behaviour is
 > verified by the test suite, not by grepping source. Sections that assert a
 > security property point at the test that covers it.
@@ -25,9 +25,35 @@ built on them.
 | Plugin enable / kill-switch | `security.write_gate.enabled` (absent = disabled, fail closed) | `plugins/write-gate/__init__.py::_write_gate_enabled` |
 | Plugin discovery allow-list | `plugins.enabled` (opt-in; plugin loads only when listed) | `hermes_cli/plugins.py::_get_enabled_plugins` |
 | Enforcement hook | `pre_tool_call` -> `_on_pre_tool_call` | `plugins/write-gate/__init__.py` |
-| Host process | `hermes-gateway.service` and `hermes-serve.service` | systemd unit names |
+| Host process | `hermes-gateway.service` and `hermes-serve.service` | systemd user units |
 | Live code under service | `/home/progenitor/.hermes/hermes-agent` | systemd unit WorkingDirectory |
-| Test interpreter (has pytest) | `/home/progenitor/.hermes/hermes-agent/.venv/bin/python` | venv probe |
+| Test interpreter (has pytest + pytest-asyncio) | `/home/progenitor/.hermes/hermes-agent/.venv/bin/python` | venv probe |
+
+**Test interpreter.** The worktree's own `.venv` has **no site-packages at all**
+(it ships `bin/activate` but no `pytest`, and no `pytest-asyncio`). Use the live
+developer venv, which has both:
+
+```bash
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python   # has pytest 9.x + pytest-asyncio
+```
+
+`scripts/run_tests.sh` probes `.venv` → `venv` → `$HOME/.hermes/hermes-agent/venv`
+and only selects a venv that actually imports pytest, so it will skip the
+worktree `.venv` and use the live one when `HERMES_PYTHON` points at it.
+
+**Broad / async tests.** For the full `tests/plugins/` run (which includes
+async tests), `run_tests.sh` alone is not reliable: the worktree `.venv` is
+empty and the live venv is the only one with `pytest-asyncio`. Call the live
+interpreter directly on `scripts/run_tests_parallel.py` under a clean
+environment, as the verified run did:
+
+```bash
+cd /home/progenitor/AI-main/hermes-startup-writegate-build
+HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+  HERMES_TEST_FILE_RETRIES=0 \
+  /home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+  scripts/run_tests_parallel.py tests/plugins/
+```
 
 **Two independent gates, not one.** Enabling Write-Gate requires **both** keys:
 
@@ -51,26 +77,17 @@ bindings, exception requests, and leases; it is deliberately *not* per-profile.
 A runbook that conflates them (e.g. "SessionDB is write-gate.db") would point an
 operator at the wrong file.
 
-**Test interpreter.** The worktree's own `.venv` has **no pytest installed** (the
-release venv it inherits from ships `bin/activate` but not pytest). Use the live
-developer venv:
-
-```bash
-/home/progenitor/.hermes/hermes-agent/.venv/bin/python   # has pytest 9.x
-```
-
-`scripts/run_tests.sh` probes `.venv` → `venv` → `$HOME/.hermes/hermes-agent/venv`
-and only selects a venv that actually imports pytest, so it will skip the
-worktree `.venv` and use the live one when `HERMES_PYTHON` points at it.
-
 ---
 
 ## 1. Preflight
 
 Confirm the Write-Gate package imports under the live interpreter and that the
-registry path resolves to a writable location.
+registry path resolves to a writable location. Run from the integration
+worktree checkout so the `writegate` package is importable; if running from
+elsewhere, set `PYTHONPATH` to point at the worktree root.
 
 ```bash
+cd /home/progenitor/AI-main/hermes-startup-writegate-build
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "import writegate.registry, writegate.enforcement, writegate.tool, \
        writegate.lineage, writegate.binding, writegate.approval, \
@@ -99,11 +116,19 @@ path is not writable, the registry cannot initialize and the hook fails closed.
 
 The worktree branch `integration/startup-writegate-runtime` is a **direct
 fast-forward descendant** of the live Primus baseline `c30942e9` (which itself
-descends from main `ff3835a6`). The live checkout at
+descends from main `ff3835a6`). The tip of this branch is `c890a409` — the
+runbook-correcting commit — **not** `27e06615`. The live checkout at
 `/home/progenitor/.hermes/hermes-agent` has **existing local modifications**
 that are not part of the Write-Gate integration and must be preserved. Integrate
 by fast-forwarding the live tree from this branch — never per-file copy or
 cherry-pick, which would strand those local changes.
+
+> **Do not stash and pop.** The local modifications on the live checkout are
+> byte-for-byte identical to the pre-cutover working tree already committed in
+> the integration history (they are part of `c30942e9`'s parent lineage). Stash
+> them, fast-forward, then `stash pop` would be a needless re-apply of content
+> that is already in the tree. **Preserve the stash through acceptance** and do
+> not pop it unless a conflict forces you to.
 
 **2a. Name a recoverable rollback ref on the live checkout.**
 
@@ -117,26 +142,17 @@ git rev-parse --short HEAD   # record the pre-integration SHA
 This ref points at the current live state, so the integration can be undone with
 one command at any point through live acceptance.
 
-**2b. Preserve the local modifications as a stash.**
-
-```bash
-cd "$LIVE"
-git stash push -u -m "write-gate-integration: preserve local mods"
-git status --short           # must be clean now
-```
-
-`-u` also stashes the untracked local files. Verify the tree is clean before
-continuing; a dirty tree cannot fast-forward cleanly.
-
-**2c. Verify the worktree branch is a fast-forward of the live HEAD.**
+**2b. Verify the worktree branch is a fast-forward of the live HEAD.**
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
 git merge-base --is-ancestor $(git rev-parse c30942e9) HEAD && \
   echo "integration branch is a fast-forward of the live baseline c30942e9"
+git merge-base --is-ancestor c890a409 $(git rev-parse HEAD) && \
+  echo "c890a409 is reachable from the integration tip"
 ```
 
-**2d. Fast-forward the live checkout.**
+**2c. Fast-forward the live checkout.**
 
 ```bash
 cd "$LIVE"
@@ -144,27 +160,20 @@ git merge --ff-only integration/startup-writegate-runtime
 git log --oneline -1
 ```
 
-**Expected.** The live HEAD advances to `27e06615` (the integration tip) with no
+**Expected.** The live HEAD advances to `c890a409` (the integration tip) with no
 merge commit, and the stat shows the full Write-Gate package plus the runbook.
 
-**2e. Restore the preserved local modifications.**
+**2d. Verify the tree is clean (no stash pop).**
 
 ```bash
 cd "$LIVE"
-git stash pop
-git status --short           # local mods back, tree no longer clean is expected
+git status --short           # clean: local mods are already in c30942e9 lineage
 ```
 
-If `pop` reports a conflict, recover the pre-integration state:
-
-```bash
-cd "$LIVE"
-git checkout -- .            # or: git reset --hard write-gate-rollback-<ts>
-git stash clear
-```
-
-Keep the `write-gate-rollback-<ts>` branch and the stash until live acceptance
-is green (see §6 smoke tests and §11 monitoring). To fully undo the integration:
+If the tree is not clean because of genuinely new local work, leave it as a
+stash and do not pop — the content is already captured upstream. Keep the
+`write-gate-rollback-<ts>` branch and the stash until live acceptance is green
+(see §6 smoke tests and §11 monitoring). To fully undo the integration:
 
 ```bash
 cd "$LIVE"
@@ -174,7 +183,7 @@ git branch -D write-gate-rollback-<ts>
 
 ---
 
-## 3. Cutover: remove the legacy pre_tool_call hook
+## 3. Cutover: atomic config.next swap (enables plugin, removes legacy hook)
 
 The live configs currently carry a **legacy** Write-Gate enforcement hook wired
 as a `hooks.pre_tool_call` command:
@@ -206,7 +215,10 @@ This cutover runs under the dual-PGX master plan. Two rules matter:
   present, or legacy hook gone but plugin not yet enabled). Services are stopped
   for the whole edit, so there is no ungoverned window.
 
-**3a. Create the timestamped backup root and back up all four configs.**
+**3a. Create the timestamped backup root and back up all four configs.** Each
+`config.yaml` is a distinct path (global vs one per profile), so preserve the
+unique path inside the backup root — do **not** collapse all four to a single
+`config.yaml` name, or later profiles would overwrite one another on restore.
 
 ```bash
 TS=$(date +%Y%m%d-%H%M%S)
@@ -217,17 +229,19 @@ for f in \
   /home/progenitor/.hermes/profiles/builder-tester/config.yaml \
   /home/progenitor/.hermes/profiles/independent-reviewer/config.yaml \
   /home/progenitor/.hermes/profiles/test-authority-reviewer/config.yaml; do
-  cp -a "$f" "$ROOT/$(basename "$f")"
-  chmod 600 "$ROOT/$(basename "$f")"
+  rel="${f#/home/progenitor/.hermes/}"          # profiles/<name>/config.yaml etc.
+  cp -a "$f" "$ROOT/$rel"
+  chmod 600 "$ROOT/$rel"
 done
-ls -la "$ROOT"
+ls -laR "$ROOT"
 ```
 
-**3b. Stop the services so no enforcement path runs during the edit.**
+**3b. Stop the services so no enforcement path runs during the edit.** These are
+**systemd user units** — use `systemctl --user`, never `sudo systemctl`.
 
 ```bash
-sudo systemctl stop hermes-gateway.service hermes-serve.service
-systemctl is-active hermes-gateway.service hermes-serve.service   # expect "inactive"
+systemctl --user stop hermes-gateway.service hermes-serve.service
+systemctl --user is-active hermes-gateway.service hermes-serve.service   # expect "inactive"
 ```
 
 With the services down there is no window in which governed writes are
@@ -246,9 +260,11 @@ Edit each `config.next` by hand or with a small script; do not edit the live
 `config.yaml` in place yet.
 
 **3d. Validate every `config.next` before install.** Each must parse, enable the
-plugin, and carry no `pre_tool_call` entry:
+plugin, and carry no `pre_tool_call` entry. Run from the integration worktree
+checkout (or set `PYTHONPATH` to it) so the import resolves:
 
 ```bash
+cd /home/progenitor/AI-main/hermes-startup-writegate-build
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
 import yaml
@@ -288,75 +304,35 @@ done
 **3f. Restart the services.**
 
 ```bash
-sudo systemctl start hermes-gateway.service hermes-serve.service
-systemctl is-active hermes-gateway.service hermes-serve.service   # expect "active"
+systemctl --user start hermes-gateway.service hermes-serve.service
+systemctl --user is-active hermes-gateway.service hermes-serve.service   # expect "active"
 ```
 
 The cutover is complete: the plugin is the sole `pre_tool_call` enforcement path,
 `pre_llm_call` startup is retained, and there was never a half-cutover state.
 
----
-
-## 4. Enable Write-Gate
-
-The kill-switch key is `security.write_gate.enabled`. Absent or `false` = the
-plugin is inert (fail closed). Set it on the **live** profile config, not the
-worktree:
-
-```bash
-hermes config set security.write_gate.enabled true
-```
-
-Verify the key resolves on the live profile:
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "from hermes_cli.config import load_config_readonly; \
-       c = load_config_readonly() or {}; \
-       v = c.get('security', {}).get('write_gate', {}).get('enabled'); \
-       print('security.write_gate.enabled =', v); \
-       assert v is True, 'Write-Gate is not enabled'"
-```
-
-**Expected.** `security.write_gate.enabled = True`, exit code 0.
-
-> The old runbook named `plugins.write-gate.enabled`. That key is **not** read by
-> the plugin; the plugin reads `security.write_gate.enabled`. Using the wrong
-> key would leave the plugin inert and give a false impression that it was on.
+> **No separate enable or restart step is needed.** This atomic cutover already
+> set both `security.write_gate.enabled` and `plugins.enabled` and restarted the
+> services in §3e/§3f. The old runbook's standalone "Enable Write-Gate" and
+> "Controlled service restart" sections are removed as redundant — the enable is
+> folded into the config.next swap, and the restart happens immediately after.
 
 ---
 
-## 5. Controlled service restart
-
-Restart the Hermes services so the live process picks up the enabled plugin and
-the `pre_tool_call` hook.
-
-```bash
-sudo systemctl restart hermes-gateway.service
-sudo systemctl restart hermes-serve.service
-```
-
-Wait for readiness, then confirm the service is running:
-
-```bash
-systemctl is-active hermes-gateway.service hermes-serve.service
-```
-
-**Expected.** `active` for both.
-
----
-
-## 6. Smoke tests (CLI / GUI / Kanban)
+## 4. Smoke tests (CLI / GUI / Kanban)
 
 These exercise the three surfaces an operator can watch. Each asserts a
-security-relevant behaviour end-to-end against the live code.
+security-relevant behaviour end-to-end against the live code. Run from the
+integration worktree checkout (or set `PYTHONPATH` to it) so the plugin module
+path resolves.
 
-### 5a. Fail-closed without a host session id
+### 4a. Fail-closed without a host session id
 
 A governed write with no host-owned session id **must** block. `None` (allow) is
 **not** an acceptable result here.
 
 ```bash
+cd /home/progenitor/AI-main/hermes-startup-writegate-build
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
 import importlib.util
@@ -375,7 +351,7 @@ print('fail-closed verified:', result)
 **Expected.** A block directive on stdout, exit code 0. `None` is rejected by the
 assertion.
 
-### 5b. Reads and Kanban are exempt before binding
+### 4b. Reads and Kanban are exempt before binding
 
 Read and Kanban tools return `None` (allow) even with no binding.
 
@@ -397,32 +373,13 @@ print('reads + kanban exempt before binding: verified')
 
 **Expected.** `reads + kanban exempt before binding: verified`, exit code 0.
 
-### 5c. Kill switch via config disables the plugin
-
-```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
-import yaml, tempfile, os
-from hermes_cli.config import load_config_readonly
-cfg = {'security': {'write_gate': {'enabled': False}}}
-tmp = tempfile.mktemp(suffix='.yaml')
-with open(tmp, 'w') as f: yaml.dump(cfg, f)
-loaded = load_config_readonly(tmp) or {}
-v = loaded.get('security', {}).get('write_gate', {}).get('enabled')
-assert v is False, 'kill switch did not disable'
-print('kill switch verified: security.write_gate.enabled disables the plugin')
-"
-```
-
-**Expected.** `kill switch verified...`, exit code 0.
-
-> These three probes are the executable form of the security properties that the
+> These two probes are the executable form of the security properties that the
 > focused test suite already covers. Prefer the suite for regression; run the
 > probes when you need a quick live confirmation without pytest.
 
 ---
 
-## 7. Verification by the test suite
+## 5. Verification by the test suite
 
 The authoritative evidence is the committed test suite, run with the live
 interpreter. Run each Write-Gate suite; every one must pass.
@@ -463,7 +420,7 @@ that is a gap to surface — not to paper over with a string check.
 
 ---
 
-## 8. Broad regression check
+## 6. Broad regression check
 
 The Write-Gate change must not widen the pre-existing plugin failure set. The
 baseline (commit `ba55ae29`) failure set is the reference: run the full
@@ -471,9 +428,17 @@ baseline (commit `ba55ae29`) failure set is the reference: run the full
 pre-existing ones (and the optional-dependency files that cannot run), with no
 new `writegate` failure and no new failures elsewhere.
 
+Because the worktree `.venv` is empty and the live venv is the only one with
+`pytest-asyncio`, call the live interpreter directly on
+`scripts/run_tests_parallel.py` under a clean environment (see "Broad / async
+tests" in Runtime facts):
+
 ```bash
+cd /home/progenitor/AI-main/hermes-startup-writegate-build
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  scripts/run_tests.sh tests/plugins/
+  HERMES_TEST_FILE_RETRIES=0 \
+  /home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+  scripts/run_tests_parallel.py tests/plugins/
 ```
 
 **Expected.** All `test_writegate_*.py` files green. Any failures outside the
@@ -482,7 +447,7 @@ failures) — a new failure is a regression to investigate.
 
 ---
 
-## 9. Commit evidence
+## 7. Commit evidence
 
 The runbook revision is the only change to commit on this branch.
 
@@ -497,48 +462,60 @@ shows only `WRITE_GATE_DEPLOYMENT.md`.
 
 ---
 
-## 10. Rollback procedure
+## 8. Rollback procedure
 
 To roll back the Write-Gate integration at runtime, reverse the cutover as one
 maintenance change while the services are stopped (no ungoverned window):
 
-1. Stop the services:
+1. Stop the services (systemd **user** units — use `--user`, never `sudo`):
+
    ```bash
-   sudo systemctl stop hermes-gateway.service hermes-serve.service
+   systemctl --user stop hermes-gateway.service hermes-serve.service
    ```
-2. Restore the four live configs from the timestamped backup root created in §3a
-   (each `config.yaml` has a validated `config.next` that superseded it):
+
+2. Restore the four live configs from the timestamped backup root created in
+   §3a, using the **unique path** stored for each (do **not** `mv` a
+   `config.next` file — that file was consumed by the atomic swap in §3e and no
+   longer exists; the validated copy lives at `$ROOT/<unique-path>`):
+
    ```bash
-   for f in \
-     /home/progenitor/.hermes/config.yaml \
-     /home/progenitor/.hermes/profiles/builder-tester/config.yaml \
-     /home/progenitor/.hermes/profiles/independent-reviewer/config.yaml \
-     /home/progenitor/.hermes/profiles/test-authority-reviewer/config.yaml; do
-     mv "${f}.next" "$f" 2>/dev/null || true
+   TS=<the timestamp from §3a>
+   ROOT=/srv/pgx-production/backups/$TS/writegate-hermes
+   for rel in \
+     config.yaml \
+     profiles/builder-tester/config.yaml \
+     profiles/independent-reviewer/config.yaml \
+     profiles/test-authority-reviewer/config.yaml; do
+     cp -a "$ROOT/$rel" "/home/progenitor/.hermes/$rel"
    done
+   ls -laR "$ROOT"
    ```
+
    The restored configs carry the legacy `hooks.pre_tool_call` hook and the
    security flag `false`, so governed writes fall back to the pre-plugin path.
    Confirm:
+
    ```bash
    grep -rn "write-gate-enforcement" /home/progenitor/.hermes/config.yaml \
      /home/progenitor/.hermes/profiles/*/config.yaml
    ```
+
 3. Start the services:
+
    ```bash
-   sudo systemctl start hermes-gateway.service hermes-serve.service
+   systemctl --user start hermes-gateway.service hermes-serve.service
    ```
+
 4. Confirm the plugin is inert. With `security.write_gate.enabled` false, the
    plugin's `register()` returns before registering the tool or the
    `pre_tool_call` hook, so writes are governed by the restored legacy hook.
 
-Verify the config key is false after restart (see §6c). The recoverable rollback
-ref and stash from §2 let you restore any live-tree changes if the rollback
-touched anything beyond config.
+The recoverable rollback ref and stash from §2 let you restore any live-tree
+changes if the rollback touched anything beyond config.
 
 ---
 
-## 11. Operational monitoring
+## 9. Operational monitoring
 
 The central registry (`write-gate.db`) stores bindings, exception requests, and
 leases. A healthy registry has a small, bounded number of active rows.
