@@ -773,6 +773,9 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # The Hermes session id the dispatcher pre-assigned to this worker run
+    # (WriteGate preassignment / lineage). NULL for legacy runs.
+    worker_session_id: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -993,7 +996,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    worker_session_id   TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob

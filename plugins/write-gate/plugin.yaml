@@ -1,0 +1,10 @@
+name: write-gate
+version: "0.1.0"
+description: "Integrated Session-Startup + WriteGate runtime. Central default-root-anchored SQLite security registry (bindings/requests/leases), a service-gated write_gate tool for the trusted confirm_binding / request_exception operations, and a pre_tool_call enforcement hook that governs write_file/patch and out-of-worktree or protected (Canon/4-artifacts/5-archive) mutations via a five-minute, folder-scoped, recovery-snapshotted lease. Dispatcher preassigns worker lineage to task_runs.worker_session_id. Enabled by security.write_gate.enabled."
+author: "NousResearch (Hermes AI Harness)"
+hooks:
+  - pre_tool_call
+provides_tools:
+  - write_gate
+provides_hooks:
+  - pre_tool_call
