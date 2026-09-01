@@ -5525,9 +5525,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.session_id = resume
             self._resumed = True
         else:
-            timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-            short_uuid = uuid.uuid4().hex[:6]
-            self.session_id = f"{timestamp_str}_{short_uuid}"
+            # WriteGate preassignment: a dispatcher-spawned worker may carry a
+            # preassigned Hermes worker session id. Honor it ONLY when the
+            # trusted Kanban markers (task id, run id, profile, workspace,
+            # board) all agree — see kanban_db._trusted_worker_session_id. An
+            # arbitrary / mismatched value fails closed and the worker keeps
+            # its own generated id, so it can never masquerade as a bound
+            # worker identity.
+            preassigned = self._resolve_preassigned_worker_session_id()
+            if preassigned:
+                self.session_id = preassigned
+            else:
+                timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
+                short_uuid = uuid.uuid4().hex[:6]
+                self.session_id = f"{timestamp_str}_{short_uuid}"
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
         
         # History file for persistent input recall across sessions
@@ -13637,6 +13648,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             write_breadcrumb(self.session_id)
         except Exception:
             pass
+
+    def _resolve_preassigned_worker_session_id(self) -> Optional[str]:
+        """Accept a dispatcher preassigned worker session id, fail-closed.
+
+        When this CLI process is a Kanban worker, the dispatcher sets
+        ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID`` / ``HERMES_KANBAN_BOARD``
+        / ``HERMES_KANBAN_WORKER_SESSION_ID`` on the launch env. We honor
+        ``HERMES_KANBAN_WORKER_SESSION_ID`` as *this* session's id only when the
+        trusted markers agree — otherwise (missing markers, mismatched run id,
+        an arbitrary injected value) we return ``None`` and the worker keeps its
+        own generated id. See ``kanban_db._trusted_worker_session_id``.
+        """
+        try:
+            from hermes_cli import kanban_db
+        except Exception:
+            return None
+        try:
+            task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+            profile = os.environ.get("HERMES_KANBAN_PROFILE") or None
+            workspace = os.environ.get("HERMES_KANBAN_WORKSPACE") or None
+            board = os.environ.get("HERMES_KANBAN_BOARD") or None
+            if not task_id or not run_id_raw:
+                return None
+            try:
+                run_id = int(run_id_raw)
+            except (TypeError, ValueError):
+                return None
+            return kanban_db._trusted_worker_session_id(
+                task_id, run_id,
+                profile=profile or None,
+                workspace=workspace or None,
+                board=board or None,
+            )
+        except Exception:
+            return None
 
     def _transfer_session_yolo(self, old_session_id: str, new_session_id: str) -> None:
         """Move YOLO bypass state from an old session key to a new one.

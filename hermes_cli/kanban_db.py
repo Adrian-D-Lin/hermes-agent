@@ -1265,9 +1265,13 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # The Hermes session id the dispatcher pre-assigned to this worker run
+    # (WriteGate preassignment / lineage). NULL for legacy runs.
+    worker_session_id: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        keys = set(row.keys())
         try:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
@@ -1289,6 +1293,9 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            worker_session_id=(
+                row["worker_session_id"] if "worker_session_id" in keys else None
+            ),
         )
 
 
@@ -1474,7 +1481,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    worker_session_id   TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2711,6 +2719,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
 
+    # task_runs gained a worker_session_id column so the dispatcher can
+    # record the session id it pre-assigned to the worker (WriteGate
+    # preassignment / lineage). Back-fill is NULL for legacy rows.
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+    if "worker_session_id" not in run_cols:
+        _add_column_if_missing(
+            conn, "task_runs", "worker_session_id", "worker_session_id TEXT"
+        )
+
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
     # tables don't fail during SCHEMA_SQL execution before ``run_id`` exists.
@@ -2887,7 +2904,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, worker_session_id TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -9345,6 +9362,11 @@ def _record_spawn_failure(
     *,
     failure_limit: int = None,
 ) -> bool:
+    # WriteGate preassignment: a spawn failure must leave an auditable
+    # failed/abandoned dispatch state, not an apparent active authority. The
+    # prepared binding created for the preassigned worker id is abandoned so it
+    # can never be reused as a run's authority.
+    _abandon_prepared_worker_binding(task_id)
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
@@ -9354,12 +9376,41 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _abandon_prepared_worker_binding(task_id: str) -> None:
+    """Abandon any prepared WriteGate binding prepared for this task's worker.
+
+    Called after a spawn failure so a failed/abandoned dispatch never appears as
+    an active worker authority (brief §3 / Canon §3d, A20). Best-effort and
+    isolated — the registry is an optional plugin dependency.
+    """
+    try:
+        from hermes_cli import kanban_db as _kdb
+        conn = _kdb.connect()
+        with contextlib.closing(conn) as c:
+            run = _kdb.latest_run(c, task_id)
+            if run is not None and run.worker_session_id:
+                from writegate import registry as _wg_registry
+                _wg_registry.get_registry().mark_binding_abandoned(
+                    run.worker_session_id,
+                )
+    except Exception:  # pragma: no cover - optional dependency
+        pass
+
+
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    worker_session_id: Optional[str] = None,
+) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    the drawer.  When ``worker_session_id`` is provided it is recorded on the
+    run too: the dispatcher pre-assigns the exact Hermes worker session id
+    (WriteGate preassignment / lineage) before Popen.
     """
     with write_txn(conn):
         conn.execute(
@@ -9368,11 +9419,17 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
+            params = [int(pid), worker_session_id, run_id]
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_session_id = ? "
+                "WHERE id = ?",
+                params,
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _append_event(
+            conn, task_id, "spawned",
+            {"pid": int(pid), "worker_session_id": worker_session_id},
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10260,6 +10317,25 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # WriteGate preassignment: derive ONE worker session id, store it on the
+        # exact current task_runs row, and create + verify the central active
+        # binding — all BEFORE the worker launches. Returns the captured id so
+        # the launched subprocess and set_worker_pid use the same value. When
+        # WriteGate is enabled this is a hard spawn failure; a failure aborts
+        # the spawn, abandons the prepared binding, and is recorded below.
+        try:
+            worker_session_id = prepare_worker_launch(
+                conn, claimed, str(workspace),
+                board=board, resolved_branch_name=resolved_branch_name,
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"writegate pre-spawn binding: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -10268,8 +10344,15 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
+                params = sig.parameters
+                if "board" in params and "worker_session_id" in params:
+                    pid = _spawn(claimed, str(workspace), board=board,
+                                 worker_session_id=worker_session_id)
+                elif "board" in params:
                     pid = _spawn(claimed, str(workspace), board=board)
+                elif "worker_session_id" in params:
+                    pid = _spawn(claimed, str(workspace),
+                                 worker_session_id=worker_session_id)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
@@ -10395,6 +10478,25 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        # WriteGate preassignment: derive ONE worker session id, store it on the
+        # exact current task_runs row, and create + verify the central active
+        # binding — all BEFORE the worker launches. Returns the captured id so
+        # the launched subprocess and set_worker_pid use the same value. When
+        # WriteGate is enabled this is a hard spawn failure; a failure aborts
+        # the spawn, abandons the prepared binding, and is recorded below.
+        try:
+            worker_session_id = prepare_worker_launch(
+                conn, claimed, str(workspace),
+                board=board, resolved_branch_name=resolved_branch_name,
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"writegate pre-spawn binding: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -10717,11 +10819,362 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _writegate_binding_enabled() -> bool:
+    """Return whether the WriteGate plugin is active for this process.
+
+    The pre-spawn binding handshake is a hard spawn failure only when the
+    feature is enabled (``security.write_gate.enabled``). When the feature is
+    disabled the dispatcher behaves exactly as before — no binding, no abort.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
+        security = config.get("security") if isinstance(config, dict) else None
+        if not isinstance(security, dict):
+            return False
+        return bool(security.get("write_gate", {}).get("enabled", False))
+    except Exception:
+        return False
+
+
+def _ensure_writegate_importable() -> bool:
+    """Make the ``writegate`` package importable for the dispatcher.
+
+    The dispatcher shares primitives (``registry``) with the WriteGate plugin.
+    When the feature is enabled the plugin is normally already registered, but
+    the import must not depend on plugin-registration ordering. If ``writegate``
+    is not yet importable, add the plugin directory to ``sys.path`` so the
+    dispatcher can resolve it. Returns True when the import now succeeds.
+    """
+    try:
+        import importlib
+        import importlib.util
+        import os
+        import sys
+
+        if "writegate" in sys.modules or importlib.util.find_spec("writegate") is not None:
+            return True
+
+        # The plugin lives at plugins/write-gate/writegate/. Walk up from this
+        # file to find the repo, then add the plugin dir to sys.path.
+        here = os.path.dirname(os.path.abspath(__file__))
+        for _ in range(6):
+            candidate = os.path.join(here, "plugins", "write-gate")
+            if os.path.isdir(candidate):
+                if candidate not in sys.path:
+                    sys.path.insert(0, candidate)
+                break
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
+
+        importlib.import_module("writegate")
+        return True
+    except Exception:
+        return False
+
+
+def prepare_worker_launch(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    resolved_branch_name: Optional[str] = None,
+) -> str:
+    """Prepare the worker launch for the WriteGate preassignment contract.
+
+    This is the dispatcher-side half of the preassignment handshake (brief §3 /
+    Canon §3d). It runs entirely within the *existing* Kanban connection and the
+    *exact* current run — it never opens a second connection and never falls
+    back to ``latest_run``.
+
+    Steps:
+
+    1. Generate **one** normal Hermes worker session id (the same shape the
+       worker itself would generate — ``<timestamp>_<uuid6>``), derived from
+       the task id + current run id so a retry yields a new id.
+    2. Persist it on the exact current ``task_runs`` row (the ``worker_session_id``
+       column), so the run record carries the id the launched subprocess will
+       use.
+    3. Create the central active binding for that id and read it back, verifying
+       profile / workspace / board lineage. Fail-closed: if the binding cannot
+       be created or verified, raise :class:`WriteGatePreSpawnError` so the
+       prepared binding is abandoned and the spawn aborted.
+    4. Return the captured id so the caller can (a) pass it to
+       ``_default_spawn`` to set the subprocess environment, and (b) abandon it
+       on failure.
+
+    When WriteGate is disabled the id is still derived and stored on the run
+    row (harmless), but the central-binding step is skipped and the id is
+    returned unchanged.
+    """
+    task_id = task.id
+    run_id = task.current_run_id
+    if run_id is None:
+        # No run to bind to — nothing is preassigned. The worker falls back to
+        # its own generated id.
+        return ""
+
+    # 1. Generate one normal worker session id.
+    worker_session_id = _generate_worker_session_id(task_id, int(run_id))
+
+    # 2. Persist it on the exact current run row (before spawn).
+    _persist_worker_session_id(conn, task_id, run_id, worker_session_id)
+
+    # 3. Central binding handshake (hard failure when WriteGate is enabled).
+    if _writegate_binding_enabled():
+        # Ensure the shared WriteGate primitives are importable before the
+        # binding handshake, regardless of plugin-registration ordering.
+        _ensure_writegate_importable()
+        try:
+            _create_and_verify_central_binding(
+                conn, task, workspace, worker_session_id, board,
+                resolved_branch_name,
+            )
+        except Exception as exc:
+            # Abandon the prepared binding before recording the failure.
+            _abandon_pre_spawn_binding(worker_session_id)
+            raise WriteGatePreSpawnError(
+                f"WriteGate: pre-spawn binding handshake failed: {exc}"
+            ) from exc
+
+    return worker_session_id
+
+
+def _generate_worker_session_id(task_id: str, run_id: int) -> str:
+    """Derive one normal Hermes worker session id from task + run.
+
+    Shape: ``<timestamp>_<uuid4-hex-first-6>`` — the same shape the worker
+    itself would generate, so the worker's own ``state.db`` transcript row and
+    the central WriteGate binding share the same id (lineage). A retry (new run)
+    yields a new id.
+    """
+    import time
+    import uuid
+    # Local datetime, matching the worker's own id generation.
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    # uuid4 hex, first six characters — the exact normal Hermes id shape.
+    raw = uuid.uuid4().hex[:6]
+    return f"{ts}_{raw}"
+
+
+def _persist_worker_session_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    worker_session_id: str,
+) -> None:
+    """Persist the preassigned worker session id on the exact run row.
+
+    Runs BEFORE Popen so the launched subprocess can read the same id. The
+    ``task_runs`` table's primary key is ``id`` (the run id) and the task
+    reference is ``task_id`` — there is no ``run_id`` column. Match on both the
+    exact run id and the task id, assert exactly one row, and read it back.
+    """
+    cur = conn.execute(
+        "UPDATE task_runs SET worker_session_id = ? "
+        "WHERE id = ? AND task_id = ?",
+        [worker_session_id, int(run_id), task_id],
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError(
+            f"WriteGate: expected exactly one task_runs row for run "
+            f"{run_id} / task {task_id}, found {cur.rowcount}"
+        )
+
+
+def _create_and_verify_central_binding(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+    worker_session_id: str,
+    board: Optional[str],
+    resolved_branch_name: Optional[str],
+) -> None:
+    """Create and read-back the central WriteGate binding for the worker.
+
+    Fail-closed: the exact central active binding must exist and match the
+    prepared id before the worker launches. Lineage is verified against the
+    task and run.
+    """
+    from writegate import registry as _wg_registry
+    reg = _wg_registry.get_registry()
+    record = reg.create_binding(
+        session_id=worker_session_id,
+        worktree_path=str(workspace),
+        project=task.project_id or None,
+        initiative=task.id,
+        board=board,
+        git_branch=resolved_branch_name or task.branch_name or None,
+        profile=task.assignee,
+        producer=_wg_registry.PRODUCER_DISPATCHER,
+        event=_wg_registry.EVENT_DISPATCH,
+    )
+    verify = reg.get_active_binding(worker_session_id)
+    if verify is None or verify.id != record.id:
+        raise WriteGatePreSpawnError(
+            "WriteGate: pre-spawn binding could not be verified for "
+            f"session {worker_session_id}"
+        )
+
+
+class WriteGatePreSpawnError(Exception):
+    """Raised when the WriteGate pre-spawn binding handshake cannot complete.
+
+    A hard spawn failure: the prepared binding must be abandoned and the spawn
+    aborted rather than launching a worker whose first turn would race ahead of
+    unusable binding state.
+    """
+
+
+def _abandon_pre_spawn_binding(worker_session_id: str) -> None:
+    """Abandon a prepared WriteGate binding after a failed spawn attempt."""
+    if not worker_session_id:
+        return
+    try:
+        from writegate import registry as _wg_registry
+        _wg_registry.get_registry().mark_binding_abandoned(worker_session_id)
+    except Exception:  # pragma: no cover - best effort
+        pass
+
+
+def _trusted_worker_session_id(
+    task_id: str,
+    run_id: int,
+    *,
+    profile: Optional[str] = None,
+    workspace: Optional[str] = None,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Verify a dispatcher preassigned worker session id, fail-closed.
+
+    This is the CLI-side half of the WriteGate preassignment handshake (brief
+    §3 / Canon §3d). The dispatcher sets ``HERMES_KANBAN_WORKER_SESSION_ID`` on
+    the launch env; the worker honors it as *its own* session id only when
+    every trusted marker agrees. An arbitrary / injected / mismatched value
+    returns ``None`` and the worker keeps its own generated id, so an env
+    value can never masquerade as a bound worker identity.
+
+    Verification (all must hold, else return ``None``):
+
+    * the supplied ``task_id`` has a run row whose primary key ``id`` equals
+      ``run_id`` and whose ``task_id`` equals ``task_id``;
+    * that run row carries a non-null ``worker_session_id`` equal to the
+      preassigned value;
+    * the task's ``assignee`` matches ``profile`` when a profile is supplied;
+    * the task's canonical workspace matches ``workspace`` when supplied;
+    * the board database/slug is resolvable when supplied;
+    * the central WriteGate registry has an *active* binding whose
+      ``session_id`` equals the preassigned id and whose stored worktree,
+      board, task/initiative, and profile lineage match the run record.
+
+    A missing/failed check anywhere returns ``None`` — the worker then
+    generates its own id and stays unbound (read-only until a trusted
+    binding exists).
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        return None
+
+    # 1. The exact run row must exist with matching id + task_id. Open a
+    #    read-only connection to this board's DB (mirrors the read-only
+    #    pattern used elsewhere in the module).
+    try:
+        db_path = _kb.kanban_db_path(board=board)
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id, task_id, worker_session_id FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(run_id), task_id),
+        ).fetchone()
+        if row is None or row["worker_session_id"] is None:
+            return None
+        stored_id = row["worker_session_id"]
+
+        # 2. The task row must exist, be assigned to the expected profile, and
+        #    carry the expected canonical workspace. Read it on the same
+        #    read-only connection (the connection is closed in finally, so we
+        #    cannot defer this to after the finally block).
+        task = _kb.get_task(conn, task_id)
+        if task is None:
+            return None
+        if profile and (task.assignee is None or _normalize_assignee(task.assignee) != profile):
+            return None
+        if workspace and (
+            task.workspace_path is None
+            or os.path.realpath(task.workspace_path) != os.path.realpath(workspace)
+        ):
+            return None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # The supplied preassigned value must equal what the dispatcher persisted.
+    if not stored_id:
+        return None
+
+    # 3. The board must be resolvable when supplied.
+    if board:
+        try:
+            slug = _kb._normalize_board_slug(board)
+            if slug is None:
+                return None
+        except Exception:
+            return None
+
+    # 4. The central binding must exist, be active, and match the run record.
+    try:
+        from writegate import registry as _wg_registry
+        reg = _wg_registry.get_registry()
+    except Exception:
+        return None
+    try:
+        binding = reg.get_active_binding(stored_id)
+    except Exception:
+        return None
+    if binding is None or not binding.is_active:
+        return None
+    # Exact worktree match.
+    if workspace and (
+        binding.worktree_path is None
+        or os.path.realpath(binding.worktree_path) != os.path.realpath(workspace)
+    ):
+        return None
+    # Board lineage match (the dispatcher recorded the real board).
+    if board and binding.board not in (board, _kb._normalize_board_slug(board)):
+        return None
+    # Task/initiative lineage match.
+    if binding.initiative not in (task_id, None):
+        return None
+    if profile and binding.profile not in (profile, task.assignee):
+        return None
+
+    return stored_id
+
+
+def _normalize_assignee(assignee: Optional[str]) -> Optional[str]:
+    return _canonical_assignee(assignee)
+
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
+    worker_session_id: Optional[str] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10734,6 +11187,13 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
+
+    ``worker_session_id`` is the id the dispatcher pre-assigned (via
+    ``prepare_worker_launch``) and persisted on the run row before Popen. When
+    present it is exported so the worker's own ``state.db`` transcript row and
+    the central WriteGate binding share the same id. When absent (e.g. a
+    custom spawn_fn or a run with no preassigned id) the worker falls back to
+    its own generated id.
     """
     import subprocess
     if not task.assignee:
@@ -10800,6 +11260,17 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    # WriteGate preassignment / lineage: the dispatcher pre-assigned the exact
+    # Hermes worker session id *before* Popen (via prepare_worker_launch) and
+    # persisted it on the run row. Use that captured value so the worker's own
+    # state.db transcript row and the central binding use the same id. The CLI
+    # honors this only when all trusted Kanban markers match (see cli.py); an
+    # arbitrary env value must fail closed and never become a session identity.
+    # The id is derived deterministically from task + run so a retry (new run)
+    # yields a new id, and so the dispatcher can persist the matching central
+    # binding.
+    if worker_session_id:
+        env["HERMES_KANBAN_WORKER_SESSION_ID"] = worker_session_id
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the

@@ -3402,6 +3402,188 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
         sys.stdout.flush()
 
 
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string (host decision clock)."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def request_write_gate_approval(
+    *,
+    request_id: str,
+    command: str,
+    description: str,
+    session_key: str = "",
+    timeout_seconds: int | None = None,
+) -> dict:
+    """Host-owned, ``once``-only approval primitive for Write-Gate requests.
+
+    This is the single entry point the ``writegate`` plugin uses to authorize
+    a bounded out-of-worktree / protected-location write. It routes
+    a visibly-typed ``write_gate`` request through the **currently active**
+    approval surface, reusing the existing host routing seams rather than
+    registering a new transport (Hermes transports are presentation backends,
+    not request types):
+
+      * **Headless / single-query / cron / unattended** — no human can answer,
+        so it denies immediately (fail closed).
+      * **Selected non-builtin transport** — ``_present_with_selected_transport``
+        with ``allow_session=False, allow_permanent=False``.
+      * **Gateway / TUI / desktop** — the registered notify callback plus
+        ``_await_gateway_decision`` with both allow flags false.
+      * **Interactive CLI** — ``prompt_dangerous_approval(..., allow_permanent=
+        False, allow_session=False)``.
+
+    The ``once`` decision grants a lease, not a single syscall: the originally
+    blocked operation may retry under the same exact session/worktree/scope
+    lease until expiry, with recovery rechecked each retry.  A new
+    unrelated/broader request, or an expired lease, re-prompts.  It never
+    consults yolo / session / permanent caches and never persists.
+
+    Returns a structured reference ``{"approved": bool, "decision": str,
+    "approval_reference": str, "decision_at": str}`` so lease creation is
+    auditable.  ``approved`` is ``True`` only on an explicit ``once`` decision;
+    every other outcome (timeout, deny, cancel, transport failure, headless)
+    fails closed with ``approved=False``.
+    """
+    # ── Fail-closed fast path: no human can answer ──────────────────────
+    # A selected plugin transport is attempted unconditionally below (Phase 1),
+    # so this fast path only fires when there is genuinely no human present
+    # AND no selected transport is configured to run.  The CLI/gateway flags
+    # alone do not guarantee a human is watching, but a selected transport is
+    # an explicit host choice that must be allowed to run, so we must not deny
+    # before Phase 1 when those flags are both false.
+    if (
+        _is_single_query_approval_context()
+        or _is_cron_approval_context()
+        or _is_unattended_platform_approval_context()
+    ):
+        logger.info("Write-Gate approval denied (no human present): %s", request_id)
+        return {
+            "approved": False,
+            "decision": "deny",
+            "approval_reference": request_id,
+            "decision_at": "",
+        }
+
+    pattern_key = "write_gate:" + request_id
+    pattern_keys = [pattern_key]
+    surface = "gateway" if _is_gateway_approval_context() else "cli"
+
+    # ── Phase 1: explicitly selected plugin transport ──────────────────
+    transport_attempt = _present_with_selected_transport(
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=pattern_keys,
+        session_key=session_key,
+        surface=surface,
+        allow_session=False,
+        allow_permanent=False,
+    )
+    if transport_attempt.get("selected"):
+        return _write_gate_from_transport_result(transport_attempt, request_id)
+
+    # ── Phase 2: gateway / TUI / desktop (queue-based notify + await) ───
+    if _is_gateway_approval_context():
+        notify_cb = None
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+        if notify_cb is not None:
+            approval_data = {
+                "command": command,
+                "pattern_key": pattern_key,
+                "pattern_keys": pattern_keys,
+                "description": description,
+                "allow_permanent": False,
+                "allow_session": False,
+            }
+            decision = _await_gateway_decision(
+                session_key, notify_cb, approval_data, surface="gateway",
+            )
+            return _write_gate_from_gateway_decision(decision, request_id)
+
+    # ── Phase 3: interactive CLI single prompt ─────────────────────────
+    try:
+        choice = prompt_dangerous_approval(
+            command,
+            description,
+            allow_permanent=False,
+            allow_session=False,
+        )
+    except Exception as exc:  # transport failure / unexpected error
+        logger.warning("Write-Gate approval transport failed: %s", exc)
+        return {
+            "approved": False,
+            "decision": "deny",
+            "approval_reference": request_id,
+            "decision_at": "",
+        }
+
+    return _write_gate_from_cli_choice(choice, request_id)
+
+
+def _write_gate_from_transport_result(transport_attempt: dict, request_id: str) -> dict:
+    """Normalize a selected-transport result to the Write-Gate reference."""
+    choice = transport_attempt.get("choice")
+    failure = transport_attempt.get("failure")
+    if failure:
+        # Transport failed and there is no explicit builtin fallback.
+        return {
+            "approved": False,
+            "decision": "deny",
+            "approval_reference": request_id,
+            "decision_at": "",
+        }
+    if choice == "once":
+        return {
+            "approved": True,
+            "decision": "once",
+            "approval_reference": request_id,
+            "decision_at": _now_iso(),
+        }
+    return {
+        "approved": False,
+        "decision": choice or "deny",
+        "approval_reference": request_id,
+        "decision_at": "",
+    }
+
+
+def _write_gate_from_gateway_decision(decision: dict, request_id: str) -> dict:
+    """Normalize a gateway/async decision to the Write-Gate reference."""
+    if not decision.get("resolved") or decision.get("choice") not in ("once",):
+        return {
+            "approved": False,
+            "decision": decision.get("choice") or "deny",
+            "approval_reference": request_id,
+            "decision_at": "",
+        }
+    return {
+        "approved": True,
+        "decision": "once",
+        "approval_reference": request_id,
+        "decision_at": _now_iso(),
+    }
+
+
+def _write_gate_from_cli_choice(choice: str, request_id: str) -> dict:
+    """Normalize a CLI prompt_dangerous_approval choice to the reference."""
+    if choice == "once":
+        return {
+            "approved": True,
+            "decision": "once",
+            "approval_reference": request_id,
+            "decision_at": _now_iso(),
+        }
+    return {
+        "approved": False,
+        "decision": choice or "deny",
+        "approval_reference": request_id,
+        "decision_at": "",
+    }
+
+
 def _normalize_approval_mode(mode) -> str:
     """Normalize approval mode values loaded from YAML/config.
 
