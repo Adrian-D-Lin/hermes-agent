@@ -10,22 +10,39 @@ Covers ``writegate/enforcement.py`` and
   * ``write_gate_tool`` — the service-gated action discriminator.
 """
 
-import importlib
+import importlib.util
 from pathlib import Path
 
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PACKAGE = "writegate"
+_PLUGIN_DIR = _REPO_ROOT / "plugins" / "write-gate"
+
+
+@pytest.fixture
+def plugin():
+    """Import the plugin's ``__init__.py`` as a standalone module, with the
+    ``writegate`` package importable from the repo-root host package."""
+    import sys
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+    import writegate  # noqa: F401
+    spec = importlib.util.spec_from_file_location(
+        "writegate_plugin_under_test",
+        _PLUGIN_DIR / "__init__.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 @pytest.fixture
 def mods(monkeypatch):
-    """Import the ``writegate`` package + key submodules from the repo path."""
+    """Import the ``writegate`` package + key submodules from the repo-root
+    host package (no plugin-private ``sys.path`` insertion)."""
+    import importlib
     import sys
-    parent_path = str(_REPO_ROOT / "plugins" / "write-gate")
-    if parent_path not in sys.path:
-        sys.path.insert(0, parent_path)
     for name in list(sys.modules):
         if name == _PACKAGE or name.startswith(_PACKAGE + "."):
             del sys.modules[name]
@@ -41,8 +58,6 @@ def mods(monkeypatch):
     for name in list(sys.modules):
         if name == _PACKAGE or name.startswith(_PACKAGE + "."):
             del sys.modules[name]
-    if parent_path in sys.path:
-        sys.path.remove(parent_path)
 
 
 @pytest.fixture
@@ -141,3 +156,19 @@ def test_write_gate_tool_confirm_requires_binding(reg, mods):
 def test_write_gate_tool_unknown_action(reg, mods):
     out = mods.tool.write_gate_tool(action="no_such_action")
     assert out  # structured error response
+
+
+# -- pre_tool_call: fail closed without host session id -----------------------
+
+def test_pre_tool_call_blocks_without_session_id(plugin):
+    """Gate 2: a governed write with no host-owned session id must block, not
+    fall through to allow."""
+    import json
+    block = plugin._on_pre_tool_call(
+        tool_name="write_file",
+        args={"path": "/some/path.txt"},
+        # No session_id kwarg: the model cannot supply one.
+    )
+    assert block is not None
+    assert block.get("action") == "block"
+    assert "session" in block.get("message", "").lower()
