@@ -204,10 +204,10 @@ def _handle_confirm_binding(session_id: str) -> str:
             ),
         })
 
-    decision = _present_and_get_decision(
+    approval = _present_and_get_decision(
         candidate.to_presentation(), kind="CONFIRMED_WORKTREE_BINDING"
     )
-    record = producer.confirm(candidate, confirmed=(decision == "once"))
+    record = producer.confirm(candidate, confirmed=bool(approval["approved"]))
     if record is None:
         return json.dumps({
             "success": True,
@@ -257,10 +257,15 @@ def _handle_request_exception(session_id: str, model_args: Dict[str, Any]) -> st
     presentation = request.to_presentation()
     presentation["request_id"] = request_id
     # Present for approval; mint the lease only on a ``once`` decision.
-    decision = _present_and_get_decision(presentation, kind="WRITE_GATE_EXCEPTION")
+    approval = _present_and_get_decision(
+        presentation, kind="WRITE_GATE_EXCEPTION"
+    )
     lease = _approval.mint_lease(
-        reg, request_id=request_id, approval_reference=None,
-        decision=decision, decision_at=_decision_timestamp(decision),
+        reg,
+        request_id=request_id,
+        approval_reference=approval["approval_reference"],
+        decision="once" if approval["approved"] else "deny",
+        decision_at=approval["decision_at"],
         request=request,
     )
     if lease is None:
@@ -299,7 +304,9 @@ def _handle_status(session_id: str) -> str:
 # Approval presentation seam
 # ---------------------------------------------------------------------------
 
-def _present_and_get_decision(presentation: Dict[str, Any], kind: str) -> str:
+def _present_and_get_decision(
+    presentation: Dict[str, Any], kind: str
+) -> Dict[str, Any]:
     """Ask a human to authorize this Write-Gate request (``once`` / ``deny``).
 
     Routes through the host-owned, ``once``-only approval primitive in
@@ -307,23 +314,37 @@ def _present_and_get_decision(presentation: Dict[str, Any], kind: str) -> str:
     dangerous-command approvals.  It does **not** register a new approval
     transport (Hermes transports are presentation backends, not request types).
 
-    Returns ``"once"`` only on an explicit human approval; every other outcome
-    (timeout, deny, cancel, transport failure, headless) returns ``"deny"`` so
-    the caller fails closed.
+    Returns the host-owned structured approval result.  Only an explicit
+    ``once`` is normalized to ``approved=True``; every other outcome fails
+    closed.  The host's approval reference and decision timestamp are kept so
+    an exception lease is auditable against the exact surfaced approval.
     """
-    import os
-    if _is_headless():
-        # No human present: never wait for an approval nobody can see.
-        return "deny"
+    request_id = str(
+        presentation.get("request_id")
+        or f"wg-binding-{uuid.uuid4().hex}"
+    )
+    deny = {
+        "approved": False,
+        "decision": "deny",
+        "approval_reference": request_id,
+        "decision_at": "",
+    }
     try:
         from tools.approval import request_write_gate_approval
-        request_id = presentation.get("request_id", "")
         session_id = presentation.get("session_id", "")
-        description = (
-            f"Write-Gate exception: {presentation.get('stated_outcome', '')} "
-            f"for session {session_id}"
+        requested_change = (
+            presentation.get("stated_outcome")
+            or presentation.get("worktree_path")
+            or ""
         )
-        command = "write_gate_exception"
+        description = (
+            f"{kind}: {requested_change} for session {session_id}"
+        )
+        command = (
+            "write_gate_exception"
+            if kind == "WRITE_GATE_EXCEPTION"
+            else "write_gate_confirm_binding"
+        )
         result = request_write_gate_approval(
             request_id=request_id,
             command=command,
@@ -332,24 +353,19 @@ def _present_and_get_decision(presentation: Dict[str, Any], kind: str) -> str:
         )
     except Exception:
         # Transport failure -> fail closed (deny), never auto-confirm.
-        return "deny"
-    return "once" if result.get("approved") else "deny"
-
-
-def _is_headless() -> bool:
-    """Best-effort: no interactive TTY and no gateway present means no human."""
-    import os
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        return True  # dispatcher-spawned worker
-    try:
-        import sys
-        return not sys.stdin.isatty()
-    except Exception:
-        return True
-
-
-def _decision_timestamp(decision: str) -> str:
-    from datetime import datetime, timezone
-    if decision != "once":
-        return ""
-    return datetime.now(timezone.utc).isoformat()
+        return deny
+    if not isinstance(result, dict) or not result.get("approved"):
+        deny["approval_reference"] = str(
+            result.get("approval_reference") or request_id
+        ) if isinstance(result, dict) else request_id
+        return deny
+    if result.get("decision") != "once" or not result.get("decision_at"):
+        return deny
+    return {
+        "approved": True,
+        "decision": "once",
+        "approval_reference": str(
+            result.get("approval_reference") or request_id
+        ),
+        "decision_at": str(result["decision_at"]),
+    }

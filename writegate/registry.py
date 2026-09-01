@@ -835,7 +835,7 @@ class Registry:
                          request_id, session_id, confirmed_worktree,
                          narrowest_folder, recovery_location, stated_outcome,
                          status, created_at
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       ) VALUES (?,?,?,?,?,?,?,?)""",
                     (
                         request_id, session_id, confirmed_worktree,
                         narrowest_folder, recovery_location, stated_outcome,
