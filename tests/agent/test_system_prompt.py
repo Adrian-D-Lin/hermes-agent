@@ -76,6 +76,21 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+def test_kanban_guidance_requires_dispatcher_task(monkeypatch):
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    agent = _make_agent(
+        valid_tool_names=["kanban_show"],
+        _kanban_worker_guidance=None,
+    )
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert KANBAN_GUIDANCE not in _stable_prompt(agent)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+    assert KANBAN_GUIDANCE in _stable_prompt(agent)
+
+
 def _prompt_parts(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),

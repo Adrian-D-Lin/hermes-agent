@@ -251,10 +251,9 @@ def _(rid, params: dict) -> dict:
                     reasoning_config = agent_reasoning
 
         if isinstance(reasoning_config, dict):
-            if reasoning_config.get("enabled") is False:
-                effort = "none"
-            else:
-                effort = str(reasoning_config.get("effort") or "medium")
+            from hermes_constants import reasoning_config_option
+
+            effort = reasoning_config_option(reasoning_config)
         else:
             raw_effort = (cfg.get("agent") or {}).get("reasoning_effort", "")
             if raw_effort is False:

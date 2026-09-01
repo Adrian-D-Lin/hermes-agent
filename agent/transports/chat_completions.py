@@ -137,6 +137,37 @@ def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> di
     return reasoning_config
 
 
+def _apply_declared_reasoning_transport(
+    api_kwargs: dict[str, Any],
+    extra_body: dict[str, Any],
+    reasoning_config: dict | None,
+) -> None:
+    """Apply a manually declared model wire control after user overrides.
+
+    The late merge is intentional: a legacy provider ``extra_body`` may still
+    contain a fixed ``enable_thinking`` value. The selected per-session option
+    is authoritative and must not be silently contradicted by that stale body.
+    """
+    if not isinstance(reasoning_config, dict):
+        return
+    transport = reasoning_config.get("_transport")
+    if transport != "chat_template_enable_thinking":
+        return
+
+    # This transport has one native control. Remove generic CustomProfile
+    # fallbacks before setting it so vLLM receives no nonsensical effort field.
+    api_kwargs.pop("reasoning_effort", None)
+    extra_body.pop("reasoning", None)
+    extra_body.pop("think", None)
+    chat_template_kwargs = extra_body.get("chat_template_kwargs")
+    if not isinstance(chat_template_kwargs, dict):
+        chat_template_kwargs = {}
+    else:
+        chat_template_kwargs = dict(chat_template_kwargs)
+    chat_template_kwargs["enable_thinking"] = reasoning_config.get("enabled") is not False
+    extra_body["chat_template_kwargs"] = chat_template_kwargs
+
+
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
     """Translate Hermes/OpenRouter-style reasoning config to Gemini thinkingConfig."""
     if reasoning_config is None or not isinstance(reasoning_config, dict):
@@ -714,13 +745,21 @@ class ChatCompletionsTransport(ProviderTransport):
         if additions:
             extra_body.update(additions)
 
-        if extra_body:
-            api_kwargs["extra_body"] = extra_body
-
-        # Request overrides last (service_tier etc.)
+        # Request overrides last (service_tier etc.). Merge an override body
+        # instead of replacing the provider additions so the declared model
+        # transport can authoritatively normalize the final wire shape below.
         overrides = params.get("request_overrides")
         if overrides:
-            api_kwargs.update(overrides)
+            for key, value in overrides.items():
+                if key == "extra_body" and isinstance(value, dict):
+                    extra_body.update(value)
+                else:
+                    api_kwargs[key] = value
+
+        _apply_declared_reasoning_transport(api_kwargs, extra_body, reasoning_config)
+
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
 
         _add_prompt_cache_key(
             api_kwargs,
@@ -861,6 +900,8 @@ class ChatCompletionsTransport(ProviderTransport):
                     extra_body.update(v)
                 else:
                     api_kwargs[k] = v
+
+        _apply_declared_reasoning_transport(api_kwargs, extra_body, reasoning_config)
 
         if extra_body:
             # Native Gemini (generativelanguage.googleapis.com, non-/openai)

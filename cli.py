@@ -5397,7 +5397,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Reasoning config (OpenRouter reasoning effort level)
         # Per-model override > global reasoning_effort — resolved through the
         # shared chokepoint in hermes_constants (Closes #21256).
-        from hermes_constants import resolve_reasoning_config
+        from hermes_constants import (
+            constrain_reasoning_config,
+            resolve_reasoning_config,
+        )
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
         # An explicit --reasoning wins over config for this run only (never
         # persisted). Kanban's dispatcher uses it to pin a task's thinking
@@ -5412,7 +5415,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     reasoning,
                 )
             else:
-                self.reasoning_config = _cli_reasoning
+                self.reasoning_config = constrain_reasoning_config(
+                    CLI_CONFIG,
+                    self.model,
+                    _cli_reasoning,
+                    strict=True,
+                )
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -10265,9 +10273,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # was for the previous session only, not for every session spawned
         # afterwards.
         self._explicit_model_override = False
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model --session, /fast, one-turn restores) do not carry
         # forward.  Re-derive model/provider and service tier from config.yaml
@@ -10330,6 +10335,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Best-effort: an unreachable config default must never block
                 # /new. The session keeps the current working model.
                 logger.debug("/new model reset to config default failed", exc_info=True)
+        from hermes_constants import resolve_reasoning_config
+
+        self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
         _sync_process_session_id(self.session_id)
 
         if self.agent:

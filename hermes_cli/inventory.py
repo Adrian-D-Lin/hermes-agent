@@ -53,6 +53,7 @@ class ConfigContext:
     user_providers: dict
     custom_providers: list
     excluded_providers: list = None
+    reasoning_capabilities: dict = None
 
     def with_overrides(
         self,
@@ -111,6 +112,9 @@ def load_picker_context() -> ConfigContext:
         user_providers=stringify_provider_map(cfg.get("providers")),
         custom_providers=get_compatible_custom_providers(cfg),
         excluded_providers=excluded if isinstance(excluded, list) else [],
+        reasoning_capabilities=(cfg.get("agent") or {}).get("reasoning_capabilities", {})
+        if isinstance(cfg.get("agent"), dict)
+        else {},
     )
 
 
@@ -275,7 +279,7 @@ def build_models_payload(
     if pricing:
         _apply_pricing(rows, force_fresh_nous_tier=force_fresh_nous_tier)
     if capabilities:
-        _apply_capabilities(rows)
+        _apply_capabilities(rows, ctx)
     if featured:
         _apply_featured(rows)
     _apply_custom_aliases(rows)
@@ -434,7 +438,7 @@ def _reasoning_catalog_reader(slug: str):
     return None
 
 
-def _apply_capabilities(rows: list[dict]) -> None:
+def _apply_capabilities(rows: list[dict], ctx: ConfigContext) -> None:
     """Attach a ``{model: {fast, reasoning, ...}}`` map to each provider row.
 
     `fast` mirrors ``model_supports_fast_mode`` (the same gate the runtime
@@ -456,8 +460,17 @@ def _apply_capabilities(rows: list[dict]) -> None:
     advertise (``z-ai/glm-5.3`` publishes ``max, high, low`` yet serves
     ``minimal`` at its lowest thinking), so filtering the picker by that list
     would hide levels that demonstrably work.
+
+    A profile-local ``reasoning_capabilities`` declaration is authoritative
+    for a custom endpoint and supplies the exact UI choices/default. It takes
+    precedence over inferred and aggregator-catalog capability data.
     """
     from hermes_cli.models import model_supports_fast_mode
+    from hermes_constants import resolve_model_reasoning_capability
+
+    capability_cfg = {
+        "agent": {"reasoning_capabilities": ctx.reasoning_capabilities or {}}
+    }
 
     try:
         from agent.models_dev import get_model_capabilities
@@ -479,12 +492,22 @@ def _apply_capabilities(rows: list[dict]) -> None:
                 except Exception:
                     reasoning = True
 
+            declared = resolve_model_reasoning_capability(capability_cfg, model)
+            if declared is not None:
+                reasoning = True
+
             entry: dict[str, Any] = {
                 "fast": bool(model_supports_fast_mode(model)),
                 "reasoning": reasoning,
             }
+            if declared is not None:
+                entry["reasoning_options"] = declared["allowed_options"]
+                entry["reasoning_default"] = declared["default"]
+                entry["can_disable_reasoning"] = (
+                    "none" in declared["allowed_options"]
+                )
 
-            if reasoning and read_reasoning_catalog is not None:
+            if declared is None and reasoning and read_reasoning_catalog is not None:
                 try:
                     detail = read_reasoning_catalog(model)
                 except Exception:

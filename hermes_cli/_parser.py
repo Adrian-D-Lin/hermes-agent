@@ -204,7 +204,7 @@ def build_top_level_parser():
         default=None,
         metavar="LEVEL",
         help=(
-            "Reasoning effort for this invocation: none, minimal, low, medium, "
+            "Reasoning option for this invocation: none, on, minimal, low, medium, "
             "high, xhigh, max, or ultra. Overrides agent.reasoning_effort in "
             "config.yaml for this run only; the persistent level lives there "
             "(or per-model under agent.reasoning_overrides)."
@@ -414,7 +414,7 @@ def build_top_level_parser():
         default=argparse.SUPPRESS,
         metavar="LEVEL",
         help=(
-            "Reasoning effort for this session: none, minimal, low, medium, "
+            "Reasoning option for this session: none, on, minimal, low, medium, "
             "high, xhigh, max, or ultra. Overrides agent.reasoning_effort for "
             "this run only (same levels as the /reasoning slash command)."
         ),

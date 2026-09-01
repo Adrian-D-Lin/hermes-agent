@@ -56,11 +56,22 @@ def _(rid, params: dict) -> dict:
     create_reasoning_override = None
     if effort := str(params.get("reasoning_effort") or "").strip():
         try:
-            from hermes_constants import parse_reasoning_effort
+            from hermes_constants import (
+                constrain_reasoning_config,
+                parse_reasoning_effort,
+            )
 
             create_reasoning_override = parse_reasoning_effort(effort)
-        except Exception:
-            create_reasoning_override = None
+            if create_reasoning_override is None:
+                return _err(rid, 4002, f"unknown reasoning value: {effort}")
+            create_reasoning_override = constrain_reasoning_config(
+                _load_cfg(),
+                create_model or _resolve_model(),
+                create_reasoning_override,
+                strict=True,
+            )
+        except ValueError as exc:
+            return _err(rid, 4002, str(exc))
     # Presence is part of the contract: omitted means inherit the profile,
     # true pins priority, and false pins normal. Empty string is the internal
     # explicit-normal sentinel because _make_agent uses None for inheritance.

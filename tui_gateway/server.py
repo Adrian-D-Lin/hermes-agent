@@ -3876,7 +3876,11 @@ def _ensure_session_db_row(session: dict) -> None:
                 "custom provider identity recovery failed (db row)", exc_info=True
             )
     if (reasoning := session.get("create_reasoning_override")) is not None:
-        model_config["reasoning_config"] = reasoning
+        model_config["reasoning_config"] = {
+            key: value
+            for key, value in reasoning.items()
+            if not str(key).startswith("_")
+        }
     create_service_tier_override = session.get("create_service_tier_override")
     if create_service_tier_override is not None:
         # Empty string is the in-memory sentinel for an explicit normal tier:
@@ -5496,7 +5500,11 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     else:
         config.pop("api_mode", None)
     if isinstance(reasoning_config, dict):
-        config["reasoning_config"] = reasoning_config
+        config["reasoning_config"] = {
+            key: value
+            for key, value in reasoning_config.items()
+            if not str(key).startswith("_")
+        }
     else:
         config.pop("reasoning_config", None)
     if service_tier:
@@ -7362,14 +7370,13 @@ def _session_info(agent, session: dict | None = None) -> dict:
     reasoning_config = getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
     if isinstance(reasoning_config, dict):
-        if reasoning_config.get("enabled") is False:
-            # Disabled must be distinguishable from unset ("" = provider
-            # default). Reporting "" here made the desktop adopt the empty
-            # value after the first turn, wiping its sticky "thinking off"
-            # pick and re-creating every later chat at the default effort.
-            reasoning_effort = "none"
-        else:
-            reasoning_effort = str(reasoning_config.get("effort", "") or "")
+        # Disabled and effort-less enabled reasoning must both be
+        # distinguishable from unset ("" = provider default). Otherwise the
+        # desktop would repaint a boolean model's explicit On state as the
+        # profile's unrelated global effort after the first session.info.
+        from hermes_constants import reasoning_config_option
+
+        reasoning_effort = reasoning_config_option(reasoning_config)
     service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
@@ -8942,6 +8949,16 @@ def _make_agent(
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
+    from hermes_constants import constrain_reasoning_config
+
+    reasoning_config = (
+        reasoning_config_override
+        if reasoning_config_override is not None
+        else _load_reasoning_config(str(model or ""))
+    )
+    reasoning_config = constrain_reasoning_config(
+        cfg, str(model or ""), reasoning_config
+    )
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,
@@ -8959,11 +8976,7 @@ def _make_agent(
         # display detail).  See cli.py PR (decoupling fix) for the matching
         # change on the classic CLI side.
         verbose_logging=False,
-        reasoning_config=(
-            reasoning_config_override
-            if reasoning_config_override is not None
-            else _load_reasoning_config(str(model or ""))
-        ),
+        reasoning_config=reasoning_config,
         service_tier=(
             service_tier_override
             if service_tier_override is not None
@@ -14320,12 +14333,19 @@ def _(rid, params: dict) -> dict:
 
     if key == "reasoning":
         try:
-            from hermes_constants import parse_reasoning_effort
+            from hermes_constants import (
+                constrain_reasoning_config,
+                parse_reasoning_effort,
+            )
 
             arg = str(value or "").strip().lower()
             scope = str(params.get("scope") or "").strip().lower()
             global_scope = scope == "global"
-            if arg in {"show", "on"}:
+            effort_control = (
+                str(params.get("reasoning_control") or "").strip().lower()
+                == "effort"
+            )
+            if not effort_control and arg in {"show", "on"}:
                 cfg = _load_cfg_raw()  # write-back round-trip
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
@@ -14343,7 +14363,7 @@ def _(rid, params: dict) -> dict:
                 if session:
                     session["show_reasoning"] = True
                 return _ok(rid, {"key": key, "value": "show"})
-            if arg in {"hide", "off"}:
+            if not effort_control and arg in {"hide", "off"}:
                 cfg = _load_cfg_raw()  # write-back round-trip
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
@@ -14404,6 +14424,22 @@ def _(rid, params: dict) -> dict:
             parsed = parse_reasoning_effort(arg)
             if parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
+            target_model = ""
+            if session is not None:
+                pending = session.get("pending_model_switch") or {}
+                target_model = str(pending.get("display_model") or "").strip()
+                if not target_model:
+                    model_override = session.get("model_override") or {}
+                    if isinstance(model_override, dict):
+                        target_model = str(model_override.get("model") or "").strip()
+                if not target_model and session.get("agent") is not None:
+                    target_model = str(
+                        getattr(session["agent"], "model", "") or ""
+                    ).strip()
+            target_model = target_model or _resolve_model()
+            parsed = constrain_reasoning_config(
+                _load_cfg(), target_model, parsed, strict=True
+            )
             if global_scope or session is None:
                 _write_config_key("agent.reasoning_effort", arg)
                 if session is not None:
@@ -14424,6 +14460,8 @@ def _(rid, params: dict) -> dict:
                     _session_info(session["agent"], session),
                 )
             return _ok(rid, {"key": key, "value": arg})
+        except ValueError as e:
+            return _err(rid, 4002, str(e))
         except Exception as e:
             return _err(rid, 5001, str(e))
 

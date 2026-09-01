@@ -138,20 +138,20 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
-    Accepts any level in ``hermes_constants.VALID_REASONING_EFFORTS`` plus
-    ``"none"`` (thinking disabled), case-insensitively. Empty / None means
+    Accepts any option in ``hermes_constants.VALID_REASONING_OPTIONS``
+    (including ``"none"`` and boolean ``"on"``), case-insensitively. Empty / None means
     "inherit the worker profile's own ``agent.reasoning_effort``" and stores
     NULL. Anything else is rejected rather than silently dropped — a typo'd
     level must not quietly hand the task back to the profile default.
     """
-    from hermes_constants import VALID_REASONING_EFFORTS
+    from hermes_constants import VALID_REASONING_OPTIONS
 
     value = str(effort or "").strip().lower()
     if not value:
         return None
-    if value == "none" or value in VALID_REASONING_EFFORTS:
+    if value in VALID_REASONING_OPTIONS:
         return value
-    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+    allowed = ", ".join(VALID_REASONING_OPTIONS)
     raise ValueError(
         f"reasoning_effort must be one of {allowed}, got {effort!r}"
     )

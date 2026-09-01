@@ -356,6 +356,13 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+        # Optional per-model reasoning controls for endpoints whose accepted
+        # choices are narrower than Hermes' universal effort scale. Entries
+        # are keyed by model id (same spelling-tolerant matching as
+        # reasoning_overrides) and may declare allowed_options, default, and
+        # transport. Custom vLLM Qwen deployments commonly use the
+        # chat_template_enable_thinking boolean transport.
+        "reasoning_capabilities": {},
 
         # Per-provider opt-in to preserve assistant ``reasoning_content``
         # when replaying history.  The built-in echo families (DeepSeek,

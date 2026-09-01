@@ -1299,12 +1299,19 @@ VALID_REASONING_EFFORTS = (
     "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 )
 
+# ``on`` is the effort-less enabled state used by boolean thinking controls.
+# It is intentionally absent from VALID_REASONING_EFFORTS: a scale should not
+# render it unless a model capability explicitly asks for a boolean control.
+VALID_REASONING_OPTIONS = ("none", "on", *VALID_REASONING_EFFORTS)
+VALID_REASONING_TRANSPORTS = ("native", "chat_template_enable_thinking")
+
 
 def parse_reasoning_effort(effort) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max",
-    "ultra".
+    Valid levels: "none", "on", "minimal", "low", "medium", "high", "xhigh",
+    "max", "ultra". ``on`` enables thinking without inventing an effort value;
+    it is used by model declarations with a boolean reasoning control.
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none" (aliases: "false", "disabled", and
     YAML boolean False — users write ``reasoning_effort: false``/``off``/``no``
@@ -1322,6 +1329,8 @@ def parse_reasoning_effort(effort) -> dict | None:
     effort = effort.strip().lower()
     if effort in {"none", "false", "disabled"}:
         return {"enabled": False}
+    if effort in {"on", "true", "enabled"}:
+        return {"enabled": True}
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None
@@ -1452,6 +1461,138 @@ def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> di
     return None
 
 
+def resolve_model_reasoning_capability(cfg: dict | None, model: str) -> dict | None:
+    """Return a validated manual reasoning capability for ``model``.
+
+    ``agent.reasoning_capabilities`` is deliberately profile-local config: a
+    custom endpoint may expose a model id whose reasoning wire contract differs
+    from another endpoint serving the same family. Model keys use the same
+    bounded spelling-tolerant matching as ``reasoning_overrides``.
+
+    Accepted entry shape::
+
+        allowed_options: [none, on]
+        default: none
+        transport: chat_template_enable_thinking
+
+    A bare list is accepted as shorthand for ``allowed_options``. Invalid
+    entries are ignored rather than poisoning the model inventory.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    agent_cfg = cfg.get("agent")
+    if not isinstance(agent_cfg, dict):
+        return None
+    declarations = agent_cfg.get("reasoning_capabilities")
+    if not isinstance(declarations, dict) or not model:
+        return None
+
+    raw = None
+    for variant in _canonical_model_variants(model):
+        if variant in declarations:
+            raw = declarations[variant]
+            break
+    if raw is None:
+        return None
+
+    if isinstance(raw, (list, tuple)):
+        raw = {"allowed_options": list(raw)}
+    if not isinstance(raw, dict):
+        return None
+
+    raw_options = raw.get("allowed_options", raw.get("options"))
+    if not isinstance(raw_options, (list, tuple)):
+        return None
+    allowed_options: list[str] = []
+    for value in raw_options:
+        if value is True:
+            # PyYAML's YAML 1.1 resolver reads an unquoted ``on`` as True.
+            # Treat that common hand-written spelling as the intended binary
+            # reasoning option instead of silently dropping the control.
+            option = "on"
+        elif value is False:
+            option = "none"
+        else:
+            option = str(value or "").strip().lower()
+        if option in VALID_REASONING_OPTIONS and option not in allowed_options:
+            allowed_options.append(option)
+    if not allowed_options:
+        return None
+
+    raw_default = raw.get("default")
+    if raw_default is True:
+        default = "on"
+    elif raw_default is False:
+        default = "none"
+    else:
+        default = str(raw_default or "").strip().lower()
+    if default not in allowed_options:
+        default = "none" if "none" in allowed_options else allowed_options[0]
+
+    transport = str(raw.get("transport") or "native").strip().lower()
+    if transport not in VALID_REASONING_TRANSPORTS:
+        return None
+
+    return {
+        "allowed_options": allowed_options,
+        "default": default,
+        "transport": transport,
+    }
+
+
+def reasoning_config_option(reasoning_config: dict | None) -> str:
+    """Convert an internal reasoning config to its declarative option name."""
+    if not isinstance(reasoning_config, dict):
+        return ""
+    if reasoning_config.get("enabled") is False:
+        return "none"
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    return effort or "on"
+
+
+def constrain_reasoning_config(
+    cfg: dict | None,
+    model: str,
+    reasoning_config: dict | None,
+    *,
+    strict: bool = False,
+) -> dict | None:
+    """Validate and annotate a reasoning config against a model declaration.
+
+    Persisted pre-feature values use the declared default with a warning so a
+    newly added capability cannot brick existing sessions. Interactive callers
+    pass ``strict=True`` and receive ``ValueError`` for unsupported choices.
+    The private ``_transport`` annotation is consumed only while constructing
+    the provider request and is never persisted.
+    """
+    capability = resolve_model_reasoning_capability(cfg, model)
+    if capability is None:
+        return reasoning_config
+
+    option = reasoning_config_option(reasoning_config)
+    if not option:
+        option = capability["default"]
+    if option not in capability["allowed_options"]:
+        allowed = ", ".join(capability["allowed_options"])
+        message = (
+            f"Reasoning option '{option}' is not supported by {model}; "
+            f"allowed options: {allowed}"
+        )
+        if strict:
+            raise ValueError(message)
+        import logging
+        logging.getLogger(__name__).warning(
+            "%s; using declared default '%s'", message, capability["default"]
+        )
+        option = capability["default"]
+
+    constrained = parse_reasoning_effort(option)
+    if constrained is None:
+        return reasoning_config
+    constrained = dict(constrained)
+    constrained["_transport"] = capability["transport"]
+    return constrained
+
+
 def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     """Resolve the effective reasoning config for *model* from a config dict.
 
@@ -1498,7 +1639,7 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     overrides = agent_cfg.get("reasoning_overrides") or {}
     per_model = resolve_per_model_reasoning_effort(model, overrides)
     if per_model is not None:
-        return per_model
+        return constrain_reasoning_config(cfg, model, per_model)
 
     # Global fallback — keep the raw value; coercing with ``or ""`` turns a
     # YAML boolean False into "", silently re-enabling thinking for users
@@ -1510,7 +1651,7 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
         logging.getLogger(__name__).warning(
             "Unknown reasoning_effort '%s', using default (medium)", effort
         )
-    return result
+    return constrain_reasoning_config(cfg, model, result)
 
 
 def is_termux() -> bool:
