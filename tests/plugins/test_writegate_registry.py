@@ -1,6 +1,6 @@
 """Tests for the write-gate registry (session binding + supersession + migration).
 
-Covers ``plugins/write-gate/writegate/registry.py``:
+Covers ``writegate/registry.py``:
 
   * ``create_binding`` inserts a row, marks any prior active binding for the
     same session ``superseded`` (one active binding per session), and returns
@@ -27,12 +27,9 @@ _PACKAGE = "writegate"
 
 @pytest.fixture
 def wgr(monkeypatch):
-    """Import the ``writegate.registry`` module from the repo path (as the
-    plugin loader would), so relative imports inside the modules resolve."""
+    """Import the ``writegate.registry`` module from the repo-root host
+    package, so relative imports inside the modules resolve."""
     import sys
-    parent_path = str(_REPO_ROOT / "plugins" / "write-gate")
-    if parent_path not in sys.path:
-        sys.path.insert(0, parent_path)
     # Import the package fresh each test.
     for name in list(sys.modules):
         if name == _PACKAGE or name.startswith(_PACKAGE + "."):
@@ -43,8 +40,6 @@ def wgr(monkeypatch):
     for name in list(sys.modules):
         if name == _PACKAGE or name.startswith(_PACKAGE + "."):
             del sys.modules[name]
-    if parent_path in sys.path:
-        sys.path.remove(parent_path)
 
 
 @pytest.fixture

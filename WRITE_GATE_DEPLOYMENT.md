@@ -10,13 +10,13 @@ central worktree binding.
 | Path | Role |
 |------|------|
 | `plugins/write-gate/__init__.py` | Plugin entrypoint. Registers the tool + hook only when `security.write_gate.enabled`. Thin registration surface. |
-| `plugins/write-gate/writegate/enforcement.py` | `decide()` — fail-closed gate on governed mutations. Reads the **host-owned** `session_id` from hook kwargs. |
-| `plugins/write-gate/writegate/tool.py` | `write_gate_tool()` — the service-gated control tool. Uses only the host-owned `session_id` kwarg. |
-| `plugins/write-gate/writegate/registry.py` | Central binding registry (`~/.hermes/write-gate.db`). Shared primitive, importable by the dispatcher. |
-| `plugins/write-gate/writegate/binding.py` | `TrustedBindingProducer` — derives/confirm binding candidates from trusted state, never model paths. |
-| `plugins/write-gate/writegate/approval.py` | `request_write_gate_approval()` — the host-owned, `once`-only approval primitive. |
-| `plugins/write-gate/writegate/recovery.py` | `RecoveryWriter` + `compute_recovery_location()` — out-of-worktree exception recovery. |
-| `plugins/write-gate/writegate/containment.py` | `canonicalize_target()` — path containment checks. |
+| `writegate/enforcement.py` | `decide()` — fail-closed gate on governed mutations. Reads the **host-owned** `session_id` from hook kwargs. |
+| `writegate/tool.py` | `write_gate_tool()` — the service-gated control tool. Uses only the host-owned `session_id` kwarg. |
+| `writegate/registry.py` | Central binding registry (`~/.hermes/write-gate.db`). Shared primitive, importable by the dispatcher. |
+| `writegate/binding.py` | `TrustedBindingProducer` — derives/confirm binding candidates from trusted state, never model paths. |
+| `writegate/approval.py` | `request_write_gate_approval()` — the host-owned, `once`-only approval primitive. |
+| `writegate/recovery.py` | `RecoveryWriter` + `compute_recovery_location()` — out-of-worktree exception recovery. |
+| `writegate/containment.py` | `canonicalize_target()` — path containment checks. |
 | `hermes_cli/kanban_db.py` | `prepare_worker_launch()` (dispatcher side) + `_trusted_worker_session_id()` (CLI side). |
 | `cli.py` | `_resolve_preassigned_worker_session_id()` — honors the preassigned id when trusted markers agree. |
 
@@ -92,10 +92,13 @@ keeps its own generated id.
 
 ## Import path (shared primitives)
 
-The dispatcher shares `writegate.registry` with the plugin. `_ensure_writegate_importable()`
-in `kanban_db.py` adds the plugin directory to `sys.path` if `writegate` is not
-yet importable, so the pre-spawn binding handshake does not depend on
-plugin-registration ordering.
+The shared WriteGate primitives are a **repo-root host package** (`writegate/`)
+importable before plugin discovery — not a plugin-private tree. The dispatcher
+shares `writegate.registry` with the plugin. `_ensure_writegate_importable()`
+in `kanban_db.py` adds the repository root to `sys.path` only if `writegate`
+is not yet resolvable, so the pre-spawn binding handshake does not depend on
+plugin-registration ordering. The thin plugin `__init__.py` performs the same
+guard so the registration surface works regardless of loader or ordering.
 
 ## Testing
 
@@ -107,6 +110,16 @@ Focused suites:
 * `tests/plugins/test_writegate_enforcement.py` — `decide()` gate + tool entrypoint.
 * `tests/plugins/test_writegate_recovery.py` — recovery-writer lineage.
 * `tests/plugins/test_writegate_plugin_register.py` — gated registration.
+* `tests/plugins/test_writegate_host_owned_import.py` — repo-root host-package
+  importability (Gate 1): proves `writegate` resolves without a plugin-private
+  `sys.path` insertion.
+* `tests/plugins/test_writegate_lineage.py` — binding lineage (resume, branch,
+  delegate, supersession, confirmed-binding history).
+* `tests/plugins/test_writegate_multitarget.py` — multi-target preflight,
+  recovery evidence, move governs both endpoints, exact lease worktree equality.
+* `tests/tools/test_writegate_approval_correlation.py` — approval identity and
+  correlation: wrong/absent id fails closed, generic approvals cannot authorize,
+  gateway-without-notify fails closed, reconnect replay, host reference.
 * `tests/tools/test_writegate_approval_primitive.py` — approval fast-path + selected-transport.
 
 Run with the CI-parity runner:
@@ -114,7 +127,7 @@ Run with the CI-parity runner:
 ```bash
 HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   bash scripts/run_tests.sh tests/hermes_cli/test_kanban_writegate_preassignment.py \
-  tests/plugins/test_writegate_*.py tests/tools/test_writegate_approval_primitive.py -q
+  tests/plugins/test_writegate_*.py tests/tools/test_writegate_*.py -q
 ```
 
 ## Failure modes

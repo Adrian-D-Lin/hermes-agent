@@ -27,8 +27,8 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT / "plugins" / "write-gate") not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT / "plugins" / "write-gate"))
+# The ``writegate`` package is a repo-root host package, importable without
+# any plugin-private sys.path insertion.
 
 
 @pytest.fixture

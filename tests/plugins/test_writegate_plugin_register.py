@@ -33,13 +33,10 @@ class _Ctx:
 @pytest.fixture
 def plugin(tmp_path, monkeypatch):
     """Import the plugin's ``__init__.py`` as a standalone module, with the
-    ``writegate`` package importable (as the real plugin loader makes it so)."""
+    ``writegate`` package importable from the repo-root host package."""
     import sys
-    writegate_path = str(_REPO_ROOT / "plugins" / "write-gate")
-    if writegate_path not in sys.path:
-        sys.path.insert(0, writegate_path)
-    # Make the writegate package importable immediately (the plugin's
-    # register() does ``from writegate import enforcement`` at call time).
+    # The writegate package is a repo-root host package, importable without
+    # any plugin-private sys.path insertion.
     import writegate  # noqa: F401
     spec = importlib.util.spec_from_file_location(
         "writegate_plugin_under_test",

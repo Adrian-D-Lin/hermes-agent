@@ -10841,10 +10841,10 @@ def _ensure_writegate_importable() -> bool:
     """Make the ``writegate`` package importable for the dispatcher.
 
     The dispatcher shares primitives (``registry``) with the WriteGate plugin.
-    When the feature is enabled the plugin is normally already registered, but
-    the import must not depend on plugin-registration ordering. If ``writegate``
-    is not yet importable, add the plugin directory to ``sys.path`` so the
-    dispatcher can resolve it. Returns True when the import now succeeds.
+    The package is a repo-root host package (``writegate/``) so it is
+    importable before plugin discovery, as long as the repository root is on
+    ``sys.path`` (it is, for the core import path).  Returns True when the
+    import now succeeds.
     """
     try:
         import importlib
@@ -10855,14 +10855,15 @@ def _ensure_writegate_importable() -> bool:
         if "writegate" in sys.modules or importlib.util.find_spec("writegate") is not None:
             return True
 
-        # The plugin lives at plugins/write-gate/writegate/. Walk up from this
-        # file to find the repo, then add the plugin dir to sys.path.
+        # The host package lives at the repository root.  Add it to ``sys.path``
+        # only if the root is not already importable, so the import does not
+        # depend on plugin-registration ordering.
         here = os.path.dirname(os.path.abspath(__file__))
         for _ in range(6):
-            candidate = os.path.join(here, "plugins", "write-gate")
-            if os.path.isdir(candidate):
-                if candidate not in sys.path:
-                    sys.path.insert(0, candidate)
+            if os.path.isdir(os.path.join(here, "writegate")):
+                root = os.path.abspath(here)
+                if root not in sys.path:
+                    sys.path.insert(0, root)
                 break
             parent = os.path.dirname(here)
             if parent == here:

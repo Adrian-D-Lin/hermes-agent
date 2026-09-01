@@ -3502,6 +3502,19 @@ def request_write_gate_approval(
                 session_key, notify_cb, approval_data, surface="gateway",
             )
             return _write_gate_from_gateway_decision(decision, request_id)
+        # Gateway/TUI/desktop context but no registered notify callback: there
+        # is no human-facing surface to present the request to. Fail closed
+        # (deny) rather than falling through to an invisible CLI prompt.
+        logger.info(
+            "Write-Gate approval denied (gateway context, no notify callback): %s",
+            request_id,
+        )
+        return {
+            "approved": False,
+            "decision": "deny",
+            "approval_reference": request_id,
+            "decision_at": "",
+        }
 
     # ── Phase 3: interactive CLI single prompt ─────────────────────────
     try:
@@ -3551,18 +3564,26 @@ def _write_gate_from_transport_result(transport_attempt: dict, request_id: str) 
 
 
 def _write_gate_from_gateway_decision(decision: dict, request_id: str) -> dict:
-    """Normalize a gateway/async decision to the Write-Gate reference."""
+    """Normalize a gateway/async decision to the Write-Gate reference.
+
+    The durable ``approval_reference`` is the **host-generated**
+    ``ApprovalEntry`` request id (``decision["request_id"]``), not the
+    tool-supplied ``request_id`` label: the entry id is what the gateway
+    correlates a ``/approve`` or ``/deny`` against, so it is the value that
+    must survive into the lease record.
+    """
+    host_ref = decision.get("request_id") or request_id
     if not decision.get("resolved") or decision.get("choice") not in ("once",):
         return {
             "approved": False,
             "decision": decision.get("choice") or "deny",
-            "approval_reference": request_id,
+            "approval_reference": host_ref,
             "decision_at": "",
         }
     return {
         "approved": True,
         "decision": "once",
-        "approval_reference": request_id,
+        "approval_reference": host_ref,
         "decision_at": _now_iso(),
     }
 
@@ -4896,7 +4917,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    return {"resolved": resolved, "choice": choice, "reason": entry.reason,
+            "request_id": entry.data.get("request_id")}
 
 
 def check_all_command_guards(command: str, env_type: str,

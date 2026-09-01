@@ -1,7 +1,7 @@
 """Tests for the write-gate recovery snapshot writer and the tool entrypoint.
 
-Covers ``plugins/write-gate/writegate/recovery.py`` and
-``plugins/write-gate/writegate/tool.py``:
+Covers ``writegate/recovery.py`` and
+``writegate/tool.py``:
 
   * ``derive_project_root`` walks up to the ``.git`` directory and falls back
     to the worktree itself for a non-Git path.

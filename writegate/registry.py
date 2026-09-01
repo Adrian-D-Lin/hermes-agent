@@ -903,7 +903,7 @@ class Registry:
                          lease_id, approval_reference, session_id,
                          confirmed_worktree, approved_folder, approved_at,
                          expires_at, status
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       ) VALUES (?,?,?,?,?,?,?,?)""",
                     (
                         lease_id, approval_reference, session_id,
                         confirmed_worktree, approved_folder, approved_at,

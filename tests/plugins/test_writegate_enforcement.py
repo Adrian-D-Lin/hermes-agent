@@ -1,7 +1,7 @@
 """Tests for the write-gate enforcement ``decide`` path and the tool entrypoint.
 
-Covers ``plugins/write-gate/writegate/enforcement.py`` and
-``plugins/write-gate/writegate/tool.py``:
+Covers ``writegate/enforcement.py`` and
+``writegate/tool.py``:
 
   * ``is_always_allowed`` / ``is_recognized_kanban`` — the read/kanban
     exemption set.
