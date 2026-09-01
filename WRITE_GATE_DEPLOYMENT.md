@@ -240,7 +240,7 @@ as a `hooks.pre_tool_call` command:
 The new plugin registers its **own** `pre_tool_call` hook. Both must not be
 active at once — that would run two enforcement paths on the same write. The
 independent `hooks.pre_llm_call` session-startup-checklist hook is unrelated and
-stays.
+stays — **except for the builder-tester profile, explained below.**
 
 **Production targets.** Every production agent home, because discovery and hook
 resolution read the active profile config:
@@ -251,6 +251,23 @@ resolution read the active profile config:
 - `/home/progenitor/.hermes/profiles/test-authority-reviewer/config.yaml`
 
 The temporary `qwen-build-*` audit profiles are **not** production targets.
+
+> **Builder-tester is out of scope for the Session Startup Protocol.** Adrian
+> decided that the builder-tester profile must **not** have the Session Startup
+> Protocol applied. The `hooks.pre_llm_call` entry currently present in
+> `profiles/builder-tester/config.yaml` is a **development and test artifact**
+> from S2 cards `t_6e26b52e` and `t_323cd67d` (it wired the `session-startup-
+> checklist.py` script into the profile during integration testing). It is **not**
+> a production role requirement. On cutover the builder-tester profile **removes
+> its residual `hooks.pre_llm_call` startup hook**; it must **not** be added back.
+> The global default profile, by contrast, **retains** its
+> `hooks.pre_llm_call` (`session-startup-checklist.py`) — it is the production
+> home for the Session Startup Protocol.
+>
+> The `independent-reviewer` and `test-authority-reviewer` profiles currently have
+> **no** `hooks.pre_llm_call` entry and must **remain without one** — do not add
+> it. All four profiles still receive the WriteGate plugin gates and have the
+> legacy `hooks.pre_tool_call` enforcement hook removed.
 
 This cutover runs under the dual-PGX master plan. Two rules matter:
 
@@ -293,32 +310,45 @@ With the services down there is no window in which governed writes are
 ungoverned: the gateway is simply not serving.
 
 **3c. Render the four `config.next` files.** For each config, write the
-post-cutover YAML to a `config.next` sibling:
+post-cutover YAML to a `config.next` sibling. The `pre_tool_call` and
+`pre_llm_call` handling differs by profile:
 
 * set `security.write_gate.enabled: true` and add `write-gate` to
   `plugins.enabled`;
 * **remove** the entire `hooks.pre_tool_call` entry (the legacy
-  `write-gate-enforcement.py` command);
-* **retain** `hooks.pre_llm_call` (`session-startup-checklist.py`) unchanged.
+  `write-gate-enforcement.py` command) from **all four** configs;
+* **global** (`/home/progenitor/.hermes/config.next`): **retain**
+  `hooks.pre_llm_call` (`session-startup-checklist.py`) unchanged — this is the
+  production home of the Session Startup Protocol;
+* **builder-tester** (`…/profiles/builder-tester/config.next`): **remove** the
+  residual `hooks.pre_llm_call` entry (`session-startup-checklist.py`). The
+  builder-tester profile is out of scope for the Session Startup Protocol (see the
+  note in §3) — this is the one place the startup hook is dropped, not retained;
+* **independent-reviewer** and **test-authority-reviewer** (`…/config.next`):
+  leave as-is — they have **no** `pre_llm_call` entry, and none must be added.
 
 Edit each `config.next` by hand or with a small script; do not edit the live
 `config.yaml` in place yet.
 
 **3d. Validate every `config.next` before install.** Each must parse, enable the
-plugin, and carry no `pre_tool_call` entry. Run from the integration worktree
+plugin, and carry no `pre_tool_call` entry. Additionally, `pre_llm_call` is
+profile-specific: present in the global config, absent from builder-tester, and
+absent from the two reviewer profiles. Run from the integration worktree
 checkout (or set `PYTHONPATH` to it) so the import resolves:
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
 /home/progenitor/.hermes/hermes-agent/.venv/bin/python -c "
 import yaml
-files = [
-  '/home/progenitor/.hermes/config.next',
-  '/home/progenitor/.hermes/profiles/builder-tester/config.next',
-  '/home/progenitor/.hermes/profiles/independent-reviewer/config.next',
-  '/home/progenitor/.hermes/profiles/test-authority-reviewer/config.next',
-]
-for f in files:
+files = {
+  'global': '/home/progenitor/.hermes/config.next',
+  'builder-tester': '/home/progenitor/.hermes/profiles/builder-tester/config.next',
+  'independent-reviewer': '/home/progenitor/.hermes/profiles/independent-reviewer/config.next',
+  'test-authority-reviewer': '/home/progenitor/.hermes/profiles/test-authority-reviewer/config.next',
+}
+expected_pre_llm_call = {'global': True, 'builder-tester': False,
+                         'independent-reviewer': False, 'test-authority-reviewer': False}
+for name, f in files.items():
     c = yaml.safe_load(open(f)) or {}
     pl = c.get('plugins', {})
     sec = c.get('security', {})
@@ -327,10 +357,18 @@ for f in files:
     assert pl.get('enabled') and 'write-gate' in pl['enabled'], f'{f}: plugin not enabled'
     assert wg.get('enabled') is True, f'{f}: security flag not true'
     assert 'pre_tool_call' not in hooks, f'{f}: legacy pre_tool_call not removed'
-    assert 'pre_llm_call' in hooks, f'{f}: pre_llm_call startup hook missing'
-    print(f'{f}: OK (plugin enabled, security flag on, legacy hook removed, pre_llm_call retained)')
+    assert ('pre_llm_call' in hooks) == expected_pre_llm_call[name], \
+        f'{f}: pre_llm_call present={\"pre_llm_call\" in hooks}, expected {expected_pre_llm_call[name]}'
+    print(f'{name}: OK (plugin enabled, security flag on, legacy hook removed, '
+          f'pre_llm_call={expected_pre_llm_call[name]})')
 "
 ```
+
+**Expected.** One `OK` line per profile, exit code 0. The global profile reports
+`pre_llm_call=True`; builder-tester and the two reviewer profiles report
+`pre_llm_call=False`. This is the profile-specific validation that replaces the
+old all-files `pre_llm_call` assertion, which would have failed on builder-tester
+(and would have wrongly required the reviewer profiles to gain one).
 
 **3e. Install all four as one maintenance change.** Swap each validated
 `config.next` over the live `config.yaml` atomically:
@@ -353,7 +391,9 @@ systemctl --user is-active hermes-gateway.service hermes-serve.service   # expec
 ```
 
 The cutover is complete: the plugin is the sole `pre_tool_call` enforcement path,
-`pre_llm_call` startup is retained, and there was never a half-cutover state.
+the global profile's `pre_llm_call` startup is retained, the builder-tester
+profile's residual startup hook is dropped, and the reviewer profiles gained no
+startup hook — there was never a half-cutover state.
 
 > **No separate enable or restart step is needed.** This atomic cutover already
 > set both `security.write_gate.enabled` and `plugins.enabled` and restarted the
