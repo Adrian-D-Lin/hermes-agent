@@ -745,6 +745,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_TASK") == tid
     assert env.get("HERMES_PROFILE") == "some-profile"
+    assert env.get("HERMES_KANBAN_PROFILE") == "some-profile"
 
 
 # ---------------------------------------------------------------------------
@@ -1414,5 +1415,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 
