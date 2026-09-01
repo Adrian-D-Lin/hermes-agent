@@ -164,6 +164,15 @@ def _on_pre_tool_call(
         from writegate import enforcement as _enforcement
         from writegate import registry as _registry
 
+        # Classification comes before identity enforcement.  Reads, the
+        # Write-Gate control tool, and the exact canonical Kanban operations
+        # are intentionally outside the governed-write path and therefore do
+        # not require a session binding.  Requiring a host session id first
+        # would turn the Write-Gate into a read gate and can deadlock startup
+        # before Session Startup has established the identity it needs.
+        if _enforcement.is_always_allowed(str(tool_name)):
+            return None
+
         # Host-owned session id only. model_tools forwards it through
         # registry.dispatch kwargs; the model may NOT supply it (or any other
         # authority field). There is no args fallback — a model-supplied
@@ -172,8 +181,8 @@ def _on_pre_tool_call(
             kwargs.get("session") or ""
         )
         if not session_id:
-            # No host-owned session id: fail closed. A governed write with no
-            # trusted session identity must be blocked, not allowed through.
+            # No host-owned session id: fail closed for a governed write.  The
+            # intentionally exempt routes returned above.
             return {"action": "block", "message": "Write-Gate: no host-owned session id; fail-closed block"}
         reg = _registry.get_registry()
         project_root = _resolve_project_root(reg, session_id)
