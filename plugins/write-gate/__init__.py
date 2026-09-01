@@ -22,6 +22,45 @@ TOOLSET = "write_gate"
 HOOK_EVENT = "pre_tool_call"
 
 
+def _ensure_host_package_importable() -> None:
+    """Make the repo-root ``writegate`` host package importable.
+
+    The shared primitives live at the repository root (not inside the
+    plugin-private directory).  When the plugin is loaded as an isolated
+    module the repo root may not already be on ``sys.path`` (e.g. a pip
+    install), so add it if the package is not yet resolvable.  This lets the
+    thin registration surface import ``writegate`` regardless of loader or
+    ordering.
+    """
+    import importlib.util
+    import os
+    import sys
+
+    if importlib.util.find_spec("writegate") is not None:
+        return
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(6):
+        if os.path.isdir(os.path.join(here, "writegate")):
+            root = os.path.abspath(here)
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            break
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+
+
+# Ensure the host package resolves before any ``register()`` import.
+_host_import_ready = False
+try:
+    _ensure_host_package_importable()
+    _host_import_ready = True
+except Exception:  # pragma: no cover - defensive, loader-dependent
+    _host_import_ready = False
+
+
 def _write_gate_enabled() -> bool:
     """Read ``security.write_gate.enabled`` from the global config.
 

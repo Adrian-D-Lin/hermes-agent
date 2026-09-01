@@ -1638,6 +1638,17 @@ DEFAULT_CONFIG = {
         # enabled (e.g. `elevenlabs`). False = require explicit pip install for everything beyond
         # the base set (restricted/audited/air-gapped environments).
         "allow_lazy_installs": True,
+        # Integrated Session-Startup Protocol + WriteGate governance. Inert
+        # unless explicitly enabled: the plugin registers one service-gated
+        # tool (``write_gate``) and one ``pre_tool_call`` enforcement hook.
+        # When true, ordinary governed writes inside the confirmed worktree
+        # are allowed, while protected/out-of-worktree writes route through a
+        # bounded once-only approval, five-minute lease, and verified recovery.
+        # No live deployment enables this from this builder card — see
+        # WRITE_GATE_DEPLOYMENT.md for the exact manifest/checklist.
+        "write_gate": {
+            "enabled": False,
+        },
     },
 
     "cron": {

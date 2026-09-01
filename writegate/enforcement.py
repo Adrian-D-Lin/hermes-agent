@@ -278,8 +278,11 @@ def decide(
             return _traversal_or_unresolvable(t)
         # Containment within the bound worktree.
         within = is_within(canonical, worktree)
-        # Symlink-escape defense in depth.
-        esc = resolve_symlink_escape(canonical, worktree)
+        # Symlink-escape defense in depth.  The escape boundary is the
+        # *project root* (the only boundary a lease can legitimately extend
+        # beyond the bound worktree); an out-of-worktree target authorized by
+        # a matching lease is *not* a symlink escape.
+        esc = resolve_symlink_escape(canonical, project_root) if project_root else False
         # Protected-location check (relative to the project root).
         protected = _is_protected(canonical, project_root)
         if esc:
