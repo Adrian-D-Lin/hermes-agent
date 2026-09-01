@@ -172,15 +172,28 @@ If `git status --short` is **not** clean, stop — the working tree still has
 uncommitted changes and `git merge --ff-only` will refuse. Resolve the residual
 state before continuing.
 
-**2c. Verify the worktree branch is a fast-forward of the live HEAD, then merge.**
+**2c. Verify that the actual live checkout HEAD is an ancestor of the actual integration branch tip, so the live checkout can fast-forward.**
+
+The present command was run from the integration worktree and compared that
+HEAD to its own branch, so it was trivially true and did not prove the live
+checkout can fast-forward. Capture the two endpoints explicitly — the live
+checkout HEAD from the Primus repo, and the integration tip from the
+worktree — and pass them to `merge-base --is-ancestor` in that order. The
+integration tip is dynamic and advances each runbook run, so read it live
+rather than hard-coding it.
 
 ```bash
-cd /home/progenitor/AI-main/hermes-startup-writegate-build
-# Current integration tip (dynamic — do not hard-code; it advances each runbook run):
-git rev-parse --short HEAD
-git merge-base --is-ancestor $(git rev-parse HEAD) integration/startup-writegate-runtime && \
-  echo "integration branch tip is reachable from this branch"
+LIVE=/home/progenitor/.hermes/hermes-agent
+WORK=/home/progenitor/AI-main/hermes-startup-writegate-build
+LIVE_HEAD=$(git -C "$LIVE" rev-parse HEAD)          # live checkout HEAD
+INTEGRATION_TIP=$(git -C "$WORK" rev-parse integration/startup-writegate-runtime)
+git merge-base --is-ancestor "$LIVE_HEAD" "$INTEGRATION_TIP" && \
+  echo "live HEAD is an ancestor of the integration tip — fast-forward is possible"
 ```
+
+If this test fails, the live checkout has diverged from the integration branch
+and `git merge --ff-only` (step 2d) will refuse — stop and re-evaluate rather
+than forcing a merge.
 
 **2d. Fast-forward the live checkout.**
 
