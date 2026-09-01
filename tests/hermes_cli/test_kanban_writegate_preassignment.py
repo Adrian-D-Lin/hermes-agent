@@ -136,6 +136,40 @@ def test_prepare_worker_launch_persists_run_and_binding(kanban_home, tmp_path, m
         conn.close()
 
 
+def test_prepare_worker_launch_is_visible_to_fresh_connection(
+    kanban_home, tmp_path, monkeypatch
+):
+    """The run-row preassignment is durable before the worker can spawn."""
+    reg = _writegate_registry(tmp_path)
+    _patch_registry(monkeypatch, reg)
+    conn = kb.connect()
+    fresh = None
+    try:
+        workspace = str(tmp_path / "wt")
+        (tmp_path / "wt").mkdir()
+        task = _make_task(conn, kb, workspace_path=workspace)
+        claimed, run_id = _claim(conn, task)
+
+        worker_id = kb.prepare_worker_launch(
+            conn, claimed, workspace, board="default"
+        )
+
+        # Do not commit on ``conn`` here. A separate connection models the
+        # worker process reading the run row immediately after Popen.
+        fresh = kb.connect()
+        row = fresh.execute(
+            "SELECT worker_session_id FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (run_id, task.id),
+        ).fetchone()
+        assert row is not None
+        assert row["worker_session_id"] == worker_id
+    finally:
+        if fresh is not None:
+            fresh.close()
+        conn.close()
+
+
 def test_prepare_worker_launch_returns_empty_without_run(kanban_home, tmp_path, monkeypatch):
     reg = _writegate_registry(tmp_path)
     _patch_registry(monkeypatch, reg)

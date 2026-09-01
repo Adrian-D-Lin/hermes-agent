@@ -10358,7 +10358,10 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    worker_session_id=worker_session_id,
+                )
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -10502,14 +10505,24 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
+                params = sig.parameters
+                if "board" in params and "worker_session_id" in params:
+                    pid = _spawn(claimed, str(workspace), board=board,
+                                 worker_session_id=worker_session_id)
+                elif "board" in params:
                     pid = _spawn(claimed, str(workspace), board=board)
+                elif "worker_session_id" in params:
+                    pid = _spawn(claimed, str(workspace),
+                                 worker_session_id=worker_session_id)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    worker_session_id=worker_session_id,
+                )
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -10974,16 +10987,20 @@ def _persist_worker_session_id(
     reference is ``task_id`` — there is no ``run_id`` column. Match on both the
     exact run id and the task id, assert exactly one row, and read it back.
     """
-    cur = conn.execute(
-        "UPDATE task_runs SET worker_session_id = ? "
-        "WHERE id = ? AND task_id = ?",
-        [worker_session_id, int(run_id), task_id],
-    )
-    if cur.rowcount != 1:
-        raise RuntimeError(
-            f"WriteGate: expected exactly one task_runs row for run "
-            f"{run_id} / task {task_id}, found {cur.rowcount}"
+    # This transaction must commit before Popen. The worker verifies the
+    # preassignment through a fresh connection during CLI startup; leaving the
+    # UPDATE pending on the dispatcher connection creates a visibility race.
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET worker_session_id = ? "
+            "WHERE id = ? AND task_id = ?",
+            [worker_session_id, int(run_id), task_id],
         )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"WriteGate: expected exactly one task_runs row for run "
+                f"{run_id} / task {task_id}, found {cur.rowcount}"
+            )
 
 
 def _create_and_verify_central_binding(
