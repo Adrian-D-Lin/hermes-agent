@@ -170,6 +170,62 @@ def test_prepare_worker_launch_is_visible_to_fresh_connection(
         conn.close()
 
 
+def test_dispatch_resolves_one_board_for_binding_spawn_and_trusted_lookup(
+    kanban_home, tmp_path, monkeypatch
+):
+    """A None-board dispatch must not bind NULL and launch on another board."""
+    import hermes_cli.profiles as profmod
+
+    reg = _writegate_registry(tmp_path)
+    _patch_registry(monkeypatch, reg)
+    monkeypatch.setattr(profmod, "profile_exists", lambda _name: True)
+
+    kb.create_board("orchestrator")
+    kb.set_current_board("orchestrator")
+    conn = kb.connect(board="orchestrator")
+    workspace = str(tmp_path / "wt")
+    (tmp_path / "wt").mkdir()
+    captured = {}
+
+    def fake_spawn(
+        task, spawn_workspace, *, board=None, worker_session_id=None
+    ):
+        captured.update(
+            task_id=task.id,
+            workspace=spawn_workspace,
+            board=board,
+            worker_session_id=worker_session_id,
+        )
+        return 4242
+
+    try:
+        task = _make_task(
+            conn, kb, assignee="builder-tester", workspace_path=workspace
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board=None)
+        assert result.spawned
+
+        current = kb.get_task(conn, task.id)
+        assert current is not None
+        assert current.current_run_id is not None
+        run_id = int(current.current_run_id)
+        worker_id = captured["worker_session_id"]
+
+        assert captured["board"] == "orchestrator"
+        binding = reg.get_active_binding(worker_id)
+        assert binding is not None
+        assert binding.board == captured["board"]
+        assert kb._trusted_worker_session_id(
+            task.id,
+            run_id,
+            profile="builder-tester",
+            workspace=workspace,
+            board=captured["board"],
+        ) == worker_id
+    finally:
+        conn.close()
+
+
 def test_prepare_worker_launch_returns_empty_without_run(kanban_home, tmp_path, monkeypatch):
     reg = _writegate_registry(tmp_path)
     _patch_registry(monkeypatch, reg)

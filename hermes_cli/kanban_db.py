@@ -10005,6 +10005,11 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    # Resolve the board once for the whole tick. The same canonical slug must
+    # feed binding creation and child launch; resolving only inside
+    # ``_default_spawn`` would leave a NULL-board binding for None-board callers.
+    board = _normalize_board_slug(board) or get_current_board()
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -11278,6 +11283,9 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    # Trusted profile marker consumed by CLI preassignment verification.
+    # HERMES_PROFILE remains separately required for Kanban comment authorship.
+    env["HERMES_KANBAN_PROFILE"] = profile_arg
     # WriteGate preassignment / lineage: the dispatcher pre-assigned the exact
     # Hermes worker session id *before* Popen (via prepare_worker_launch) and
     # persisted it on the run row. Use that captured value so the worker's own
