@@ -15,6 +15,7 @@ registry at ``get_default_hermes_root()/write-gate.db`` (cross-profile).
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ def register(ctx) -> None:
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["confirm_binding", "request_exception", "status"],
+                    "enum": ["confirm_binding", "reanchor", "request_exception", "status"],
                     "description": "The Write-Gate operation to perform.",
                 },
                 "stated_outcome": {
@@ -129,6 +130,10 @@ def register(ctx) -> None:
             # other authority field) — see the security gate in the build
             # brief §"Security review gate".
             session_id=str(kw.get("session_id") or ""),
+            # The trusted top-level task id is forwarded through the same
+            # kwargs and drives the host-owned CWD record the binding derives
+            # from. The model may NOT supply it.
+            task_id=str(kw.get("task_id") or ""),
         ),
         description=(
             "Confirm worktree binding, request a protected-write exception, or "
@@ -160,6 +165,11 @@ def _on_pre_tool_call(
         return None
     if not isinstance(args, dict):
         args = args or {}
+    # Trusted top-level task id forwarded through the same kwargs as
+    # session_id. The CWD record the binding derives from is keyed by the task
+    # id (the top-level session key), which is authoritative over the possibly
+    # diverged agent session_id.
+    task_id = str(kwargs.get("task_id") or "")
     try:
         from writegate import enforcement as _enforcement
         from writegate import registry as _registry
@@ -185,6 +195,21 @@ def _on_pre_tool_call(
             # intentionally exempt routes returned above.
             return {"action": "block", "message": "Write-Gate: no host-owned session id; fail-closed block"}
         reg = _registry.get_registry()
+
+        # Bounded lazy lineage: before deciding, derive a binding only from
+        # trusted *existing* lineage — the session's own active binding, or a
+        # verified branch/compression/delegate parent. This never auto-binds a
+        # top-level session from cwd (that requires explicit human
+        # confirm_binding), and /new + ordinary unbound sessions still block.
+        # ``_writegate_profile_dir`` is a host/test seam for the SessionDB
+        # location; absent it, the resolver uses the live profile home.
+        profile_dir = kwargs.get("_writegate_profile_dir")
+        if isinstance(profile_dir, os.PathLike):
+            profile_dir = os.fspath(profile_dir)
+        if not isinstance(profile_dir, str):
+            profile_dir = None
+        _maybe_lazy_derive_binding(reg, session_id, task_id, profile_dir)
+
         project_root = _resolve_project_root(reg, session_id)
         decision = _enforcement.decide(
             tool_name=str(tool_name),
@@ -214,6 +239,75 @@ def _recovery_factory(reg, session_id):
         project_root = _recovery.derive_project_root(worktree) or worktree
         return _recovery.RecoveryWriter(reg, project_root, sid, lease_id)
     return _factory
+
+
+def _maybe_lazy_derive_binding(
+    reg: "_registry.Registry",
+    session_id: str,
+    task_id: str,
+    profile_dir: "str | None" = None,
+) -> None:
+    """Bounded lazy lineage: derive a binding only from trusted *existing*
+    lineage, before enforcement decides.
+
+    This is NOT an auto-bind from ambient cwd.  It resolves:
+
+    * the session's own active binding (resume / in-place compression — the
+      same id keeps its binding), or
+    * a verified branch/compression/delegate parent whose parent is actively
+      bound.  The verified evidence comes from the profile's trusted
+      SessionDB row markers (:func:`writegate.lineage.resolve_lineage`):
+      ``_branched_from == parent_session_id`` (branch),
+      ``_delegate_from == parent_session_id`` or ``source == "tool"``
+      (delegate), or parent ``end_reason == "compression"`` with no fork
+      marker (compression child).  ``/new`` / gateway resets
+      (``_reset_from == parent_session_id``) and ordinary unbound sessions
+      derive nothing.
+
+    The ``task_id`` argument is accepted for seam compatibility but is NOT
+    lineage proof — lineage is read from the SessionDB row only.  Fail-closed:
+    any error is swallowed and the session stays as it was (unbound → blocked).
+    """
+    try:
+        from writegate import binding as _binding
+        from writegate import lineage as _lineage
+
+        # Idempotent: a session that already has its own active binding is a
+        # no-op.
+        if reg.get_active_binding(session_id) is not None:
+            return
+
+        verified = _lineage.resolve_lineage(session_id, profile_dir=profile_dir)
+        if not verified:
+            return
+
+        # A delegate child (source == "tool" / _delegate_from) may carry a
+        # trusted per-task workspace of its own: the host-owned session cwd
+        # record under the task key is authoritative (A22).  Branch and
+        # compression children inherit the parent's exact worktree and must
+        # not be redirected through ambient state.
+        assigned_workspace = None
+        if verified["kind"] == "delegate":
+            try:
+                assigned_workspace = _binding.resolve_trusted_worktree(
+                    session_id, task_id=task_id,
+                )
+            except Exception:
+                assigned_workspace = None
+
+        derived = _binding.derive_binding(
+            reg,
+            session_id=session_id,
+            task_id=task_id,
+            parent_session_id=verified["parent_session_id"],
+            parent_is_bound=verified["parent_is_bound"],
+            assigned_workspace=assigned_workspace,
+        )
+        # derive_binding returns None for /new, legacy/null, or unverified
+        # lineage — exactly the cases that must stay unbound.
+    except Exception:
+        # Never let lineage derivation break enforcement: stay as-is.
+        return
 
 
 def _resolve_project_root(reg, session_id: str) -> str:
