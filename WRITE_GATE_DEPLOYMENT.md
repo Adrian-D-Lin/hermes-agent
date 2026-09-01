@@ -88,8 +88,7 @@ elsewhere, set `PYTHONPATH` to point at the worktree root.
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "import writegate.registry, writegate.enforcement, writegate.tool, \
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python -c "import writegate.registry, writegate.enforcement, writegate.tool, \
        writegate.lineage, writegate.binding, writegate.approval, \
        writegate.recovery, writegate.containment; \
        print('all writegate modules importable')"
@@ -98,14 +97,21 @@ HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
 **Expected.** `all writegate modules importable` on stdout, exit code 0.
 
 ```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "from writegate.registry import resolve_registry_path; \
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python -c "from writegate.registry import resolve_registry_path; \
        import os; p = resolve_registry_path(); \
        d = os.path.dirname(p); \
        open(os.path.join(d, '.wg-write-test'), 'w').close(); \
        print('registry path writable:', d); \
        os.remove(os.path.join(d, '.wg-write-test'))"
 ```
+
+> **Shell syntax.** The interpreter path is run as a **plain executable**
+> (`…/bin/python -c …`), never as an environment assignment immediately
+> followed by `-c`. `HERMES_PYTHON=/path/python -c …` is invalid shell: the
+> shell treats `-c` as the command to run and reports
+> `/bin/sh: 1: -c: not found` (exit 127). An environment assignment is valid
+> only when it precedes an **actual executable** — that is the shape used for
+> the test-runner invocations below, not for `python -c` probes.
 
 **Expected.** The directory holding `write-gate.db` printed, exit code 0. If the
 path is not writable, the registry cannot initialize and the hook fails closed.
@@ -115,20 +121,32 @@ path is not writable, the registry cannot initialize and the hook fails closed.
 ## 2. Integration: fast-forward the live checkout from this branch
 
 The worktree branch `integration/startup-writegate-runtime` is a **direct
-fast-forward descendant** of the live Primus baseline `c30942e9` (which itself
-descends from main `ff3835a6`). The tip of this branch is `c890a409` — the
-runbook-correcting commit — **not** `27e06615`. The live checkout at
-`/home/progenitor/.hermes/hermes-agent` has **existing local modifications**
-that are not part of the Write-Gate integration and must be preserved. Integrate
-by fast-forwarding the live tree from this branch — never per-file copy or
-cherry-pick, which would strand those local changes.
+fast-forward descendant** of the live Primus baseline. The live checkout at
+`/home/progenitor/.hermes/hermes-agent` is on `main` and has **existing local
+modifications** that are not part of the Write-Gate integration and must be
+preserved. Integrate by fast-forwarding the live tree from this branch — never
+per-file copy or cherry-pick, which would strand those local changes.
 
-> **Do not stash and pop.** The local modifications on the live checkout are
-> byte-for-byte identical to the pre-cutover working tree already committed in
-> the integration history (they are part of `c30942e9`'s parent lineage). Stash
-> them, fast-forward, then `stash pop` would be a needless re-apply of content
-> that is already in the tree. **Preserve the stash through acceptance** and do
-> not pop it unless a conflict forces you to.
+> **The live checkout is dirty before migration.** It currently carries local
+> modifications (modified tracked files) that are not part of the Write-Gate
+> integration. `git merge --ff-only` refuses to run while the working tree is
+> dirty, so the working tree **must** be stashed first. Unlike the pre-cutover
+> working tree committed in the integration history, this dirty state is a
+> **live, in-flight** set of changes — it is **not** guaranteed to match any
+> committed baseline. Therefore:
+>
+> * **Do not** rely on "these local mods are already in `c30942e9`'s lineage" —
+>   that was true for the earlier baseline but the live checkout has since
+>   diverged. Treat the current dirty state as new work to preserve.
+> * **Do** create a **named stash that includes untracked files**
+>   (`git stash push -u -m "…"`), fast-forward, then **leave the stash in
+>   place** through acceptance. Do **not** `stash pop` it: its content is
+>   preserved in the stash entry and re-applying it risks a conflict that
+>   silently drops a change. The rollback branch (step 2a) plus the retained
+>   stash together cover any live-tree change if acceptance fails.
+> * **Do not** `git reset --hard` during the migration — that would discard the
+>   working-tree changes. Rollback is covered in the dedicated procedure (§8),
+>   where `reset --hard` to a named ref is appropriate.
 
 **2a. Name a recoverable rollback ref on the live checkout.**
 
@@ -142,17 +160,29 @@ git rev-parse --short HEAD   # record the pre-integration SHA
 This ref points at the current live state, so the integration can be undone with
 one command at any point through live acceptance.
 
-**2b. Verify the worktree branch is a fast-forward of the live HEAD.**
+**2b. Stash the dirty working tree (including untracked files) before the merge.**
+
+```bash
+cd "$LIVE"
+git stash push -u -m "write-gate-preintegration-dirty-state-$(date +%Y%m%d-%H%M%S)"
+git status --short           # expect: clean working tree
+```
+
+If `git status --short` is **not** clean, stop — the working tree still has
+uncommitted changes and `git merge --ff-only` will refuse. Resolve the residual
+state before continuing.
+
+**2c. Verify the worktree branch is a fast-forward of the live HEAD, then merge.**
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
-git merge-base --is-ancestor $(git rev-parse c30942e9) HEAD && \
-  echo "integration branch is a fast-forward of the live baseline c30942e9"
-git merge-base --is-ancestor c890a409 $(git rev-parse HEAD) && \
-  echo "c890a409 is reachable from the integration tip"
+# Current integration tip (dynamic — do not hard-code; it advances each runbook run):
+git rev-parse --short HEAD
+git merge-base --is-ancestor $(git rev-parse HEAD) integration/startup-writegate-runtime && \
+  echo "integration branch tip is reachable from this branch"
 ```
 
-**2c. Fast-forward the live checkout.**
+**2d. Fast-forward the live checkout.**
 
 ```bash
 cd "$LIVE"
@@ -160,26 +190,28 @@ git merge --ff-only integration/startup-writegate-runtime
 git log --oneline -1
 ```
 
-**Expected.** The live HEAD advances to `c890a409` (the integration tip) with no
-merge commit, and the stat shows the full Write-Gate package plus the runbook.
-
-**2d. Verify the tree is clean (no stash pop).**
+**Expected.** The live HEAD advances to the branch tip with no merge commit, and
+the stat shows the full Write-Gate package plus the runbook. The branch tip is
+the latest runbook-correcting commit (`4a2457fe` or later) — **not** the older
+`c890a409`. Verify the live tip is at least the branch tip:
 
 ```bash
 cd "$LIVE"
-git status --short           # clean: local mods are already in c30942e9 lineage
+git merge-base --is-ancestor $(cd /home/progenitor/AI-main/hermes-startup-writegate-build && git rev-parse HEAD) HEAD && \
+  echo "live checkout now at or beyond the integration tip"
 ```
 
-If the tree is not clean because of genuinely new local work, leave it as a
-stash and do not pop — the content is already captured upstream. Keep the
+**2e. Verify the tree is clean.**
+
+```bash
+cd "$LIVE"
+git status --short           # clean: no residual working-tree changes
+```
+
+If the tree is not clean, stop and investigate before proceeding — a dirty tree
+here means the stash did not fully clear or new changes appeared. Keep the
 `write-gate-rollback-<ts>` branch and the stash until live acceptance is green
-(see §6 smoke tests and §11 monitoring). To fully undo the integration:
-
-```bash
-cd "$LIVE"
-git reset --hard write-gate-rollback-<ts>
-git branch -D write-gate-rollback-<ts>
-```
+(see §6 smoke tests and §11 monitoring). To fully undo the integration, see §8.
 
 ---
 
@@ -265,8 +297,7 @@ checkout (or set `PYTHONPATH` to it) so the import resolves:
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
-  -c "
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python -c "
 import yaml
 files = [
   '/home/progenitor/.hermes/config.next',
@@ -356,7 +387,7 @@ assertion.
 Read and Kanban tools return `None` (allow) even with no binding.
 
 ```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
 import importlib.util
 spec = importlib.util.spec_from_file_location(
@@ -386,7 +417,7 @@ interpreter. Run each Write-Gate suite; every one must pass.
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   scripts/run_tests.sh tests/plugins/test_writegate_startup_binding.py
 ```
 
@@ -397,7 +428,7 @@ session inheritance, `/new`-with-parent retention, read/kanban exemption,
 fail-closed without session id, lazy lineage derivation, and the kill switch.
 
 ```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   scripts/run_tests.sh tests/plugins/test_writegate_enforcement.py \
                     tests/plugins/test_writegate_registry.py \
                     tests/plugins/test_writegate_lineage.py \
@@ -435,7 +466,7 @@ tests" in Runtime facts):
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   HERMES_TEST_FILE_RETRIES=0 \
   /home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   scripts/run_tests_parallel.py tests/plugins/
@@ -521,7 +552,7 @@ The central registry (`write-gate.db`) stores bindings, exception requests, and
 leases. A healthy registry has a small, bounded number of active rows.
 
 ```bash
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   -c "
 import sqlite3, os
 db_path = '/home/progenitor/.hermes/write-gate.db'
@@ -549,7 +580,7 @@ Run the focused suite and confirm the commit is the runbook-only change:
 
 ```bash
 cd /home/progenitor/AI-main/hermes-startup-writegate-build
-HERMES_PYTHON=/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
+/home/progenitor/.hermes/hermes-agent/.venv/bin/python \
   scripts/run_tests.sh tests/plugins/test_writegate_startup_binding.py \
   2>&1 | grep "Summary"
 git log --oneline -1
