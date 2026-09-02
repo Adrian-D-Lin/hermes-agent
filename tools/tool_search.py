@@ -1050,9 +1050,12 @@ def dispatch_tool_search(args: Dict[str, Any],
                                      "description": ..., "required": [...]}}
         }
 
-    ``limit`` applies PER QUERY. Each query group that returns no matches gets
-    an ``available_sources`` + ``hint`` block so a lexical miss is not mistaken
-    for a missing capability.
+    ``limit`` applies PER QUERY. Searches also report matching tools that are
+    already exposed directly to the model. This prevents a miss in the
+    deferred-only catalog from being misread as proof that a direct tool is
+    unavailable. Each query group that returns no deferred or direct matches
+    gets an ``available_sources`` + ``hint`` block so a lexical miss is not
+    mistaken for a missing capability.
     """
     if config is None:
         config = load_config()
@@ -1078,31 +1081,54 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
+    visible, deferrable = classify_tools(current_tool_defs)
     catalog = build_catalog(deferrable)
+    direct_catalog = build_catalog([
+        td for td in visible
+        if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES
+    ])
 
     results: List[Dict[str, Any]] = []
     tools_map: Dict[str, Dict[str, Any]] = {}
     corpus_stats = _corpus_stats(catalog)
+    direct_corpus_stats = _corpus_stats(direct_catalog)
     available_sources = _available_source_summary(catalog) if catalog else []
     for query in queries:
         hits = search_catalog(catalog, query, limit=limit, corpus_stats=corpus_stats)
+        direct_hits = search_catalog(
+            direct_catalog,
+            query,
+            limit=limit,
+            corpus_stats=direct_corpus_stats,
+        )
         for h in hits:
             if h.name not in tools_map:
                 tools_map[h.name] = _shared_tool_record(h)
         group: Dict[str, Any] = {"query": query, "matches": [h.name for h in hits]}
-        if not hits and catalog:
+        if direct_hits:
+            group["direct_matches"] = [h.name for h in direct_hits]
+            group["hint"] = (
+                "Tools in direct_matches are already present in your active tool list. "
+                "Call the appropriate one directly by name; do not use tool_describe "
+                "or tool_call for it."
+            )
+        elif not hits and catalog:
             group["available_sources"] = available_sources
             group["hint"] = (
-                "This query returned no lexical matches, but the sources above "
-                "are connected and their tools remain available. Retry "
-                "tool_search with the service name plus a concrete action or "
-                "object before concluding the capability is unavailable."
+                "This query returned no lexical matches in the deferred-tool catalog, "
+                "but the sources above are connected and their tools remain available. "
+                "Retry tool_search with the service name plus a concrete action or "
+                "object before concluding the deferred capability is unavailable. "
+                "This result does not enumerate directly exposed tools and must not "
+                "be used to conclude that a direct capability is unavailable."
             )
         results.append(group)
 
     result: Dict[str, Any] = {
         "queries": queries,
+        "catalog_scope": "deferred_tools_only",
+        "total_deferred_available": len(catalog),
+        # Backward-compatible alias retained for existing bridge consumers.
         "total_available": len(catalog),
         "results": results,
         "tools": tools_map,

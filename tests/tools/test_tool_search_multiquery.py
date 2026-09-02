@@ -292,6 +292,31 @@ class TestMultiQuerySearch:
         for group in result["results"]:
             assert len(group["matches"]) <= 1
 
+    def test_search_identifies_matching_tool_already_exposed_directly(self, issue_defs):
+        from tools.tool_search import ToolSearchConfig, dispatch_tool_search
+
+        direct_name = "mq_desktop_preview"
+        direct_def = _register(
+            direct_name,
+            "desktop_ui",
+            desc="Open a local file in the desktop preview pane.",
+        )
+        result = json.loads(dispatch_tool_search(
+            {"queries": ["desktop preview open file"]},
+            current_tool_defs=[*issue_defs, direct_def],
+            config=ToolSearchConfig.from_raw({}),
+        ))
+
+        assert result["catalog_scope"] == "deferred_tools_only"
+        assert result["total_deferred_available"] == 3
+        assert result["total_available"] == 3
+        group = result["results"][0]
+        assert group["matches"] == []
+        assert direct_name in group["direct_matches"]
+        assert "already present" in group["hint"]
+        assert "Call" in group["hint"] and "directly" in group["hint"]
+        assert direct_name not in result["tools"]
+
     def test_required_names_are_bounded(self):
         from tools.tool_search import ToolSearchConfig, dispatch_tool_search
 
