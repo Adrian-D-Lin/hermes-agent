@@ -516,7 +516,51 @@ def test_clarify_batch_state_cleared_after_resolution(server):
         assert rid not in server._pending
 
 
-def test_clarify_block_helper_builds_batch_payload(capture):
+def test_clarify_block_one_question_batch_uses_legacy_payload(capture):
+    """The documented one-entry questions form remains answerable by Desktop
+    renderers that only understand top-level question/choices fields."""
+    server, buf = capture
+    normalized = [
+        {
+            "qid": "q0", "id": "approach", "question": "Which?",
+            "choices": ["a (Recommended)", "b"], "choices_offered": ["a", "b"],
+            "multi_select": False,
+        },
+    ]
+
+    box = {}
+
+    def run():
+        box["answer"] = server._clarify_block("s1", "", None, questions=normalized)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    rid = None
+    while time.monotonic() < deadline and rid is None:
+        with server._prompt_lock:
+            rid = next(iter(server._pending), None)
+            assert not server._batch_clarify
+        time.sleep(0.01)
+    assert rid
+
+    server.handle_request({
+        "id": "a", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": "a"},
+    })
+    thread.join(timeout=5)
+
+    assert json.loads(box["answer"]) == {"answers": {"q0": "a"}}
+    messages = [json.loads(line) for line in buf.getvalue().splitlines()]
+    request = messages[0]["params"]
+    assert request["type"] == "clarify.request"
+    assert request["payload"]["question"] == "Which?"
+    assert request["payload"]["choices"] == ["a (Recommended)", "b"]
+    assert "questions" not in request["payload"]
+    assert "qid" not in request["payload"]
+
+
+def test_clarify_block_helper_builds_multi_question_batch_payload(capture):
     """_clarify_block forwards only wire fields (qid/question/choices/
     multi_select) — the tool-side normalized entries carry extra keys the
     renderer must not see."""
@@ -526,6 +570,11 @@ def test_clarify_block_helper_builds_batch_payload(capture):
             "qid": "q0", "id": "approach", "question": "Which?",
             "choices": ["a (Recommended)", "b"], "choices_offered": ["a", "b"],
             "multi_select": False,
+        },
+        {
+            "qid": "q1", "id": "scope", "question": "Where?",
+            "choices": ["here (Recommended)", "there"],
+            "choices_offered": ["here", "there"], "multi_select": False,
         },
     ]
 
@@ -547,6 +596,10 @@ def test_clarify_block_helper_builds_batch_payload(capture):
     server.handle_request({
         "id": "a", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "a"},
+    })
+    server.handle_request({
+        "id": "b", "method": "clarify.respond",
+        "params": {"request_id": rid, "question_id": "q1", "answer": "here"},
     })
     thread.join(timeout=5)
 

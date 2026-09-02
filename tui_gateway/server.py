@@ -4646,12 +4646,13 @@ def _clarify_timeout_seconds() -> float | None:
 def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
     """Bridge the clarify tool callback onto _block.
 
-    Single-question calls keep the exact historical payload shape (older
-    renderers never see a new field). Batch calls emit one clarify.request
+    Single-question calls — including the schema's required one-entry
+    ``questions`` form — keep the exact historical payload shape so older
+    renderers remain answerable. Multi-question calls emit one clarify.request
     carrying the question list — only wire fields (qid/question/choices/
     multi_select) are forwarded; the tool-side normalized entries also carry
-    result-assembly keys (id, choices_offered) the renderer must not see.
-    The tool decodes the JSON reply via its batch answer parser.
+    result-assembly keys (id, choices_offered) the renderer must not see. The
+    tool decodes either reply via its batch answer parser.
     """
     if questions:
         wire = [
@@ -4663,6 +4664,26 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
             }
             for entry in questions
         ]
+        if len(wire) == 1:
+            entry = wire[0]
+            payload = {
+                "question": entry["question"],
+                "choices": entry["choices"],
+            }
+            if entry["multi_select"]:
+                payload["multi_select"] = True
+            answer = _block(
+                "clarify.request",
+                sid,
+                payload,
+                timeout=_clarify_timeout_seconds(),
+            )
+            if not answer:
+                return answer
+            return json.dumps(
+                {"answers": {entry["qid"]: answer}},
+                ensure_ascii=False,
+            )
         return _block(
             "clarify.request",
             sid,
