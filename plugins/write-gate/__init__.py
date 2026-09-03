@@ -134,6 +134,8 @@ def register(ctx) -> None:
             # kwargs and drives the host-owned CWD record the binding derives
             # from. The model may NOT supply it.
             task_id=str(kw.get("task_id") or ""),
+            stated_outcome=args.get("stated_outcome", ""),
+            affected_files=args.get("affected_files") or [],
         ),
         description=(
             "Confirm worktree binding, request a protected-write exception, or "
