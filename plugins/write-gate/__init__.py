@@ -195,7 +195,18 @@ def _on_pre_tool_call(
         if not session_id:
             # No host-owned session id: fail closed for a governed write.  The
             # intentionally exempt routes returned above.
-            return {"action": "block", "message": "Write-Gate: no host-owned session id; fail-closed block"}
+            return {
+                "action": "block",
+                "message": _enforcement.format_block_message(
+                    "Write-Gate: no host-owned session id; fail-closed block",
+                    remediation=(
+                        "Stop and ask the user/operator to restore session "
+                        "identity (e.g. resume or reconnect the session) "
+                        "before retrying the write. Reads remain available "
+                        "while this is pending."
+                    ),
+                ),
+            }
         reg = _registry.get_registry()
 
         # Bounded lazy lineage: before deciding, derive a binding only from
@@ -232,7 +243,36 @@ def _on_pre_tool_call(
         return block or None
     except Exception as exc:  # registry/policy failure -> fail closed
         logger.warning("write_gate: pre_tool_call error (fail-closed block): %s", exc)
-        return {"action": "block", "message": f"Write-Gate: enforcement error, fail-closed: {exc}"}
+        reason = f"Write-Gate: enforcement error, fail-closed: {exc}"
+        remediation = (
+            "Stop and report the enforcement failure to the "
+            "user/operator before retrying any governed write."
+        )
+        # The exception that landed us here may have been the
+        # ``from writegate import enforcement`` import itself (or the
+        # module's own formatter blowing up) — never re-attempt that same
+        # failing call.  Reuse the already-bound ``_enforcement`` from the
+        # try block when it made it far enough to exist; otherwise fall
+        # back to a locally built message with the same shape so this
+        # handler can never raise.
+        enforcement_mod = locals().get("_enforcement")
+        message = None
+        if enforcement_mod is not None:
+            try:
+                message = enforcement_mod.format_block_message(
+                    reason, remediation=remediation,
+                )
+            except Exception:
+                message = None
+        if message is None:
+            message = (
+                f"{reason}\n\n"
+                f"Required next action: {remediation}\n\n"
+                "Do not retry through terminal, execute_code, Python or "
+                "shell scripts, plugins, MCP tools, or another alternate "
+                "write route."
+            )
+        return {"action": "block", "message": message}
 
 
 def _recovery_factory(reg, session_id):

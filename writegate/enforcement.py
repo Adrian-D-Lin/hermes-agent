@@ -66,6 +66,30 @@ GOVERNED_TOOLS = frozenset({"write_file", "patch"})
 # bound worktree (§4 / §5).
 PROTECTED_PREFIXES = ("Canon/", "4-artifacts/", "5-archive/")
 
+# Model-visible closing line on every block message: the assurance boundary
+# (§7) is not a comprehensive filesystem boundary, so the model must be told
+# explicitly that a block is not a cue to route the same mutation through some
+# other surface.
+ALTERNATE_ROUTE_PROHIBITION = (
+    "Do not retry through terminal, execute_code, Python or shell scripts, "
+    "plugins, MCP tools, or another alternate write route."
+)
+
+
+def format_block_message(reason: str, remediation: str = "") -> str:
+    """Build the single model-visible block message from ``reason`` plus an
+    optional ``remediation``.
+
+    Always appends :data:`ALTERNATE_ROUTE_PROHIBITION` last, so every block —
+    whether or not a remediation is available — closes with the same
+    no-alternate-route instruction the model must not skip.
+    """
+    parts = [reason]
+    if remediation:
+        parts.append(f"Required next action: {remediation}")
+    parts.append(ALTERNATE_ROUTE_PROHIBITION)
+    return "\n\n".join(parts)
+
 
 @dataclass
 class Decision:
@@ -87,7 +111,10 @@ class Decision:
     def to_block(self) -> Optional[Dict[str, str]]:
         if self.allowed:
             return None
-        return {"action": "block", "message": self.reason}
+        return {
+            "action": "block",
+            "message": format_block_message(self.reason, self.remediation),
+        }
 
 
 def is_recognized_kanban(tool_name: str) -> bool:
@@ -258,10 +285,9 @@ def decide(
             ),
             blocked_targets=targets,
             remediation=(
-                "Re-anchor the session: confirm the card/worktree binding "
-                "through the trusted startup operation, or submit a structured "
-                "Write-Gate exception request for the protected/out-of-worktree "
-                "target. Do not attempt to bypass the governed route."
+                "Call write_gate(action='confirm_binding') to re-anchor the "
+                "session's worktree binding. Reads remain allowed while this "
+                "is pending."
             ),
         )
 
@@ -303,9 +329,10 @@ def decide(
                     ),
                     blocked_targets=[t],
                     remediation=(
-                        "Submit write_gate(action='request_exception') for this "
-                        "target; the human approves a five-minute, folder-scoped "
-                        "lease and the recovery snapshot is taken before the edit."
+                        "Call write_gate(action='request_exception') with "
+                        "affected_files and stated_outcome for this target, "
+                        "then wait for human approval. Once approved, retry "
+                        "with write_file or patch."
                     ),
                 )
             # Leased path: snapshot evidence immediately for **every** governed
@@ -320,6 +347,12 @@ def decide(
                         allowed=False,
                         reason=f"Write-Gate: recovery evidence could not be written or verified: {outcome.error}",
                         blocked_targets=[t],
+                        remediation=(
+                            "Stop and report the recovery-evidence failure to "
+                            "the user/operator; retry only after the recovery "
+                            "writer's worktree access or storage issue has "
+                            "been resolved."
+                        ),
                     )
             continue
         # Ordinary in-worktree write: allowed without a lease (§4).  Symlink
@@ -337,9 +370,25 @@ def _traversal_or_unresolvable(target: str) -> Decision:
     from .containment import has_traversal_component
     if has_traversal_component(target):
         reason = f"Write-Gate: path traversal rejected for {target!r}"
+        remediation = (
+            "Resend the request with a normalized path containing no '..' "
+            "traversal segments, addressed to a location inside the bound "
+            "worktree (or a leased folder for a protected/out-of-worktree "
+            "target)."
+        )
     else:
         reason = f"Write-Gate: cannot resolve target path {target!r}"
-    return Decision(allowed=False, reason=reason, blocked_targets=[target])
+        remediation = (
+            "Resend the request with a valid, resolvable path — check for "
+            "malformed path syntax or an unresolvable/missing parent "
+            "directory."
+        )
+    return Decision(
+        allowed=False,
+        reason=reason,
+        blocked_targets=[target],
+        remediation=remediation,
+    )
 
 
 def _is_protected(canonical: str, project_root: Optional[str]) -> bool:
