@@ -408,6 +408,62 @@ def _handle_status(session_id: str) -> str:
 # Approval presentation seam
 # ---------------------------------------------------------------------------
 
+def _format_approval_command(
+    presentation: Dict[str, Any], kind: str
+) -> str:
+    def _get(key: str) -> str:
+        value = presentation.get(key)
+        if value is None:
+            return ""
+        return str(value)
+
+    if kind == "WRITE_GATE_EXCEPTION":
+        lines = [
+            "WRITE-GATE EXCEPTION REQUEST",
+            f"Outcome: {_get('stated_outcome')}",
+            "Affected files:",
+        ]
+        affected = presentation.get("affected_files")
+        if affected is None:
+            items = []
+        elif isinstance(affected, str):
+            items = [affected]
+        elif isinstance(affected, (list, tuple)):
+            items = list(affected)
+        else:
+            items = [affected]
+        for item in items:
+            lines.append(f"  - {item}")
+        lines.append(f"Approved folder: {_get('approved_folder')}")
+        lines.append(f"Recovery location: {_get('recovery_location')}")
+        lines.append(f"Lease validity: {_get('lease_validity')}")
+        lines.append(f"Confirmed worktree: {_get('confirmed_worktree')}")
+        lines.append(f"Session: {_get('session_id')}")
+        lines.append(f"Warning: {_get('warning')}")
+        return "\n".join(lines)
+
+    if kind == "CONFIRMED_WORKTREE_BINDING":
+        lines = [
+            "WRITE-GATE WORKTREE BINDING",
+            f"Project: {_get('project')}",
+            f"Initiative: {_get('initiative')}",
+            f"Board: {_get('board')}",
+            f"Worktree: {_get('worktree_path')}",
+            f"Branch: {_get('git_branch')}",
+            f"Profile: {_get('profile')}",
+            f"Confirmation basis: {_get('confirmation_basis')}",
+            f"Session: {_get('session_id')}",
+            f"Note: {_get('note')}",
+        ]
+        return "\n".join(lines)
+
+    return "\n".join([
+        "WRITE-GATE REQUEST",
+        f"Kind: {kind}",
+        f"Session: {_get('session_id')}",
+    ])
+
+
 def _present_and_get_decision(
     presentation: Dict[str, Any], kind: str
 ) -> Dict[str, Any]:
@@ -444,11 +500,7 @@ def _present_and_get_decision(
         description = (
             f"{kind}: {requested_change} for session {session_id}"
         )
-        command = (
-            "write_gate_exception"
-            if kind == "WRITE_GATE_EXCEPTION"
-            else "write_gate_confirm_binding"
-        )
+        command = _format_approval_command(presentation, kind)
         result = request_write_gate_approval(
             request_id=request_id,
             command=command,

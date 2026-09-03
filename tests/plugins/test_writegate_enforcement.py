@@ -232,6 +232,108 @@ def test_present_approval_preserves_host_reference_and_timestamp(
     assert result == expected
 
 
+def test_present_approval_surfaces_exception_request_in_order(
+    monkeypatch, mods
+):
+    captured = {}
+
+    def approve_once(**kwargs):
+        captured.update(kwargs)
+        return {
+            "approved": True,
+            "decision": "once",
+            "approval_reference": "host-approval-exception",
+            "decision_at": "2026-09-01T10:20:30+00:00",
+        }
+
+    monkeypatch.setattr(
+        "tools.approval.request_write_gate_approval",
+        approve_once,
+    )
+    mods.tool._present_and_get_decision(
+        {
+            "request_id": "wg-exception-request",
+            "session_id": "sess-1",
+            "stated_outcome": "update policy",
+            "affected_files": ["/worktree/Canon/a.md", "/worktree/Canon/b.md"],
+            "approved_folder": "/worktree/Canon",
+            "recovery_location": "/worktree/5-archive/write-gate/sess-1/lease-1",
+            "lease_validity": "Lease lasts 5 minutes from approval.",
+            "confirmed_worktree": "/worktree",
+            "warning": "Generic approval cannot satisfy this request.",
+        },
+        kind="WRITE_GATE_EXCEPTION",
+    )
+
+    assert captured["command"].splitlines() == [
+        "WRITE-GATE EXCEPTION REQUEST",
+        "Outcome: update policy",
+        "Affected files:",
+        "  - /worktree/Canon/a.md",
+        "  - /worktree/Canon/b.md",
+        "Approved folder: /worktree/Canon",
+        "Recovery location: /worktree/5-archive/write-gate/sess-1/lease-1",
+        "Lease validity: Lease lasts 5 minutes from approval.",
+        "Confirmed worktree: /worktree",
+        "Session: sess-1",
+        "Warning: Generic approval cannot satisfy this request.",
+    ]
+    assert captured["description"] == (
+        "WRITE_GATE_EXCEPTION: update policy for session sess-1"
+    )
+
+
+def test_present_approval_surfaces_worktree_binding_in_order(
+    monkeypatch, mods
+):
+    captured = {}
+
+    def approve_once(**kwargs):
+        captured.update(kwargs)
+        return {
+            "approved": True,
+            "decision": "once",
+            "approval_reference": "host-approval-binding",
+            "decision_at": "2026-09-01T10:20:30+00:00",
+        }
+
+    monkeypatch.setattr(
+        "tools.approval.request_write_gate_approval",
+        approve_once,
+    )
+    mods.tool._present_and_get_decision(
+        {
+            "request_id": "wg-binding-request",
+            "session_id": "sess-2",
+            "project": "GRC App",
+            "initiative": "Kanban lifecycle",
+            "board": "development",
+            "worktree_path": "/worktree",
+            "git_branch": "feature/kanban",
+            "profile": "session-agent",
+            "confirmation_basis": "derived-from-card",
+            "note": "Confirming persists the worktree binding.",
+        },
+        kind="CONFIRMED_WORKTREE_BINDING",
+    )
+
+    assert captured["command"].splitlines() == [
+        "WRITE-GATE WORKTREE BINDING",
+        "Project: GRC App",
+        "Initiative: Kanban lifecycle",
+        "Board: development",
+        "Worktree: /worktree",
+        "Branch: feature/kanban",
+        "Profile: session-agent",
+        "Confirmation basis: derived-from-card",
+        "Session: sess-2",
+        "Note: Confirming persists the worktree binding.",
+    ]
+    assert captured["description"] == (
+        "CONFIRMED_WORKTREE_BINDING: /worktree for session sess-2"
+    )
+
+
 def test_exception_lease_receives_host_approval_metadata(
     monkeypatch, reg, mods, tmp_path
 ):
