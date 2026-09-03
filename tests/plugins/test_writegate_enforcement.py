@@ -263,3 +263,102 @@ def test_exception_lease_receives_host_approval_metadata(
     assert lease is not None
     assert lease.approval_reference == "host-approval-42"
     assert lease.approved_at == expected_at
+
+
+# -- Decision.to_block: remediation + universal prohibition --------------------
+
+def test_decision_to_block_exposes_remediation_and_prohibition(mods):
+    d = mods.enforcement.Decision(
+        allowed=False,
+        reason="Write-Gate: some reason",
+        remediation="Do the specific remediation.",
+    )
+    block = d.to_block()
+    assert block is not None
+    assert block["action"] == "block"
+    msg = block["message"]
+    assert "Write-Gate: some reason" in msg
+    assert "Required next action:" in msg
+    assert "Do the specific remediation." in msg
+    assert mods.enforcement.ALTERNATE_ROUTE_PROHIBITION in msg
+
+
+# -- decide: protected/outside no-lease message names the exception flow ------
+
+def test_decide_outside_worktree_no_lease_names_exception_flow(reg, mods, tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    reg.create_binding(session_id="bound", worktree_path=str(worktree))
+    outside = tmp_path / "outside" / "file.txt"
+    d = mods.enforcement.decide(
+        tool_name="write_file",
+        args={"path": str(outside)},
+        session_id="bound",
+        reg=reg,
+        project_root=str(worktree),
+    )
+    assert not d.allowed
+    msg = d.to_block()["message"]
+    assert "request_exception" in msg
+    assert "affected_files" in msg
+    assert "stated_outcome" in msg
+    assert "wait for human approval" in msg
+    assert "write_file or patch" in msg
+
+
+# -- pre_tool_call: missing host session id includes stop/operator guidance ---
+
+def test_pre_tool_call_missing_session_id_includes_stop_operator_guidance(plugin, mods):
+    block = plugin._on_pre_tool_call(
+        tool_name="write_file",
+        args={"path": "/some/path.txt"},
+        # No session_id kwarg: the model cannot supply one.
+    )
+    assert block is not None
+    assert block.get("action") == "block"
+    msg = block.get("message", "")
+    assert "stop" in msg.lower() or "ask" in msg.lower()
+    assert "operator" in msg.lower()
+    assert mods.enforcement.ALTERNATE_ROUTE_PROHIBITION in msg
+
+
+# -- decide: traversal block includes remediation and prohibition -------------
+
+def test_decide_traversal_block_includes_remediation_and_prohibition(reg, mods):
+    reg.create_binding(session_id="bound", worktree_path="/wt")
+    d = mods.enforcement.decide(
+        tool_name="write_file",
+        args={"path": "/wt/../../etc/passwd"},
+        session_id="bound",
+        reg=reg,
+    )
+    assert not d.allowed
+    msg = d.to_block()["message"]
+    assert "traversal" in msg.lower()
+    assert "normalized path" in msg.lower()
+    assert mods.enforcement.ALTERNATE_ROUTE_PROHIBITION in msg
+
+
+# -- pre_tool_call: enforcement exception includes stop/report guidance -------
+
+def test_pre_tool_call_enforcement_exception_includes_stop_report_guidance(
+    plugin, mods, monkeypatch
+):
+    import writegate.registry as registry_mod
+
+    def _boom():
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(registry_mod, "get_registry", _boom)
+    block = plugin._on_pre_tool_call(
+        tool_name="write_file",
+        args={"path": "/some/path.txt"},
+        session_id="sess-1",
+    )
+    assert block is not None
+    assert block.get("action") == "block"
+    msg = block.get("message", "")
+    assert "stop" in msg.lower()
+    assert "report" in msg.lower()
+    assert "operator" in msg.lower()
+    assert mods.enforcement.ALTERNATE_ROUTE_PROHIBITION in msg
