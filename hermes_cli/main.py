@@ -2718,7 +2718,11 @@ def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
         )
 
 
-_AGENT_COMMANDS = {None, "chat", "acp", "rl"}
+# Every top-level surface that can execute an in-process agent turn must pass
+# through the lifecycle-hook registration below.  ``dashboard`` and ``serve``
+# share the in-process WebSocket agent backend; omitting them meant Desktop and
+# browser sessions silently skipped configured ``pre_llm_call`` hooks.
+_AGENT_COMMANDS = {None, "chat", "acp", "rl", "dashboard", "serve"}
 _AGENT_SUBCOMMANDS = {
     "cron": ("cron_command", {"run", "tick"}),
     "gateway": ("gateway_command", {"run"}),

@@ -61,3 +61,56 @@ def test_plugin_discovery_runs_for_plain_chat(monkeypatch):
     calls = _install_discover_spy(monkeypatch)
     main_mod._prepare_agent_startup(_args(tui=False, command="chat"))
     assert calls == ["discover"]
+
+
+def test_serve_registers_lifecycle_hooks_without_duplicate_mcp_startup(monkeypatch):
+    calls = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(
+            start_background_plugin_discovery=lambda: calls.append("plugins"),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(load_config=lambda: {"hooks": {"pre_llm_call": []}}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        types.SimpleNamespace(
+            register_from_config=lambda config, **kwargs: calls.append(
+                ("shell_hooks", config, kwargs)
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.outbound_webhooks",
+        types.SimpleNamespace(
+            register_from_config=lambda config: calls.append(("outbound_hooks", config))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(discover_mcp_tools=lambda: calls.append("inline_mcp")),
+    )
+
+    main_mod._prepare_agent_startup(_args(tui=False, command="serve"))
+
+    assert calls == [
+        "plugins",
+        ("shell_hooks", {"hooks": {"pre_llm_call": []}}, {"accept_hooks": False}),
+        ("outbound_hooks", {"hooks": {"pre_llm_call": []}}),
+    ]
+
+
+def test_dashboard_and_serve_share_agent_startup_classification():
+    for command in ("dashboard", "serve"):
+        args = _args(tui=False, command=command)
+        assert command in main_mod._AGENT_COMMANDS
+        assert main_mod._command_has_dedicated_mcp_startup(args) is True
