@@ -211,10 +211,10 @@ CREATE TABLE IF NOT EXISTS segment_workspace_members (
 -- DEV1 permit a nullable segment_id and workspace_id; a non-null workspace
 -- relationship is validated by the policy/store layer.
 CREATE TABLE IF NOT EXISTS task_lifecycle_contracts (
-    contract_id TEXT PRIMARY KEY NOT NULL,
+    contract_id TEXT NOT NULL,
     contract_version TEXT NOT NULL,
     step TEXT NOT NULL,
-    task_card_id INTEGER NOT NULL,
+    task_card_id INTEGER PRIMARY KEY NOT NULL,
     task_id TEXT NOT NULL,
     initiative_card_id INTEGER NOT NULL,
     initiative_id TEXT NOT NULL,
@@ -227,7 +227,6 @@ CREATE TABLE IF NOT EXISTS task_lifecycle_contracts (
     skill_version TEXT NOT NULL,
     skill_hash TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    UNIQUE (task_card_id),
     FOREIGN KEY (task_card_id, initiative_id)
         REFERENCES adrian_kanban_cards (id, initiative_id),
     FOREIGN KEY (initiative_card_id, initiative_id)
@@ -244,7 +243,7 @@ CREATE TABLE IF NOT EXISTS initiative_phase_results (
     initiative_card_id INTEGER NOT NULL,
     initiative_id TEXT NOT NULL,
     phase TEXT NOT NULL,
-    segment_id TEXT,
+    segment_id TEXT CHECK(segment_id IS NULL OR TRIM(segment_id) != ''),
     iteration INTEGER NOT NULL,
     result_kind TEXT NOT NULL,
     contract_id TEXT,
@@ -265,7 +264,7 @@ CREATE TABLE IF NOT EXISTS initiative_phase_results (
 -- accepted rows so historical/rejected results never collide.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_initiative_phase_results_accepted
     ON initiative_phase_results (
-        initiative_card_id, phase, segment_id, iteration, result_kind
+        initiative_card_id, phase, COALESCE(segment_id, ''), iteration, result_kind
     )
     WHERE accepted = 1;
 

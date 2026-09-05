@@ -64,6 +64,7 @@ def provider_modules():
         "contracts": importlib.import_module(f"{name}.contracts"),
         "diagnostics": importlib.import_module(f"{name}.diagnostics"),
         "provider": importlib.import_module(f"{name}.provider"),
+        "schema": importlib.import_module(f"{name}.schema"),
     }
     yield modules
     for module_name in tuple(sys.modules):
@@ -1128,3 +1129,125 @@ def test_f15_cold_snapshot_rejects_scope_never_issued_by_initial_registry(
 
     assert "segment_id" in str(rejected.value)
     assert "segment_workspace_id" in str(rejected.value)
+
+
+def _fresh_s2_schema(provider_modules):
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    provider_modules["schema"].create_schema(conn)
+    conn.execute(
+        "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES ('I1')"
+    )
+    conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('initiative', 'I1', NULL, 'Initiative', 1)"
+    )
+    initiative_card_id = conn.execute(
+        "SELECT id FROM adrian_kanban_cards WHERE task_id IS NULL"
+    ).fetchone()[0]
+    return conn, initiative_card_id
+
+
+def _insert_task_card(conn, task_id):
+    cursor = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('task', 'I1', ?, ?, 1)",
+        (task_id, task_id),
+    )
+    return cursor.lastrowid
+
+
+def _insert_contract(conn, initiative_card_id, task_card_id, task_id, contract_id):
+    conn.execute(
+        "INSERT INTO task_lifecycle_contracts "
+        "(contract_id, contract_version, step, task_card_id, task_id, "
+        "initiative_card_id, initiative_id, segment_id, workspace_id, "
+        "execution_profile, canonical_contract_payload, registry_hash, "
+        "skill_id, skill_version, skill_hash, created_at) "
+        "VALUES (?, '1', 'D2', ?, ?, ?, 'I1', NULL, NULL, "
+        "'independent-reviewer', '{}', 'registry-hash', "
+        "'skill:d2', '1', 'skill-hash', 1)",
+        (contract_id, task_card_id, task_id, initiative_card_id),
+    )
+
+
+def test_h01_contract_family_is_reusable_but_each_task_has_at_most_one_contract(
+    provider_modules,
+):
+    conn, initiative_card_id = _fresh_s2_schema(provider_modules)
+    task_one = _insert_task_card(conn, "T1")
+    task_two = _insert_task_card(conn, "T2")
+
+    _insert_contract(
+        conn, initiative_card_id, task_one, "T1", "design-lifecycle.d2"
+    )
+    _insert_contract(
+        conn, initiative_card_id, task_two, "T2", "design-lifecycle.d2"
+    )
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_lifecycle_contracts "
+        "WHERE contract_id = 'design-lifecycle.d2'"
+    ).fetchone()[0] == 2
+    columns = {
+        row["name"]: row["pk"]
+        for row in conn.execute("PRAGMA table_info(task_lifecycle_contracts)")
+    }
+    assert columns["task_card_id"] == 1
+    assert columns["contract_id"] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_contract(
+            conn,
+            initiative_card_id,
+            task_one,
+            "T1",
+            "design-lifecycle.other",
+        )
+    conn.close()
+
+
+def _insert_phase_result(conn, initiative_card_id, result_id, segment_id, accepted):
+    conn.execute(
+        "INSERT INTO initiative_phase_results "
+        "(result_id, initiative_card_id, initiative_id, phase, segment_id, "
+        "iteration, result_kind, contract_id, contract_version, "
+        "canonical_payload, accepted_task_refs, accepted_checkpoint_refs, "
+        "actor_evidence, idempotency_key, accepted, created_at) "
+        "VALUES (?, ?, 'I1', 'D3', ?, 1, 'close', NULL, NULL, '{}', "
+        "NULL, NULL, 'actor', ?, ?, 1)",
+        (result_id, initiative_card_id, segment_id, f"key:{result_id}", accepted),
+    )
+
+
+@pytest.mark.parametrize("segment_id", [None, "S1"])
+def test_f08_duplicate_accepted_phase_result_key_rejects_even_with_null_segment(
+    provider_modules, segment_id
+):
+    conn, initiative_card_id = _fresh_s2_schema(provider_modules)
+    _insert_phase_result(conn, initiative_card_id, "R1", segment_id, 1)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_phase_result(conn, initiative_card_id, "R2", segment_id, 1)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM initiative_phase_results WHERE accepted = 1"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_f08_unaccepted_phase_results_may_repeat_and_blank_segment_is_rejected(
+    provider_modules,
+):
+    conn, initiative_card_id = _fresh_s2_schema(provider_modules)
+    _insert_phase_result(conn, initiative_card_id, "R1", None, 0)
+    _insert_phase_result(conn, initiative_card_id, "R2", None, 0)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM initiative_phase_results WHERE accepted = 0"
+    ).fetchone()[0] == 2
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_phase_result(conn, initiative_card_id, "R3", "   ", 1)
+    conn.close()
