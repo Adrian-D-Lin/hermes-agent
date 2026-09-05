@@ -66,6 +66,7 @@ def provider_modules():
         "diagnostics": importlib.import_module(f"{name}.diagnostics"),
         "lifecycle": importlib.import_module(f"{name}.lifecycle"),
         "policy": importlib.import_module(f"{name}.policy"),
+        "private_adapter": importlib.import_module(f"{name}.private_adapter"),
         "provider": importlib.import_module(f"{name}.provider"),
         "schema": importlib.import_module(f"{name}.schema"),
     }
@@ -662,6 +663,175 @@ def test_u06_scope_rejects_different_connection_without_consuming_capability(
         kb.clear_authority_providers()
         conn.close()
         other.close()
+
+
+def test_h03_private_adapter_executes_one_typed_native_mutation(
+    provider_modules, tmp_path, monkeypatch
+):
+    adapter_mod = provider_modules["private_adapter"]
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+        ("task-1", "Adapter probe", "ready", 1_000),
+    )
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    binding = _binding(
+        cap_mod,
+        operation="kanban_comment",
+        target="task-1",
+        workspace_id=None,
+    )
+    capability = provider._mint_after_admission(binding)
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        adapter = adapter_mod._PrivateNativeAdapter(provider, conn)
+        result = adapter.execute(
+            capability,
+            binding,
+            adapter_mod._CommentArgs(
+                task_id="task-1", author="orchestrator", body="raw evidence"
+            ),
+        )
+
+        assert type(result) is int and result > 0
+        assert provider.is_consumed(capability) is True
+        row = conn.execute(
+            "SELECT task_id, author, body FROM task_comments WHERE id = ?",
+            (result,),
+        ).fetchone()
+        assert tuple(row) == ("task-1", "orchestrator", "raw evidence")
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u07_private_adapter_rejects_operation_and_target_mismatch_before_scope(
+    provider_modules, tmp_path, monkeypatch
+):
+    adapter_mod = provider_modules["private_adapter"]
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        adapter = adapter_mod._PrivateNativeAdapter(provider, conn)
+        wrong_operation = _binding(
+            cap_mod,
+            operation="kanban_complete",
+            target="task-1",
+            workspace_id=None,
+        )
+        operation_capability = provider._mint_after_admission(wrong_operation)
+        with pytest.raises(adapter_mod._PrivateAdapterRejected, match="arguments"):
+            adapter.execute(
+                operation_capability,
+                wrong_operation,
+                adapter_mod._CommentArgs("task-1", "orchestrator", "comment"),
+            )
+        assert provider.is_consumed(operation_capability) is False
+
+        wrong_target = _binding(
+            cap_mod,
+            operation="kanban_comment",
+            target="task-2",
+            workspace_id=None,
+        )
+        target_capability = provider._mint_after_admission(wrong_target)
+        with pytest.raises(adapter_mod._PrivateAdapterRejected, match="target"):
+            adapter.execute(
+                target_capability,
+                wrong_target,
+                adapter_mod._CommentArgs("task-1", "orchestrator", "comment"),
+            )
+        assert provider.is_consumed(target_capability) is False
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_private_adapter_failure_after_native_txn_consumes_without_retry(
+    provider_modules, tmp_path, monkeypatch
+):
+    adapter_mod = provider_modules["private_adapter"]
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    binding = _binding(
+        cap_mod,
+        operation="kanban_comment",
+        target="missing-task",
+        workspace_id=None,
+    )
+    capability = provider._mint_after_admission(binding)
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        adapter = adapter_mod._PrivateNativeAdapter(provider, conn)
+        with pytest.raises(ValueError, match="unknown task"):
+            adapter.execute(
+                capability,
+                binding,
+                adapter_mod._CommentArgs(
+                    "missing-task", "orchestrator", "must not retry"
+                ),
+            )
+        assert provider.is_consumed(capability) is True
+        assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 0
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_private_adapter_is_closed_typed_and_not_publicly_imported(provider_modules):
+    adapter_mod = provider_modules["private_adapter"]
+    expected = {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_unblock",
+        "kanban_comment",
+        "kanban_heartbeat",
+        "kanban_request_changes",
+        "kanban_request_review",
+    }
+    assert set(adapter_mod._OPERATION_ARGUMENT_TYPES) == expected
+    assert adapter_mod.__all__ == ()
+
+    args = adapter_mod._CommentArgs("task-1", "orchestrator", "comment")
+    with pytest.raises(FrozenInstanceError):
+        args.task_id = "task-2"
+    with pytest.raises(adapter_mod._PrivateAdapterRejected, match="nonblank"):
+        adapter_mod._CommentArgs(" ", "orchestrator", "comment")
+
+    package_root = Path(__file__).parents[1] / "plugins" / "adrian-kanban"
+    for public_name in ("__init__.py", "commands.py", "seam.py", "plugin.yaml"):
+        assert "private_adapter" not in (package_root / public_name).read_text(
+            encoding="utf-8"
+        )
 
 
 def test_h16_rejection_envelope_preserves_every_failure_and_remediation(
