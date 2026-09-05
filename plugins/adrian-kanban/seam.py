@@ -4,18 +4,19 @@ This package is the *only* thing S1 implements on the plugin side. It is a thin
 adapter over the **generic, core-owned** seam in
 ``hermes_cli.kanban_db``:
 
-* :func:`register` wires the plugin's provider through the core's generic
-  ``register_authority_provider`` interface. The core owns the seam; the plugin
-  only registers *through* it and never reaches into core internals.
+* :func:`register_provider` wires the plugin's provider through the core's
+  generic ``register_authority_provider`` interface. The core owns the seam; the
+  plugin only registers *through* it and never reaches into core internals.
 * :func:`resolve_authority` — reads the machine-global selection from config.
-* :func:`provider_is_available` — the health + interface gate.
-* :func:`scoped_authority` — a context manager that enforces the seam: while
-  active, native mutation and dispatch either delegate to a healthy provider or
-  fail closed.
 * :func:`ensure_admitted` — delegate an already-admitted operation across the
   seam.
 * :func:`health_report` — a read-only health result reporting the selected
   authority, plugin version, database path, and native-surface state.
+
+Provider validation and status are core-owned: the generic seam in
+``hermes_cli.kanban_db`` performs the health/interface gate, and core
+``write_txn`` owns enforcement of the seam. The plugin delegates to the core and
+does not re-implement that gate.
 
 The seam is deliberately generic: it knows only that a provider must expose
 ``name``, ``is_healthy() -> bool``, and ``admit_operation(operation) -> bool``.
@@ -29,14 +30,9 @@ operator explicitly selects ``adrian-kanban``.
 
 from __future__ import annotations
 
-import contextlib
-import logging
-from contextvars import ContextVar
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 
 from hermes_cli import kanban_db as _kb
-
-_log = logging.getLogger(__name__)
 
 # The fail-closed diagnostic is defined in the generic, core-owned seam. The
 # plugin re-exports it so existing import sites (tests, S2) keep resolving
@@ -49,10 +45,6 @@ AuthorityAdmissionRejected = _kb.AuthorityAdmissionRejected
 # seam's ``AUTHORITY_ADRIAN_KANBAN`` and ``config_defaults``.
 AUTHORITY_ADRIAN_KANBAN = "adrian-kanban"
 AUTHORITY_NATIVE = "native"
-
-# The minimal interface a provider must supply for the seam to delegate.
-# S2's production capability is expected to implement this same surface.
-_REQUIRED_PROVIDER_ATTRS = ("name", "is_healthy", "admit_operation")
 
 
 class AdmittedAuthorityProvider:
@@ -78,12 +70,6 @@ class AdmittedAuthorityProvider:
         raise NotImplementedError
 
 
-# The active seam scope. ``None`` or ``native`` = no enforcement.
-_SCOPE_CTX: "ContextVar[Optional[str]]" = ContextVar(
-    "adrian_kanban_seam_scope", default=None
-)
-
-
 def register_provider(
     provider: AdmittedAuthorityProvider, db_path: Optional[str] = None
 ) -> None:
@@ -96,64 +82,12 @@ def register_provider(
     _kb.register_authority_provider(provider, db_path)
 
 
-@contextlib.contextmanager
-def scoped_authority(
-    authority: str, *, db_path: Optional[str] = None
-) -> "Iterator[None]":
-    """Establish a scoped authority for the duration of a mutation/dispatch.
-
-    While active:
-
-    * If ``authority == 'native'`` the scope is a no-op (existing behavior).
-    * If ``authority == 'adrian-kanban'`` the seam requires a healthy,
-      interface-compatible provider. When present, callers may delegate an
-      already-admitted operation via :func:`ensure_admitted`. When absent,
-      callers must raise :class:`AuthorityAdmissionRejected` before touching
-      the DB.
-
-    ``db_path`` scopes a test-only provider to a specific board DB.
-    """
-    token = _SCOPE_CTX.set(authority)
-    try:
-        yield
-    finally:  # pragma: no cover - defensive
-        _SCOPE_CTX.reset(token)
-
-
-def current_scope_authority() -> Optional[str]:
-    """Return the active seam scope authority, or ``None`` if unset."""
-    return _SCOPE_CTX.get()
-
-
 def resolve_authority() -> str:
     """Return the configured mutation authority, fail-closed on error.
 
     Delegates to the generic, core-owned ``kanban_db.resolve_selected_authority``.
     """
     return _kb.resolve_selected_authority()
-
-
-def provider_is_available(provider: Optional[AdmittedAuthorityProvider]) -> bool:
-    """True only if *provider* is present, healthy, and interface-compatible.
-
-    This is the fail-closed gate. A provider that is present but unhealthy, or
-    present but missing ``name``/``is_healthy``/``admit_operation``, returns
-    False so the seam refuses to delegate.
-    """
-    if provider is None:
-        return False
-    for attr in _REQUIRED_PROVIDER_ATTRS:
-        if not hasattr(provider, attr):
-            return False
-    try:
-        if not bool(provider.is_healthy()):
-            return False
-    except Exception:  # pragma: no cover - defensive
-        _log.warning("kanban seam: provider health probe failed")
-        return False
-    if not callable(getattr(provider, "admit_operation", None)):
-        return False
-    return True
 
 
 def ensure_admitted(operation: str, *, db_path: Optional[str] = None) -> bool:
