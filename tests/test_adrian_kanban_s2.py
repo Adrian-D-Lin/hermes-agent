@@ -64,6 +64,7 @@ def provider_modules():
         "contracts": importlib.import_module(f"{name}.contracts"),
         "diagnostics": importlib.import_module(f"{name}.diagnostics"),
         "lifecycle": importlib.import_module(f"{name}.lifecycle"),
+        "policy": importlib.import_module(f"{name}.policy"),
         "provider": importlib.import_module(f"{name}.provider"),
         "schema": importlib.import_module(f"{name}.schema"),
     }
@@ -1448,3 +1449,356 @@ def test_h05_cold_hydration_rejects_noncanonical_or_extra_payload(
     with pytest.raises(lifecycle.LifecycleRecordRejected, match="payload keys"):
         repository.load("T1")
     conn.close()
+
+
+def _policy_snapshot(provider_modules, step="D2"):
+    contracts = provider_modules["contracts"]
+    if step == "D2":
+        return contracts.expand_contract(
+            step=step,
+            initiative_id="I1",
+            baseline_refs=("baseline",),
+            governing_source_refs=("canon",),
+        )
+    if step == "D4.1":
+        return contracts.expand_contract(
+            step=step,
+            initiative_id="I1",
+            baseline_refs=("baseline",),
+            prior_record_refs=("record",),
+        )
+    return contracts.expand_contract(
+        step=step,
+        initiative_id="I1",
+        baseline_refs=("baseline",),
+        prior_record_refs=("record",),
+        predecessor_ref="handoff:D4.1",
+    )
+
+
+def _policy_record(provider_modules, step="D2"):
+    lifecycle = provider_modules["lifecycle"]
+    snapshot = _policy_snapshot(provider_modules, step)
+    skill = lifecycle.SkillBinding(
+        skill_id=f"skill:{step}", skill_version="1", skill_hash="skill-hash"
+    )
+    return lifecycle.LifecycleContractRecord(
+        task_card_id=2,
+        task_id=f"task:{step}",
+        initiative_card_id=1,
+        snapshot=snapshot,
+        skill=skill,
+        created_at=10,
+    )
+
+
+def _compatibility(provider_modules, record):
+    policy = provider_modules["policy"]
+    snapshot = record.snapshot
+    return policy.ResolvedCompatibility(
+        phase=snapshot.phase,
+        contract_id=snapshot.contract_id,
+        contract_version=snapshot.contract_version,
+        step=snapshot.step,
+        execution_profile=snapshot.execution_profile,
+        output_validator=snapshot.output_validator,
+        registry_hash=snapshot.registry_hash,
+        skill=record.skill,
+    )
+
+
+def _launch_facts(provider_modules, record, **changes):
+    policy = provider_modules["policy"]
+    values = {
+        "attempt_id": "attempt-1",
+        "task_id": record.task_id,
+        "status": "ready",
+        "assignee": record.snapshot.execution_profile,
+        "current_phase": record.snapshot.phase,
+        "current_initiative_id": record.snapshot.initiative_id,
+        "current_segment_id": record.snapshot.segment_id,
+        "current_workspace_id": record.snapshot.segment_workspace_id,
+        "compatibility": _compatibility(provider_modules, record),
+        "predecessor": None,
+        "blocking_task_ids": (),
+        "active_profile_task_ids": (),
+        "workspace": None,
+    }
+    values.update(changes)
+    return policy.ExecutionLaunchFacts(**values)
+
+
+def _diagnostic_codes(decision):
+    rejection = decision.rejection
+    return (
+        [check.code for check in rejection.failed_checks],
+        [check.code for check in rejection.not_evaluated_checks],
+    )
+
+
+def test_h06_policy_alone_explicitly_admits_valid_execution_launch(
+    provider_modules,
+):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+    facts = _launch_facts(provider_modules, record)
+
+    decision = policy.evaluate_execution_launch(record, facts)
+
+    assert decision.admitted is True
+    assert decision.task_id == record.task_id
+    assert decision.execution_profile == record.snapshot.execution_profile
+    assert decision.rejection is None
+
+
+def test_f14_policy_collects_all_independent_launch_failures_without_values(
+    provider_modules,
+):
+    policy = provider_modules["policy"]
+    lifecycle = provider_modules["lifecycle"]
+    record = _policy_record(provider_modules)
+    incompatible_skill = lifecycle.SkillBinding(
+        "secret-skill", "secret-version", "secret-skill-hash"
+    )
+    incompatible = policy.ResolvedCompatibility(
+        phase="secret-compat-phase",
+        contract_id="secret-contract",
+        contract_version=2,
+        step="secret-step",
+        execution_profile="secret-compat-profile",
+        output_validator="secret-validator",
+        registry_hash="secret-registry-hash",
+        skill=incompatible_skill,
+    )
+    facts = _launch_facts(
+        provider_modules,
+        record,
+        task_id="other-task",
+        status="blocked",
+        assignee="secret-assignee",
+        current_phase="other-phase",
+        current_initiative_id="other-initiative",
+        current_segment_id="S9",
+        current_workspace_id="W9",
+        compatibility=incompatible,
+        predecessor=policy.PredecessorEvidence(
+            "unexpected-ref", "accepted_handoff", "I1", True
+        ),
+        blocking_task_ids=("dependency-task",),
+        active_profile_task_ids=("running-task",),
+        workspace=policy.WorkspaceFacts("S9", "W9", True, True, False),
+    )
+
+    decision = policy.evaluate_execution_launch(record, facts)
+    failed, not_evaluated = _diagnostic_codes(decision)
+
+    assert decision.admitted is False
+    assert failed == [
+        "TASK_ID_MISMATCH",
+        "TASK_STATUS_NOT_READY",
+        "ASSIGNEE_PROFILE_MISMATCH",
+        "INITIATIVE_ID_MISMATCH",
+        "INITIATIVE_PHASE_MISMATCH",
+        "INITIATIVE_SEGMENT_MISMATCH",
+        "CURRENT_WORKSPACE_MISMATCH",
+        "COMPATIBILITY_PHASE_MISMATCH",
+        "COMPATIBILITY_CONTRACT_ID_MISMATCH",
+        "COMPATIBILITY_CONTRACT_VERSION_MISMATCH",
+        "COMPATIBILITY_STEP_MISMATCH",
+        "COMPATIBILITY_EXECUTION_PROFILE_MISMATCH",
+        "COMPATIBILITY_OUTPUT_VALIDATOR_MISMATCH",
+        "COMPATIBILITY_REGISTRY_HASH_MISMATCH",
+        "COMPATIBILITY_SKILL_ID_MISMATCH",
+        "COMPATIBILITY_SKILL_VERSION_MISMATCH",
+        "COMPATIBILITY_SKILL_HASH_MISMATCH",
+        "UNEXPECTED_PREDECESSOR_EVIDENCE",
+        "EXPLICIT_DEPENDENCY_BLOCKED",
+        "UNEXPECTED_WORKSPACE_FACTS",
+        "PROFILE_LANE_OCCUPIED",
+    ]
+    assert not_evaluated == []
+    assert decision.rejection.state_changed is False
+    rendered = decision.rejection.render()
+    for secret in (
+        "secret-assignee",
+        "secret-contract",
+        "secret-registry-hash",
+        "secret-skill-hash",
+        "unexpected-ref",
+    ):
+        assert secret not in rendered
+
+
+def test_h06_exact_accepted_predecessor_releases_sequenced_step(provider_modules):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules, "D4.2")
+    predecessor = policy.PredecessorEvidence(
+        reference="handoff:D4.1",
+        evidence_kind="accepted_handoff",
+        initiative_id="I1",
+        accepted=True,
+    )
+
+    decision = policy.evaluate_execution_launch(
+        record, _launch_facts(provider_modules, record, predecessor=predecessor)
+    )
+
+    assert decision.admitted is True
+
+
+@pytest.mark.parametrize(
+    ("predecessor", "failed_codes", "not_evaluated_codes"),
+    (
+        (
+            None,
+            ["PREDECESSOR_EVIDENCE_MISSING"],
+            [
+                "PREDECESSOR_KIND_NOT_EVALUATED",
+                "PREDECESSOR_ACCEPTANCE_NOT_EVALUATED",
+            ],
+        ),
+        (
+            ("wrong-ref", "accepted_handoff", "I1", True),
+            ["PREDECESSOR_EVIDENCE_MISMATCH"],
+            [
+                "PREDECESSOR_KIND_NOT_EVALUATED",
+                "PREDECESSOR_ACCEPTANCE_NOT_EVALUATED",
+            ],
+        ),
+        (
+            ("handoff:D4.1", "initiative_checkpoint", "I1", False),
+            ["PREDECESSOR_KIND_MISMATCH", "PREDECESSOR_NOT_ACCEPTED"],
+            [],
+        ),
+    ),
+)
+def test_u09_sequence_evidence_rejects_missing_mismatched_or_unaccepted(
+    provider_modules, predecessor, failed_codes, not_evaluated_codes
+):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules, "D4.2")
+    evidence = None
+    if predecessor is not None:
+        evidence = policy.PredecessorEvidence(*predecessor)
+
+    decision = policy.evaluate_execution_launch(
+        record, _launch_facts(provider_modules, record, predecessor=evidence)
+    )
+    failed, not_evaluated = _diagnostic_codes(decision)
+
+    assert failed == failed_codes
+    assert not_evaluated == not_evaluated_codes
+
+
+def test_f04_profile_lane_counts_only_supplied_lifecycle_tasks(provider_modules):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+
+    available = policy.evaluate_execution_launch(
+        record, _launch_facts(provider_modules, record)
+    )
+    occupied = policy.evaluate_execution_launch(
+        record,
+        _launch_facts(
+            provider_modules,
+            record,
+            active_profile_task_ids=("same-profile-lifecycle-task",),
+        ),
+    )
+
+    assert available.admitted is True
+    assert _diagnostic_codes(occupied)[0] == ["PROFILE_LANE_OCCUPIED"]
+    assert "model_sessions" not in policy.ExecutionLaunchFacts.__annotations__
+
+
+def test_f15_invalid_snapshot_marks_dependent_policy_groups_not_evaluated(
+    provider_modules,
+):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+    corrupt_snapshot = replace(record.snapshot, execution_profile="wrong-profile")
+    corrupt_record = replace(record, snapshot=corrupt_snapshot)
+
+    decision = policy.evaluate_execution_launch(
+        corrupt_record,
+        _launch_facts(
+            provider_modules,
+            corrupt_record,
+            task_id="other-task",
+            status="blocked",
+        ),
+    )
+    failed, not_evaluated = _diagnostic_codes(decision)
+
+    assert failed == [
+        "TASK_ID_MISMATCH",
+        "TASK_STATUS_NOT_READY",
+        "CONTRACT_SNAPSHOT_INVALID",
+    ]
+    assert not_evaluated == [
+        "CONTRACT_COMPATIBILITY_NOT_EVALUATED",
+        "SEQUENCE_NOT_EVALUATED",
+        "WORKSPACE_NOT_EVALUATED",
+        "PROFILE_LANE_NOT_EVALUATED",
+    ]
+
+
+def test_u09_workspace_alignment_controller_and_writer_are_separate_checks(
+    provider_modules, monkeypatch
+):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+    scoped_snapshot = replace(
+        record.snapshot,
+        segment_id="S1",
+        segment_workspace_id="workspace-1",
+    )
+    scoped_record = replace(record, snapshot=scoped_snapshot)
+    compatibility = _compatibility(provider_modules, scoped_record)
+    monkeypatch.setattr(policy, "validate_snapshot", lambda snapshot: True)
+
+    missing = policy.evaluate_execution_launch(
+        scoped_record,
+        _launch_facts(
+            provider_modules,
+            scoped_record,
+            compatibility=compatibility,
+        ),
+    )
+    failed, not_evaluated = _diagnostic_codes(missing)
+    assert failed == ["WORKSPACE_ALIGNMENT_MISMATCH"]
+    assert not_evaluated == [
+        "WORKSPACE_CONTROLLER_NOT_EVALUATED",
+        "WORKSPACE_WRITER_NOT_EVALUATED",
+    ]
+
+    matched_but_unsafe = policy.WorkspaceFacts(
+        "S1", "workspace-1", False, False, True
+    )
+    unsafe = policy.evaluate_execution_launch(
+        scoped_record,
+        _launch_facts(
+            provider_modules,
+            scoped_record,
+            compatibility=compatibility,
+            workspace=matched_but_unsafe,
+        ),
+    )
+    assert _diagnostic_codes(unsafe)[0] == [
+        "WORKSPACE_CONTROLLER_NOT_READY",
+        "WORKSPACE_WRITER_CONTESTED",
+    ]
+
+
+def test_policy_fact_types_are_frozen_strict_and_model_agnostic(provider_modules):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+    facts = _launch_facts(provider_modules, record)
+
+    with pytest.raises(FrozenInstanceError):
+        facts.assignee = "changed"
+    with pytest.raises(policy.PolicyInputRejected):
+        replace(facts, active_profile_task_ids=("same", "same"))
+    with pytest.raises(policy.PolicyInputRejected):
+        policy.ExecutionLaunchDecision(True, record.task_id, "profile", object())
+    assert "model_name" not in policy.ExecutionLaunchFacts.__annotations__
