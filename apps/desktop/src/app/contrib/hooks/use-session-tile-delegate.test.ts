@@ -71,7 +71,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     setSessions([])
   })
 
-  it('carries the owning profile into a cold tile resume so it cannot fork profiles', async () => {
+  it('carries the owning profile and Desktop source into a cold tile resume', async () => {
     // A tile opens a session owned by another profile. Resuming without the
     // profile lets the gateway fall back to the launch-profile DB and clone the
     // conversation into the wrong profile (#67603). The owning profile must ride
@@ -96,7 +96,8 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-x',
         cols: 96,
         profile: 'ai-engineer',
-        omit_messages: true
+        omit_messages: true,
+        source: 'desktop'
       },
       undefined,
       undefined
@@ -124,7 +125,8 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-y',
         cols: 96,
         profile: 'default',
-        omit_messages: true
+        omit_messages: true,
+        source: 'desktop'
       },
       undefined,
       undefined
@@ -146,6 +148,7 @@ describe('useSessionTileDelegate resumeTile', () => {
       session_id: 'stored-shared',
       cols: 96,
       omit_messages: true,
+      source: 'desktop',
       profile: 'default'
     })
     expect(ambientRequest).not.toHaveBeenCalled()
@@ -175,6 +178,7 @@ describe('useSessionTileDelegate resumeTile', () => {
       session_id: 'stored-remote',
       cols: 96,
       omit_messages: true,
+      source: 'desktop',
       profile: 'backend-oxcoder'
     })
     expect(ambientRequest).not.toHaveBeenCalled()
@@ -257,7 +261,8 @@ describe('useSessionTileDelegate resumeTile', () => {
         session_id: 'stored-b',
         cols: 96,
         profile: 'default',
-        omit_messages: true
+        omit_messages: true,
+        source: 'desktop'
       },
       undefined,
       undefined

@@ -271,6 +271,7 @@ export function useSessionTileDelegate({
                 session_id: storedSessionId,
                 cols: 96,
                 omit_messages: true,
+                source: 'desktop',
                 ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
               })
             )
