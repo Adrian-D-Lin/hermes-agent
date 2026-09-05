@@ -608,10 +608,11 @@ def test_transition_schema_matches_ratified_record_shape(
         / "kanban.db"
     )
     rows = store._conn.execute(
-        "PRAGMA table_info(adrian_kanban_initiative_transitions)"
+        "PRAGMA table_info(initiative_transitions)"
     ).fetchall()
     cols = {row["name"] for row in rows}
     assert {
+        "initiative_card_id",
         "transition_id",
         "initiative_id",
         "previous_transition_id",
@@ -638,7 +639,8 @@ def test_segment_manifest_projection_exists(
     Path: fringe. Behaviour: segment-manifest projection structures exist with
     the design-required manifest identifier fields.
     Fixture: the foundational store schema. Expected: the projection table
-    carries manifest_path / manifest_sha / digest / readiness / validation.
+    carries the immutable manifest, parsed segment, readiness, and validation
+    fields under their corrected S2 names.
     Out-of-scope: projection population (S2).
     """
     AdmittedStore = adrian_plugin_modules["store"].AdmittedStore
@@ -647,15 +649,16 @@ def test_segment_manifest_projection_exists(
         database_path=kanban_home.parent / "adrian-seg" / "kanban.db"
     )
     rows = store._conn.execute(
-        "PRAGMA table_info(adrian_kanban_segment_manifest)"
+        "PRAGMA table_info(initiative_segment_projections)"
     ).fetchall()
     cols = {row["name"] for row in rows}
     for expected in (
         "manifest_path",
         "manifest_sha",
-        "digest",
-        "readiness",
-        "validation",
+        "content_digest",
+        "parsed_segment_definitions",
+        "readiness_refs",
+        "validation_result",
     ):
         assert expected in cols, f"missing segment_manifest field: {expected}"
 
@@ -914,10 +917,26 @@ def test_admitted_write_transaction_rolls_back_on_crash(
     class _Provider:
         name = "rollback-provider"
 
+        def __init__(self) -> None:
+            self.consumed = False
+
         def is_healthy(self) -> bool:
             return True
 
         def admit_operation(self, operation: str) -> bool:
+            return True
+
+        def validate_capability(
+            self, capability, context, canonical_path, *, allow_consumed: bool
+        ) -> bool:
+            return capability is token and context is binding and (
+                allow_consumed or not self.consumed
+            )
+
+        def consume_capability(self, capability, context, canonical_path) -> bool:
+            if capability is not token or context is not binding or self.consumed:
+                return False
+            self.consumed = True
             return True
 
     (kanban_home / "config.yaml").write_text(
@@ -926,17 +945,24 @@ def test_admitted_write_transaction_rolls_back_on_crash(
         f"  database_path: {authority_db.as_posix()}\n",
         encoding="utf-8",
     )
-    kb.register_authority_provider(_Provider(), str(authority_db))
+    token = object()
+    binding = object()
+    provider = _Provider()
+    kb.register_authority_provider(provider, str(authority_db))
     try:
         with pytest.raises(RuntimeError, match="simulated crash"):
-            with kb.write_txn(conn):
-                conn.execute(
-                    "INSERT INTO crash_probe (id, value) VALUES (1, 'partial')"
-                )
-                raise RuntimeError("simulated crash")
+            with kb._scoped_authority_capability(
+                conn, token, binding, db_path=str(authority_db)
+            ):
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "INSERT INTO crash_probe (id, value) VALUES (1, 'partial')"
+                    )
+                    raise RuntimeError("simulated crash")
         count = conn.execute("SELECT COUNT(*) FROM crash_probe").fetchone()[0]
         assert count == 0
         assert conn.in_transaction is False
+        assert provider.consumed is True
     finally:
         kb.clear_authority_providers()
         conn.close()
@@ -969,12 +995,23 @@ def test_transition_schema_rejects_two_successors_for_one_predecessor(
             to_phase="DEV2",
             to_segment_id="S1",
         )
+        initiative_card_id = store._conn.execute(
+            "SELECT id FROM adrian_kanban_cards "
+            "WHERE initiative_id = 'init_chain' AND task_id IS NULL"
+        ).fetchone()[0]
         with pytest.raises(sqlite3.IntegrityError):
             store._conn.execute(
-                "INSERT INTO adrian_kanban_initiative_transitions "
-                "(initiative_id, previous_transition_id, transition_id, "
-                "to_phase, created_at) VALUES (?, ?, ?, ?, ?)",
-                ("init_chain", 10, 30, "DEV3", int(time.time())),
+                "INSERT INTO initiative_transitions "
+                "(initiative_card_id, initiative_id, previous_transition_id, "
+                "transition_id, to_phase, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    initiative_card_id,
+                    "init_chain",
+                    10,
+                    30,
+                    "DEV3",
+                    int(time.time()),
+                ),
             )
 
 
@@ -1039,7 +1076,7 @@ def test_concurrent_transition_writers_cannot_branch_the_chain(
     assert isinstance(failures[0], TransitionIntegrityError)
     with AdmittedStore(database_path=db_path) as check:
         count = check._conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_initiative_transitions "
+            "SELECT COUNT(*) FROM initiative_transitions "
             "WHERE initiative_id = 'init_race'"
         ).fetchone()[0]
         assert count == 2
