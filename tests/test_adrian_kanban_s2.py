@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import importlib
 import importlib.util
+import inspect
 import json
 import pickle
 import sqlite3
@@ -60,6 +61,7 @@ def provider_modules():
     spec.loader.exec_module(package)
     modules = {
         "capability": importlib.import_module(f"{name}.capability"),
+        "contracts": importlib.import_module(f"{name}.contracts"),
         "diagnostics": importlib.import_module(f"{name}.diagnostics"),
         "provider": importlib.import_module(f"{name}.provider"),
     }
@@ -766,3 +768,363 @@ def test_diagnostic_rejects_unknown_authority_labels(provider_modules, actor):
             actor,
             "not_retryable",
         )
+
+
+_EXPECTED_CONTRACT_TEMPLATES = {
+    "D2": (
+        "design-lifecycle.d2",
+        "D2",
+        "independent-reviewer",
+        ("baseline_refs", "governing_source_refs"),
+        ("eight_angle_review", "accumulated_record_on_reentry"),
+        "d2_review_v1",
+        None,
+    ),
+    "D4.1": (
+        "design-lifecycle.d4",
+        "D4",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("exact_per_document_edit_set",),
+        "d4_1_edit_set_v1",
+        ("d4", 1, None, "accepted_completion"),
+    ),
+    "D4.2": (
+        "design-lifecycle.d4",
+        "D4",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("d4_1_accepted",),
+        "d4_2_verification_v1",
+        ("d4", 2, "D4.1", "accepted_completion"),
+    ),
+    "D4.5": (
+        "design-lifecycle.d4",
+        "D4",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("d4_3_approval_checkpoint", "d4_4_execution_checkpoint"),
+        "d4_5_post_write_v1",
+        ("d4", 5, "D4.4", "initiative_checkpoint"),
+    ),
+    "DEV1.1a": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 1, None, "accepted_completion"),
+    ),
+    "DEV1.1b": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 2, "DEV1.1a", "accepted_completion"),
+    ),
+    "DEV1.1c": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 3, "DEV1.1b", "accepted_completion"),
+    ),
+    "DEV1.1d": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 4, "DEV1.1c", "accepted_completion"),
+    ),
+    "DEV1.1e": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 5, "DEV1.1d", "accepted_completion"),
+    ),
+    "DEV1.4": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("dry_cumulative_reconnaissance",),
+        "dev1_4_design_to_scope_v1",
+        None,
+    ),
+    "DEV1.5": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("prior_record_refs",),
+        ("ratified_scope",),
+        "dev1_5_segmentation_v1",
+        None,
+    ),
+    "DEV1.6": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "test-authority-reviewer",
+        ("prior_record_refs",),
+        ("ratified_scope", "proposed_segment_list"),
+        "dev1_6_segment_review_v1",
+        None,
+    ),
+}
+
+
+@pytest.mark.parametrize("step", tuple(_EXPECTED_CONTRACT_TEMPLATES))
+def test_h07_registry_contains_only_the_fixed_v028_task_templates(
+    provider_modules, step
+):
+    contracts = provider_modules["contracts"]
+    template = contracts.template_for(step)
+    expected = _EXPECTED_CONTRACT_TEMPLATES[step]
+    sequence = template.sequence
+    sequence_tuple = None
+    if sequence is not None:
+        sequence_tuple = (
+            sequence.family,
+            sequence.ordinal,
+            sequence.predecessor_step,
+            sequence.release_condition,
+        )
+
+    assert (
+        template.contract_id,
+        template.phase,
+        template.execution_profile,
+        template.required_reference_groups,
+        template.constraints,
+        template.output_validator,
+        sequence_tuple,
+    ) == expected
+    assert template.contract_version == 1
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ("D1", "D3", "D4.3", "D4.4", "DEV1.2", "DEV1.3", "DEV1.7"),
+)
+def test_h07_initiative_checkpoints_are_not_task_contract_templates(
+    provider_modules, checkpoint
+):
+    contracts = provider_modules["contracts"]
+    with pytest.raises(contracts.ContractRejected, match="unknown step"):
+        contracts.template_for(checkpoint)
+
+
+def test_h07_contract_expansion_has_no_caller_control_over_derived_policy(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    parameters = inspect.signature(contracts.expand_contract).parameters
+
+    assert "execution_profile" not in parameters
+    assert "constraints" not in parameters
+    assert "output_validator" not in parameters
+
+    snapshot = contracts.expand_contract(
+        step="D2",
+        initiative_id=" initiative-1 ",
+        baseline_refs=(" baseline:a ",),
+        governing_source_refs=("canon:b",),
+    )
+    assert snapshot.initiative_id == "initiative-1"
+    assert snapshot.baseline_refs == ("baseline:a",)
+    assert snapshot.execution_profile == "independent-reviewer"
+    assert snapshot.constraints == (
+        "eight_angle_review",
+        "accumulated_record_on_reentry",
+    )
+    assert snapshot.output_validator == "d2_review_v1"
+    assert contracts.validate_snapshot(snapshot) is True
+
+
+def test_h07_registry_hash_and_snapshot_payload_are_deterministic(provider_modules):
+    contracts = provider_modules["contracts"]
+    first_hash = contracts.registry_hash()
+    second_hash = contracts.registry_hash()
+    snapshot = contracts.expand_contract(
+        step="DEV1.6",
+        initiative_id="initiative-1",
+        prior_record_refs=("record:1",),
+    )
+
+    assert first_hash == second_hash == snapshot.registry_hash
+    assert len(first_hash) == 64
+    assert snapshot.canonical_payload() == json.dumps(
+        snapshot.canonical_dict(), sort_keys=True, separators=(",", ":")
+    )
+
+
+@pytest.mark.parametrize(
+    ("step", "kwargs", "expected_group", "expected_ordinal"),
+    (
+        (
+            "D4.1",
+            {"baseline_refs": ("b",), "prior_record_refs": ("p",)},
+            "initiative-1:d4",
+            1,
+        ),
+        (
+            "D4.2",
+            {
+                "baseline_refs": ("b",),
+                "prior_record_refs": ("p",),
+                "predecessor_ref": "result:D4.1",
+            },
+            "initiative-1:d4",
+            2,
+        ),
+        (
+            "DEV1.1a",
+            {"baseline_refs": ("b",)},
+            "initiative-1:dev1_angles",
+            1,
+        ),
+        (
+            "DEV1.1e",
+            {"baseline_refs": ("b",), "predecessor_ref": "result:DEV1.1d"},
+            "initiative-1:dev1_angles",
+            5,
+        ),
+    ),
+)
+def test_h18_sequence_expansion_enforces_first_and_later_step_shape(
+    provider_modules, step, kwargs, expected_group, expected_ordinal
+):
+    contracts = provider_modules["contracts"]
+    snapshot = contracts.expand_contract(
+        step=step, initiative_id="initiative-1", **kwargs
+    )
+
+    assert snapshot.sequence_group_id == expected_group
+    assert snapshot.sequence_ordinal == expected_ordinal
+    if expected_ordinal == 1:
+        assert snapshot.predecessor_ref is None
+    else:
+        assert snapshot.predecessor_ref == kwargs["predecessor_ref"]
+    assert contracts.validate_snapshot(snapshot) is True
+
+
+def test_h18_sequence_expansion_rejects_missing_or_unexpected_predecessor(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    with pytest.raises(contracts.ContractRejected, match="no predecessor"):
+        contracts.expand_contract(
+            step="D4.1",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            prior_record_refs=("p",),
+            predecessor_ref="unexpected",
+        )
+    with pytest.raises(contracts.ContractRejected, match="required"):
+        contracts.expand_contract(
+            step="D4.2",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            prior_record_refs=("p",),
+        )
+
+
+def test_u10_expansion_rejects_missing_duplicate_and_segment_inputs(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    with pytest.raises(contracts.ContractRejected, match="governing_source_refs"):
+        contracts.expand_contract(
+            step="D2", initiative_id="initiative-1", baseline_refs=("b",)
+        )
+    with pytest.raises(contracts.ContractRejected, match="unique"):
+        contracts.expand_contract(
+            step="D2",
+            initiative_id="initiative-1",
+            baseline_refs=("b", " b "),
+            governing_source_refs=("g",),
+        )
+    with pytest.raises(contracts.ContractRejected, match="both be set"):
+        contracts.expand_contract(
+            step="D2",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            governing_source_refs=("g",),
+            segment_id="S1",
+        )
+    with pytest.raises(contracts.ContractRejected, match="initial templates"):
+        contracts.expand_contract(
+            step="D2",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            governing_source_refs=("g",),
+            segment_id="S1",
+            segment_workspace_id="workspace-1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reported"),
+    (
+        ("version", 2, "version"),
+        ("contract_id", "secret-contract", "contract_id"),
+        ("contract_version", 2, "contract_version"),
+        ("phase", "secret-phase", "phase"),
+        ("execution_profile", "secret-profile", "execution_profile"),
+        ("constraints", ("secret-constraint",), "constraints"),
+        ("output_validator", "secret-validator", "output_validator"),
+        ("registry_hash", "secret-hash", "registry_hash"),
+        ("sequence_group_id", "secret-group", "sequence_group_id"),
+        ("sequence_ordinal", 3, "sequence_ordinal"),
+        ("release_condition", "initiative_checkpoint", "release_condition"),
+        ("baseline_refs", (), "required_reference_groups"),
+    ),
+)
+def test_f15_cold_snapshot_validation_detects_each_derived_field_drift(
+    provider_modules, field, value, reported
+):
+    contracts = provider_modules["contracts"]
+    snapshot = contracts.expand_contract(
+        step="D4.2",
+        initiative_id="initiative-1",
+        baseline_refs=("b",),
+        prior_record_refs=("p",),
+        predecessor_ref="result:D4.1",
+    )
+    altered = replace(snapshot, **{field: value})
+
+    with pytest.raises(contracts.ContractRejected) as rejected:
+        contracts.validate_snapshot(altered)
+
+    assert reported in str(rejected.value)
+    assert "secret-" not in str(rejected.value)
+
+
+def test_f15_cold_snapshot_rejects_scope_never_issued_by_initial_registry(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    snapshot = contracts.expand_contract(
+        step="D2",
+        initiative_id="initiative-1",
+        baseline_refs=("b",),
+        governing_source_refs=("g",),
+    )
+    altered = replace(
+        snapshot, segment_id="S1", segment_workspace_id="workspace-1"
+    )
+
+    with pytest.raises(contracts.ContractRejected) as rejected:
+        contracts.validate_snapshot(altered)
+
+    assert "segment_id" in str(rejected.value)
+    assert "segment_workspace_id" in str(rejected.value)
