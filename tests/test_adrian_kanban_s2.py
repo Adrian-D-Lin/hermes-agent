@@ -60,6 +60,7 @@ def provider_modules():
     spec.loader.exec_module(package)
     modules = {
         "capability": importlib.import_module(f"{name}.capability"),
+        "diagnostics": importlib.import_module(f"{name}.diagnostics"),
         "provider": importlib.import_module(f"{name}.provider"),
     }
     yield modules
@@ -655,3 +656,113 @@ def test_u06_scope_rejects_different_connection_without_consuming_capability(
         kb.clear_authority_providers()
         conn.close()
         other.close()
+
+
+def test_h16_rejection_envelope_preserves_every_failure_and_remediation(
+    provider_modules,
+):
+    diagnostic = provider_modules["diagnostics"]
+    collector = diagnostic.DiagnosticCollector(
+        "attempt-1",
+        "kanban_transition_initiative",
+        diagnostic.Boundary("DEV3/S1", "DEV4/S1"),
+    )
+    collector.failure(
+        diagnostic.FailedCheck(
+            "MISSING_HANDOFF",
+            "task:t-1",
+            "accepted DEV3 handoff",
+            "no accepted handoff",
+            "accepted task handoff record ID",
+            "complete review on the same task card",
+            "reviewer",
+            "return_route",
+        )
+    )
+    collector.failure(
+        diagnostic.FailedCheck(
+            "STALE_BASE",
+            "workspace:w-1",
+            "expected origin/main base",
+            "workspace base differs",
+            "full Git commit SHA",
+            "reconcile the workspace through the DEV3 return route",
+            "orchestrator",
+            "return_route",
+        )
+    )
+    collector.not_evaluated(
+        diagnostic.NotEvaluatedCheck(
+            "MERGE_CONTAINMENT",
+            ("MISSING_HANDOFF", "STALE_BASE"),
+        )
+    )
+
+    rejection = collector.rejection()
+    payload = rejection.as_dict()
+
+    assert payload["result"] == "REJECTED"
+    assert payload["state_changed"] is False
+    assert [item["code"] for item in payload["failed_checks"]] == [
+        "MISSING_HANDOFF",
+        "STALE_BASE",
+    ]
+    assert payload["not_evaluated_checks"] == [
+        {
+            "code": "MERGE_CONTAINMENT",
+            "requires": ["MISSING_HANDOFF", "STALE_BASE"],
+        }
+    ]
+    rendered = rejection.render()
+    assert rendered.startswith("REJECTED — no Kanban state changed")
+    assert "complete review on the same task card" in rendered
+    assert "reconcile the workspace" in rendered
+
+
+def test_f14_diagnostic_codes_are_unique_across_all_result_lists(provider_modules):
+    diagnostic = provider_modules["diagnostics"]
+    collector = diagnostic.DiagnosticCollector(
+        "attempt-1", "operation", diagnostic.Boundary("from", "to")
+    )
+    failure = diagnostic.FailedCheck(
+        "DUPLICATE",
+        "target",
+        "expected",
+        "observed",
+        "format",
+        "safe correction",
+        "session_agent",
+        "same_operation",
+    )
+    collector.failure(failure)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        collector.failure(failure)
+    with pytest.raises(ValueError, match="duplicate"):
+        collector.not_evaluated(
+            diagnostic.NotEvaluatedCheck("DUPLICATE", ("PREREQUISITE",))
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        diagnostic.RejectionEnvelope(
+            "attempt-1",
+            "operation",
+            diagnostic.Boundary("from", "to"),
+            (failure,),
+            (diagnostic.NotEvaluatedCheck("DUPLICATE", ("X",)),),
+        )
+
+
+@pytest.mark.parametrize("actor", ["root", "model", "admin", ""])
+def test_diagnostic_rejects_unknown_authority_labels(provider_modules, actor):
+    diagnostic = provider_modules["diagnostics"]
+    with pytest.raises(ValueError):
+        diagnostic.FailedCheck(
+            "ACTOR",
+            "actor",
+            "ratified actor enum",
+            "unknown",
+            "session_agent | orchestrator | reviewer | adrian | system_operator",
+            "use runtime-derived actor evidence",
+            actor,
+            "not_retryable",
+        )
