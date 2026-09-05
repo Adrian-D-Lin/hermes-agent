@@ -44,7 +44,7 @@ def relative_time(ts, *, session_id: Optional[str] = None) -> str:
     """Format a timestamp as relative time (e.g., '2h ago', 'yesterday'); ``?`` when unset or corrupt."""
     if not ts or (ts := coerce_epoch(ts, session_id=session_id, field="last_active")) is None:
         return "?"
-    delta = _time.time() - ts
+    delta = _time.time() - seconds
     if delta < 60:
         return "just now"
     if delta < 3600:
@@ -55,4 +55,4 @@ def relative_time(ts, *, session_id: Optional[str] = None) -> str:
         return "yesterday"
     if delta < 604800:
         return f"{int(delta / 86400)}d ago"
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d")
