@@ -3132,6 +3132,118 @@ _REQUIRED_PROVIDER_ATTRS = ("name", "is_healthy", "admit_operation")
 # provider registered for one board path is never visible to another.
 _PROVIDER_REGISTRY: "dict[str, object]" = {}
 
+_REQUIRED_CAPABILITY_PROVIDER_ATTRS = (
+    "validate_capability",
+    "consume_capability",
+)
+
+
+@dataclass
+class _AuthorityCapabilityEnvelope:
+    provider: object
+    capability: object
+    context: object
+    canonical_path: str
+    connection_identity: int
+    state: str = "fresh"
+
+
+_ACTIVE_AUTHORITY_CAPABILITY: ContextVar[
+    Optional[_AuthorityCapabilityEnvelope]
+] = ContextVar("_ACTIVE_AUTHORITY_CAPABILITY", default=None)
+
+
+def _require_capability_provider(provider):
+    if not _provider_is_available(provider):
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    for attr in _REQUIRED_CAPABILITY_PROVIDER_ATTRS:
+        if not hasattr(provider, attr) or not callable(getattr(provider, attr)):
+            raise AuthorityAdmissionRejected(
+                "capability interface is unavailable; native mutation fails "
+                "closed/no fallback"
+            )
+    return provider
+
+
+@contextlib.contextmanager
+def _scoped_authority_capability(
+    conn,
+    capability,
+    context,
+    *,
+    db_path: Optional[str] = None,
+):
+    selected_authority = resolve_selected_authority()
+    if selected_authority != AUTHORITY_ADRIAN_KANBAN:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if _ACTIVE_AUTHORITY_CAPABILITY.get() is not None:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if getattr(conn, "in_transaction", False):
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+
+    resolved_path = resolve_authority_path(override=db_path)
+    main_path = _sqlite_main_connection_file(conn)
+    if main_path is None:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    canonical_path = _canonical_path(resolved_path)
+    if _canonical_path(main_path) != canonical_path:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+
+    provider = _require_admitted_provider(canonical_path)
+    _require_capability_provider(provider)
+
+    try:
+        result = provider.validate_capability(
+            capability,
+            context,
+            canonical_path,
+            allow_consumed=False,
+        )
+        if result is not True:
+            raise AuthorityAdmissionRejected(
+                "capability interface is unavailable; native mutation fails "
+                "closed/no fallback"
+            )
+    except AuthorityAdmissionRejected:
+        raise
+    except Exception as exc:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        ) from exc
+
+    envelope = _AuthorityCapabilityEnvelope(
+        provider=provider,
+        capability=capability,
+        context=context,
+        canonical_path=canonical_path,
+        connection_identity=id(conn),
+        state="fresh",
+    )
+    token = _ACTIVE_AUTHORITY_CAPABILITY.set(envelope)
+    try:
+        yield conn
+    finally:
+        _ACTIVE_AUTHORITY_CAPABILITY.reset(token)
+
 
 def _normalize_authority_path(value: Optional[str]) -> str:
     """Return the normalized absolute path for an explicit authority value.
@@ -3432,46 +3544,107 @@ def _canonical_path(value: str) -> str:
     return str(Path(value).expanduser().resolve())
 
 
-def _enforce_seam_on_write_txn(conn: sqlite3.Connection) -> None:
-    """Fail closed when a non-native authority is selected and no provider is ready.
+def _enforce_seam_on_write_txn(
+    conn: sqlite3.Connection, *, nested: bool
+) -> Optional[_AuthorityCapabilityEnvelope]:
+    selected_authority = resolve_selected_authority()
+    if selected_authority != AUTHORITY_ADRIAN_KANBAN:
+        return None
 
-    No-op under the default ``native`` authority. When ``adrian-kanban`` is
-    selected the seam:
-
-    1. resolves the configured authoritative database path (raising
-       :class:`AuthorityAdmissionRejected` when it is missing or relative),
-    2. derives the SQLite ``main`` connection file from ``PRAGMA database_list``
-       and rejects any mismatch against the resolved path (fail closed), then
-    3. requires the provider registered for that exact path.
-
-    The comparison is canonical: both the configured path and the SQLite-
-    reported file are normalized through :func:`_canonical_path` before being
-    compared, so segment/symlink differences that denote the same file do not
-    cause a false mismatch.
-
-    The seam is generic and core-owned: it never imports concrete plugin code.
-    """
-    if resolve_selected_authority() != AUTHORITY_ADRIAN_KANBAN:
-        return
-    # (1) Resolve the configured authoritative path. This also rejects a
-    # missing or relative configuration before we touch the connection.
-    authoritative = resolve_authority_path()
-    # (2) Derive the actual SQLite main connection file and reject a mismatch.
-    actual_file = _sqlite_main_connection_file(conn)
-    if actual_file is None:
+    resolved_path = resolve_authority_path()
+    main_path = _sqlite_main_connection_file(conn)
+    if main_path is None:
         raise AuthorityAdmissionRejected(
-            "adrian-kanban: could not read the SQLite main connection file "
-            "from PRAGMA database_list; native mutation fails closed "
-            "(no fallback)"
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
         )
-    if _canonical_path(authoritative) != _canonical_path(actual_file):
+    canonical_path = _canonical_path(resolved_path)
+    if _canonical_path(main_path) != canonical_path:
         raise AuthorityAdmissionRejected(
-            f"adrian-kanban: connection file {actual_file!r} does not match "
-            f"the configured authoritative database path {authoritative!r}; "
-            "native mutation fails closed (no fallback)"
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
         )
-    # (3) Require the provider registered for that exact path.
-    _require_admitted_provider(authoritative)
+
+    provider = _require_admitted_provider(canonical_path)
+    _require_capability_provider(provider)
+
+    envelope = _ACTIVE_AUTHORITY_CAPABILITY.get()
+    if envelope is None:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if envelope.provider is not provider:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if envelope.canonical_path != canonical_path:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if envelope.connection_identity != id(conn):
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+
+    try:
+        if nested:
+            if envelope.state != "active":
+                raise AuthorityAdmissionRejected(
+                    "capability interface is unavailable; native mutation "
+                    "fails closed/no fallback"
+                )
+            result = provider.validate_capability(
+                envelope.capability,
+                envelope.context,
+                canonical_path,
+                allow_consumed=True,
+            )
+            if result is not True:
+                raise AuthorityAdmissionRejected(
+                    "capability interface is unavailable; native mutation "
+                    "fails closed/no fallback"
+                )
+        else:
+            if envelope.state != "fresh":
+                raise AuthorityAdmissionRejected(
+                    "capability interface is unavailable; native mutation "
+                    "fails closed/no fallback"
+                )
+            result = provider.validate_capability(
+                envelope.capability,
+                envelope.context,
+                canonical_path,
+                allow_consumed=False,
+            )
+            if result is not True:
+                raise AuthorityAdmissionRejected(
+                    "capability interface is unavailable; native mutation "
+                    "fails closed/no fallback"
+                )
+            consume_result = provider.consume_capability(
+                envelope.capability,
+                envelope.context,
+                canonical_path,
+            )
+            if consume_result is not True:
+                raise AuthorityAdmissionRejected(
+                    "capability interface is unavailable; native mutation "
+                    "fails closed/no fallback"
+                )
+            envelope.state = "active"
+    except AuthorityAdmissionRejected:
+        raise
+    except Exception as exc:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        ) from exc
+
+    return envelope
 
 
 def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
@@ -3487,83 +3660,64 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
-    """Context manager for an IMMEDIATE write transaction.
+    """Run an IMMEDIATE transaction with explicit nested savepoints.
 
-    Use for any multi-statement write (creating a task + link, claiming a
-    task + recording an event, etc.). A claim CAS inside this context is
-    atomic -- at most one concurrent writer can succeed.
-
-    Nesting is an explicit opt-in: a caller already inside a transaction
-    gets a loud ``RuntimeError`` unless it passes ``allow_nested=True``,
-    in which case a SQLite savepoint is used instead of a second
-    ``BEGIN IMMEDIATE``. Only composition primitives that graph builders
-    deliberately run under one outer commit (``create_task``,
-    ``add_comment``) opt in — helpers with post-commit side effects
-    (``complete_task`` & co.) must never run under an open outer
-    transaction, because their side effects (workspace cleanup, ready
-    recomputation, failure-counter clears) would fire while the outer
-    transaction can still roll back.
-
-    The explicit ROLLBACK on exception is wrapped in try/except so that
-    a SQLite auto-rollback (which leaves no active transaction) does not
-    shadow the original exception with a spurious rollback error.
+    Under non-native authority, the outer transaction irreversibly consumes
+    its scoped capability before ``BEGIN IMMEDIATE``. Nested savepoints
+    validate the same active envelope without consuming it again.
     """
     _assert_not_delegated_child_mutation()
-    # S1 generic authority seam: if ``adrian-kanban`` is selected, native
-    # mutation must fail closed unless the configured provider is present,
-    # compatible, healthy, and supplies the admitted-operation interface. This
-    # gate runs before BEGIN IMMEDIATE so no transaction begins on a rejected
-    # path. Native (default) selection is a no-op here.
-    _enforce_seam_on_write_txn(conn)
-    if getattr(conn, "in_transaction", False):
-        if not allow_nested:
-            raise RuntimeError(
-                "write_txn: already inside a transaction. Nested composition "
-                "must opt in explicitly with write_txn(conn, allow_nested=True) "
-                "(savepoint semantics; the inner RELEASE is not durable until "
-                "the outer transaction commits)."
-            )
-        savepoint = f"hermes_nested_{secrets.token_hex(8)}"
-        conn.execute(f"SAVEPOINT {savepoint}")
+    nested = bool(getattr(conn, "in_transaction", False))
+    if nested and not allow_nested:
+        raise RuntimeError(
+            "write_txn: already inside a transaction. Nested composition "
+            "must opt in explicitly with write_txn(conn, allow_nested=True) "
+            "(savepoint semantics; the inner RELEASE is not durable until "
+            "the outer transaction commits)."
+        )
+
+    envelope = _enforce_seam_on_write_txn(conn, nested=nested)
+
+    if nested:
+        name = f"hermes_nested_{secrets.token_hex(8)}"
+        conn.execute(f"SAVEPOINT {name}")
         try:
             yield conn
         except Exception:
             try:
-                conn.execute(f"ROLLBACK TO {savepoint}")
-                conn.execute(f"RELEASE {savepoint}")
+                conn.execute(f"ROLLBACK TO {name}")
+                conn.execute(f"RELEASE {name}")
             except sqlite3.OperationalError:
                 pass
             raise
         else:
-            conn.execute(f"RELEASE {savepoint}")
+            conn.execute(f"RELEASE {name}")
         return
 
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
-        yield conn
-    except Exception:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
-        raise
-    else:
-        try:
-            _execute_boundary_with_retry(conn, "COMMIT")
+            yield conn
         except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        else:
+            try:
+                _execute_boundary_with_retry(conn, "COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            else:
+                _check_file_length_invariant(conn)
+    finally:
+        if envelope is not None:
+            envelope.state = "finished"
 
 
 # ---------------------------------------------------------------------------

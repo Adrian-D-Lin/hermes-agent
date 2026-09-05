@@ -142,47 +142,50 @@ class AdmittedStore:
         This method does NOT evaluate routes, actors, or reconciliation
         content; S2 owns admission policy.
         """
-        current_id = validate_initiative_identity(initiative_id)
+        current_identity = validate_initiative_identity(initiative_id)
         now = int(time.time())
         try:
-            # BEGIN IMMEDIATE before the head read so the read, predecessor/
-            # monotonic validation, insert, and commit happen in one transaction:
-            # a concurrent caller cannot both read the same head and validate it.
             self._conn.execute("BEGIN IMMEDIATE")
-            # Determine the last recorded transition id for this initiative.
+            card = self._conn.execute(
+                "SELECT id FROM adrian_kanban_cards WHERE card_type = 'initiative' "
+                "AND initiative_id = ? AND task_id IS NULL",
+                (current_identity,),
+            ).fetchone()
+            if card is None:
+                raise InitiativeIdentityError(
+                    f"no canonical initiative card for initiative_id {initiative_id!r}"
+                )
+            initiative_card_id = card["id"]
             row = self._conn.execute(
-                "SELECT MAX(transition_id) AS m FROM "
-                "adrian_kanban_initiative_transitions WHERE initiative_id = ?",
-                (current_id,),
+                "SELECT MAX(transition_id) AS m FROM initiative_transitions "
+                "WHERE initiative_id = ?",
+                (current_identity,),
             ).fetchone()
             current_max = row["m"] if row else None
-
-            # Require the predecessor to match the current highest (or be absent
-            # only when there is no prior transition), and require the new id to
-            # strictly increase.
             if current_max is None:
                 if previous_transition_id is not None:
                     raise TransitionIntegrityError(
-                        "previous_transition_id must be None for the first "
-                        "transition of the initiative"
+                        "first transition must not name a predecessor"
                     )
             elif previous_transition_id != current_max:
                 raise TransitionIntegrityError(
-                    f"previous_transition_id {previous_transition_id} does not "
-                    f"match the current highest transition_id {current_max}"
+                    f"transition predecessor {previous_transition_id!r} does not "
+                    f"match current accepted transition {current_max}"
                 )
-
             validated_id = validate_transition_id(current_max, transition_id)
-
+            if to_phase is None:
+                raise TransitionIntegrityError("transition requires a to_phase")
             self._conn.execute(
-                "INSERT INTO adrian_kanban_initiative_transitions ("
-                "initiative_id, previous_transition_id, transition_id, "
-                "from_phase, from_segment_id, to_phase, to_segment_id, "
-                "canon_route, repository_reconciliation_ref, trigger, "
-                "actor_evidence, canonical_payload, rendered_history_ref, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO initiative_transitions ("
+                "initiative_card_id, initiative_id, previous_transition_id, "
+                "transition_id, from_phase, from_segment_id, to_phase, "
+                "to_segment_id, canon_route, repository_reconciliation_ref, "
+                "trigger, actor_evidence, canonical_payload, "
+                "rendered_history_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    current_id,
+                    initiative_card_id,
+                    current_identity,
                     previous_transition_id,
                     validated_id,
                     from_phase,
