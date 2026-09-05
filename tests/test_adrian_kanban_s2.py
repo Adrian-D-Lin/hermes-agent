@@ -64,6 +64,7 @@ def provider_modules():
         "capability": importlib.import_module(f"{name}.capability"),
         "contracts": importlib.import_module(f"{name}.contracts"),
         "diagnostics": importlib.import_module(f"{name}.diagnostics"),
+        "journal": importlib.import_module(f"{name}.journal"),
         "lifecycle": importlib.import_module(f"{name}.lifecycle"),
         "policy": importlib.import_module(f"{name}.policy"),
         "private_adapter": importlib.import_module(f"{name}.private_adapter"),
@@ -832,6 +833,333 @@ def test_private_adapter_is_closed_typed_and_not_publicly_imported(provider_modu
         assert "private_adapter" not in (package_root / public_name).read_text(
             encoding="utf-8"
         )
+
+
+def _journal_connection(schema_module):
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    schema_module.create_schema(conn)
+    conn.execute(
+        "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES (?)",
+        ("initiative-1",),
+    )
+    card = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('initiative', 'initiative-1', NULL, 'Initiative', 1000)"
+    )
+    card_id = int(card.lastrowid)
+    conn.execute(
+        "INSERT INTO initiative_segment_projections "
+        "(projection_id, projection_version, initiative_card_id, initiative_id, "
+        "manifest_path, manifest_sha, content_digest, parsed_segment_definitions, "
+        "readiness_refs, validation_result, projected_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "projection-1",
+            1,
+            card_id,
+            "initiative-1",
+            "2-design/segments.json",
+            "a" * 40,
+            "sha256:manifest",
+            "{}",
+            "[]",
+            "valid",
+            1_001,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspaces "
+        "(workspace_id, initiative_card_id, initiative_id, segment_id, "
+        "projection_id, lifecycle_state, controller_binding_ref, active, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "workspace-1",
+            card_id,
+            "initiative-1",
+            "S1",
+            "projection-1",
+            "planned",
+            "controller-1",
+            1,
+            1_002,
+            1_002,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspace_members "
+        "(workspace_id, repository_identity, relative_path, branch, "
+        "required_base_sha, observed_head, member_state, observed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "workspace-1",
+            "repo-1",
+            "initiative-1/S1/repo-1",
+            "initiative-1/S1",
+            "b" * 40,
+            None,
+            "planned",
+            1_002,
+        ),
+    )
+    return conn
+
+
+def _journal_intent(journal_module, **changes):
+    values = {
+        "operation_id": "operation-1",
+        "idempotency_id": "idempotency-1",
+        "member_target": "repo-1",
+        "operation_kind": "workspace_materialize",
+        "workspace_id": "workspace-1",
+        "repository_identity": "repo-1",
+        "intended_git_evidence": "base=b" + ("b" * 39),
+        "intended_filesystem_evidence": "relative=initiative-1/S1/repo-1",
+        "actor_evidence": "system:workspace-controller",
+        "created_at": 1_010,
+    }
+    values.update(changes)
+    return journal_module.JournalIntent(**values)
+
+
+def test_f04_journal_prepares_then_verifies_without_blind_replay(provider_modules):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+
+    assert journal.recovery_action("operation-1", "repo-1") == "prepare"
+    conn.execute("BEGIN IMMEDIATE")
+    prepared = journal.append_prepared(_journal_intent(journal_mod))
+    conn.commit()
+
+    assert prepared.ordinal == 1
+    assert prepared.state == "prepared"
+    assert journal.recovery_action("operation-1", "repo-1") == "verify"
+
+    conn.execute("BEGIN IMMEDIATE")
+    verified = journal.append_verified(
+        operation_id="operation-1",
+        member_target="repo-1",
+        observed_git_evidence="head=c" + ("c" * 39),
+        observed_filesystem_evidence="exists=true",
+        actor_evidence="system:workspace-controller",
+        created_at=1_011,
+    )
+    conn.commit()
+
+    assert verified.ordinal == 2
+    assert verified.state == "verified"
+    assert journal.recovery_action("operation-1", "repo-1") == "consume_verified"
+    assert journal.verified_evidence("operation-1", "repo-1") == verified
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT ordinal, state FROM external_operation_journal "
+            "ORDER BY ordinal"
+        )
+    ] == [(1, "prepared"), (2, "verified")]
+    conn.close()
+
+
+def test_journal_exact_duplicate_prepare_is_idempotent(provider_modules):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+    intent = _journal_intent(journal_mod)
+
+    conn.execute("BEGIN IMMEDIATE")
+    first = journal.append_prepared(intent)
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    duplicate = journal.append_prepared(intent)
+    conn.commit()
+
+    assert duplicate == first
+    assert conn.execute(
+        "SELECT COUNT(*) FROM external_operation_journal"
+    ).fetchone()[0] == 1
+    with pytest.raises(journal_mod.JournalRejected, match="different intent"):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            journal.append_prepared(
+                replace(intent, intended_git_evidence="different-base")
+            )
+        finally:
+            conn.rollback()
+    conn.close()
+
+
+def test_journal_failed_recovery_requires_explicit_resume_disposition(
+    provider_modules,
+):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_prepared(_journal_intent(journal_mod))
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    failed = journal.append_failed(
+        operation_id="operation-1",
+        member_target="repo-1",
+        observed_git_evidence=None,
+        observed_filesystem_evidence="exists=false",
+        error_disposition="effect absent after verification",
+        recovery_disposition="resume",
+        actor_evidence="system:workspace-controller",
+        created_at=1_011,
+    )
+    conn.commit()
+
+    assert failed.state == "failed"
+    assert journal.recovery_action("operation-1", "repo-1") == "resume"
+    conn.execute("BEGIN IMMEDIATE")
+    resumed = journal.append_resume_prepared(
+        operation_id="operation-1",
+        member_target="repo-1",
+        actor_evidence="system:workspace-controller",
+        created_at=1_012,
+    )
+    conn.commit()
+    assert resumed.ordinal == 3
+    assert resumed.state == "prepared"
+    assert journal.recovery_action("operation-1", "repo-1") == "verify"
+
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_failed(
+        operation_id="operation-1",
+        member_target="repo-1",
+        observed_git_evidence=None,
+        observed_filesystem_evidence="exists=false",
+        error_disposition="unsafe repository state",
+        recovery_disposition="manual intervention required",
+        actor_evidence="system:workspace-controller",
+        created_at=1_013,
+    )
+    conn.commit()
+    assert journal.recovery_action("operation-1", "repo-1") == "halt"
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(journal_mod.JournalRejected, match="not resumable"):
+            journal.append_resume_prepared(
+                operation_id="operation-1",
+                member_target="repo-1",
+                actor_evidence="system:workspace-controller",
+                created_at=1_014,
+            )
+    finally:
+        conn.rollback()
+    conn.close()
+
+
+def test_journal_append_requires_caller_transaction_and_valid_sequence(
+    provider_modules,
+):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+    intent = _journal_intent(journal_mod)
+
+    with pytest.raises(journal_mod.JournalRejected, match="transaction"):
+        journal.append_prepared(intent)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(journal_mod.JournalRejected, match="prepared"):
+            journal.append_verified(
+                operation_id="operation-1",
+                member_target="repo-1",
+                observed_git_evidence="head=abc",
+                observed_filesystem_evidence=None,
+                actor_evidence="system:workspace-controller",
+                created_at=1_011,
+            )
+    finally:
+        conn.rollback()
+
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_prepared(intent)
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(journal_mod.JournalRejected, match="observed evidence"):
+            journal.append_verified(
+                operation_id="operation-1",
+                member_target="repo-1",
+                observed_git_evidence=None,
+                observed_filesystem_evidence=None,
+                actor_evidence="system:workspace-controller",
+                created_at=1_011,
+            )
+    finally:
+        conn.rollback()
+    conn.close()
+
+
+def test_journal_rollback_erases_prepare_and_recovery_starts_clean(provider_modules):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_prepared(_journal_intent(journal_mod))
+    conn.rollback()
+
+    assert journal.head("operation-1", "repo-1") is None
+    assert journal.recovery_action("operation-1", "repo-1") == "prepare"
+    conn.close()
+
+
+def test_journal_cold_read_rejects_corrupt_sequence(provider_modules):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_prepared(_journal_intent(journal_mod))
+    conn.commit()
+    conn.execute(
+        "INSERT INTO external_operation_journal ("
+        "operation_id, idempotency_id, member_target, ordinal, operation_kind, "
+        "workspace_id, repository_identity, state, intended_git_evidence, "
+        "intended_filesystem_evidence, actor_evidence, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "operation-1",
+            "changed-idempotency",
+            "repo-1",
+            2,
+            "workspace_materialize",
+            "workspace-1",
+            "repo-1",
+            "prepared",
+            "base=b" + ("b" * 39),
+            "relative=initiative-1/S1/repo-1",
+            "system:workspace-controller",
+            1_011,
+        ),
+    )
+
+    with pytest.raises(journal_mod.JournalRejected, match="stable intent"):
+        journal.head("operation-1", "repo-1")
+    conn.close()
+
+
+def test_journal_module_has_no_side_effect_or_mutating_sql_surface(provider_modules):
+    module_path = (
+        Path(__file__).parents[1]
+        / "plugins"
+        / "adrian-kanban"
+        / "journal.py"
+    )
+    source = module_path.read_text(encoding="utf-8")
+
+    for forbidden_import in ("subprocess", "pathlib", "requests", "httpx"):
+        assert forbidden_import not in source
+    assert ".commit(" not in source
+    assert ".rollback(" not in source
+    assert "UPDATE external_operation_journal" not in source
+    assert "DELETE FROM external_operation_journal" not in source
 
 
 def test_h16_rejection_envelope_preserves_every_failure_and_remediation(
