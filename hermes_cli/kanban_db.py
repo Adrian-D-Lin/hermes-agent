@@ -180,20 +180,20 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
-    Accepts any level in ``hermes_constants.VALID_REASONING_EFFORTS`` plus
-    ``"none"`` (thinking disabled), case-insensitively. Empty / None means
+    Accepts any option in ``hermes_constants.VALID_REASONING_OPTIONS``
+    (including ``"none"`` and boolean ``"on"``), case-insensitively. Empty / None means
     "inherit the worker profile's own ``agent.reasoning_effort``" and stores
     NULL. Anything else is rejected rather than silently dropped — a typo'd
     level must not quietly hand the task back to the profile default.
     """
-    from hermes_constants import VALID_REASONING_EFFORTS
+    from hermes_constants import VALID_REASONING_OPTIONS
 
     value = str(effort or "").strip().lower()
     if not value:
         return None
-    if value == "none" or value in VALID_REASONING_EFFORTS:
+    if value in VALID_REASONING_OPTIONS:
         return value
-    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+    allowed = ", ".join(VALID_REASONING_OPTIONS)
     raise ValueError(
         f"reasoning_effort must be one of {allowed}, got {effort!r}"
     )
@@ -1307,9 +1307,13 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # The Hermes session id the dispatcher pre-assigned to this worker run
+    # (WriteGate preassignment / lineage). NULL for legacy runs.
+    worker_session_id: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        keys = set(row.keys())
         try:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
@@ -1331,6 +1335,9 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            worker_session_id=(
+                row["worker_session_id"] if "worker_session_id" in keys else None
+            ),
         )
 
 
@@ -1516,7 +1523,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    worker_session_id   TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1631,10 +1639,21 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
-    # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
-    # the PRAGMA explicitly so it is observable and survives future wrapper
-    # changes. Parameter binding is not supported for PRAGMA assignments.
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    try:
+        # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
+        # the PRAGMA explicitly so it is observable and survives future wrapper
+        # changes. Parameter binding is not supported for PRAGMA assignments.
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except BaseException:
+        # A half-open connection abandoned here would leak its fd AND leave a
+        # stale entry in the connect_tracked live-connection registry (which
+        # only clears on close), permanently blocking byte-level probes of
+        # this database file. Close before re-raising.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -2742,6 +2761,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
 
+    # task_runs gained a worker_session_id column so the dispatcher can
+    # record the session id it pre-assigned to the worker (WriteGate
+    # preassignment / lineage). Back-fill is NULL for legacy rows.
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+    if "worker_session_id" not in run_cols:
+        _add_column_if_missing(
+            conn, "task_runs", "worker_session_id", "worker_session_id TEXT"
+        )
+
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
     # tables don't fail during SCHEMA_SQL execution before ``run_id`` exists.
@@ -2918,7 +2946,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, worker_session_id TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -5936,19 +5964,20 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    ``scratch`` workspaces are removed; ``worktree`` workspaces are removed only
+    when provably free of work (clean tree, every commit reachable from a
+    remote-tracking ref); ``dir`` workspaces are intentionally preserved.
     """
     try:
         row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
-        if kind != "scratch" or not path:
+        if kind not in ("scratch", "worktree") or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
             # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
@@ -5956,7 +5985,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         # Check if this task has children that still need the workspace.
         # If any child is not yet done/archived, defer cleanup so the
-        # child can read handoff artifacts from the scratch dir (#33774).
+        # child can read handoff artifacts from the workspace (#33774).
         _active_children = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks t ON t.id = l.child_id "
@@ -5966,10 +5995,18 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         ).fetchone()
         if _active_children:
             _log.debug(
-                "Deferring scratch workspace cleanup for task %s: "
+                "Deferring %s workspace cleanup for task %s: "
                 "active children still need workspace at %s",
-                task_id, path,
+                kind, task_id, path,
             )
+            return
+        if kind == "worktree":
+            # Kill the (dead) tmux worker session BEFORE removing the
+            # worktree so a lingering worker never has its cwd deleted out
+            # from under it. Both steps stay best-effort.
+            _cleanup_worker_tmux(conn, task_id)
+            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            _try_cleanup_parent_workspaces(conn, task_id)
             return
         import shutil
         wp = Path(path)
@@ -6000,6 +6037,69 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+def _cleanup_worktree_workspace(
+    task_id: str, path: str, branch_name: Optional[str] = None
+) -> None:
+    """Remove a finished task's linked git worktree when it holds no work.
+
+    Mirrors the safety judgment of the CLI startup pruner
+    (``cli._prune_stale_worktrees``): removal requires a clean working tree
+    AND every commit reachable from a remote-tracking ref. Any doubt — dirty
+    files, unpushed commits, unresolvable repo, failing git — preserves the
+    worktree. The task's auto-generated ``wt/<task-id>`` branch is deleted
+    with it; custom branches are kept. Best-effort like the scratch path.
+    """
+    try:
+        from cli import _worktree_has_unpushed_commits, _worktree_is_dirty
+    except Exception:
+        return  # CLI safety predicates unavailable — preserve
+    try:
+        wp = Path(path).expanduser()
+        if not wp.is_dir():
+            return
+        common = _git_common_dir(wp)
+        if common is None or common.name != ".git":
+            return  # not a linked worktree of a normal repo — never guess
+        repo_root = common.parent
+        if wp.resolve(strict=False) == repo_root.resolve(strict=False):
+            return  # never remove the main checkout
+        if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
+            _log.info(
+                "Preserving worktree for task %s: dirty or unpushed work at %s",
+                task_id, wp,
+            )
+            return
+        # No --force: the dirty/unpushed checks above run before removal, so
+        # git's own dirty guard re-verifies at removal time. If the tree
+        # became dirty between our check and the removal (TOCTOU), removal
+        # fails safe and the worktree is preserved.
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "remove", str(wp)],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0:
+            _log.warning(
+                "git worktree remove failed for task %s at %s: %s",
+                task_id, wp, (result.stderr or result.stdout or "").strip(),
+            )
+            return
+        _log.debug("Removed worktree workspace: %s", wp)
+        branch = (branch_name or "").strip() or f"wt/{task_id}"
+        if branch.startswith("wt/"):
+            subprocess.run(
+                ["git", "-C", str(repo_root), "branch", "-D", branch],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=30,
+                check=False,
+            )
+    except Exception:
+        pass  # best-effort — never block completion
+
+
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
     """Clean up parent scratch workspaces now that *task_id* completed.
 
@@ -6015,10 +6115,14 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
         ).fetchall()
         for (parent_id,) in parents:
             row = conn.execute(
-                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
                 (parent_id,),
             ).fetchone()
-            if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+            if (
+                not row
+                or row["workspace_kind"] not in ("scratch", "worktree")
+                or not row["workspace_path"]
+            ):
                 continue
             # Check if ALL children of this parent are terminal
             active = conn.execute(
@@ -6031,6 +6135,11 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             if active:
                 continue  # still has active children
             # All children done — safe to clean up parent workspace
+            if row["workspace_kind"] == "worktree":
+                _cleanup_worktree_workspace(
+                    parent_id, row["workspace_path"], row["branch_name"]
+                )
+                continue
             import shutil
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
@@ -7521,6 +7630,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    # Reap the workspace on archive too — tasks archived without ever
+    # completing previously kept their scratch dir / worktree forever.
+    _cleanup_workspace(conn, task_id)
     return True
 
 
@@ -8069,6 +8181,13 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    memory_pressure: Optional[str] = None
+    """System memory pressure observed at spawn time when the memory guard
+    restricted this tick (OOF-30/OOF-77): ``"critical"`` — no new workers
+    were spawned this tick; ``"elevated"`` — at most one new worker was
+    spawned. ``None`` when memory was fine/unknown and the guard imposed
+    no restriction. Reclaim/promotion bookkeeping still ran either way;
+    deferred tasks stay queued for the next tick."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9321,6 +9440,11 @@ def _record_spawn_failure(
     *,
     failure_limit: int = None,
 ) -> bool:
+    # WriteGate preassignment: a spawn failure must leave an auditable
+    # failed/abandoned dispatch state, not an apparent active authority. The
+    # prepared binding created for the preassigned worker id is abandoned so it
+    # can never be reused as a run's authority.
+    _abandon_prepared_worker_binding(task_id)
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
@@ -9330,12 +9454,41 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _abandon_prepared_worker_binding(task_id: str) -> None:
+    """Abandon any prepared WriteGate binding prepared for this task's worker.
+
+    Called after a spawn failure so a failed/abandoned dispatch never appears as
+    an active worker authority (brief §3 / Canon §3d, A20). Best-effort and
+    isolated — the registry is an optional plugin dependency.
+    """
+    try:
+        from hermes_cli import kanban_db as _kdb
+        conn = _kdb.connect()
+        with contextlib.closing(conn) as c:
+            run = _kdb.latest_run(c, task_id)
+            if run is not None and run.worker_session_id:
+                from writegate import registry as _wg_registry
+                _wg_registry.get_registry().mark_binding_abandoned(
+                    run.worker_session_id,
+                )
+    except Exception:  # pragma: no cover - optional dependency
+        pass
+
+
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    worker_session_id: Optional[str] = None,
+) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    the drawer.  When ``worker_session_id`` is provided it is recorded on the
+    run too: the dispatcher pre-assigns the exact Hermes worker session id
+    (WriteGate preassignment / lineage) before Popen.
     """
     with write_txn(conn):
         conn.execute(
@@ -9344,11 +9497,17 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
+            params = [int(pid), worker_session_id, run_id]
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_session_id = ? "
+                "WHERE id = ?",
+                params,
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _append_event(
+            conn, task_id, "spawned",
+            {"pid": int(pid), "worker_session_id": worker_session_id},
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -9597,6 +9756,201 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+# ---------------------------------------------------------------------------
+# Memory-aware dispatch guard (OOF-30 / OOF-77)
+#
+# Two production incidents ("larrikin-lollies", "synclare-task-manager")
+# followed the same shape: no ``kanban.max_in_progress`` configured, a busy
+# board, and a 1 GiB VM — the dispatcher fanned out 26-31 concurrent workers,
+# the host went into swap-thrash/OOM, and the dashboard (and everything else
+# on the machine) became unreachable. Two complementary safeguards:
+#
+#   1. A memory-DERIVED default concurrency cap when the operator never set
+#      ``kanban.max_in_progress`` (``resolve_max_in_progress``) — sized from
+#      MemTotal so a 1 GiB VM defaults to 2 workers, not unlimited.
+#   2. A live memory-PRESSURE guard inside the dispatch tick itself
+#      (``_memory_pressure_level``) — even a correctly-sized static cap can't
+#      see other tenants of the box, so under real observed pressure the
+#      dispatcher stops adding workers regardless of configured caps.
+#
+# Both fail open: on non-Linux hosts or any read error the sample is empty,
+# the derived default is None (no cap — unchanged behaviour), and the
+# pressure level is "unknown" (no spawn restriction).
+# ---------------------------------------------------------------------------
+
+# Assumed per-worker memory footprint for the derived default cap. Hermes
+# workers are full agent processes (Python + model client + tool subprocesses);
+# ~512 MiB is a deliberately conservative planning number so the derived cap
+# errs toward fewer workers on small VMs.
+MEMORY_GUARD_MB_PER_WORKER = 512
+# Bounds for the derived default: never below 2 (a board must still make
+# progress on the smallest hosted VM) and never above 8 (operators who want
+# more fan-out on big iron should say so explicitly in config).
+DERIVED_MAX_IN_PROGRESS_FLOOR = 2
+DERIVED_MAX_IN_PROGRESS_CEILING = 8
+
+
+def _system_memory_sample() -> dict:
+    """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
+
+    Delegates to :func:`gateway.lifecycle_ledger.sample_memory` (pure /proc
+    reads, Linux-only, never raises). Local import keeps ``kanban_db``
+    importable in stripped-down environments without the gateway package.
+    Module-level indirection is also the test seam — the shared conftest
+    patches this to ``{}`` so suite results don't depend on the CI runner's
+    live memory state.
+    """
+    try:
+        from gateway.lifecycle_ledger import sample_memory
+        return sample_memory() or {}
+    except Exception:
+        return {}
+
+
+def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
+    """Memory-derived default for ``kanban.max_in_progress`` when unset.
+
+    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)`` — e.g.
+    a 1 GiB VM derives 2, a 4 GiB VM derives 8. Returns ``None`` (no cap,
+    pre-fix behaviour) when total memory can't be determined, so dev
+    machines on macOS/Windows are unaffected.
+    """
+    if sample is None:
+        sample = _system_memory_sample()
+    total_kib = sample.get("mem_total_kib")
+    if isinstance(total_kib, bool) or not isinstance(total_kib, int) or total_kib <= 0:
+        return None
+    workers = (total_kib // 1024) // MEMORY_GUARD_MB_PER_WORKER
+    return max(
+        DERIVED_MAX_IN_PROGRESS_FLOOR,
+        min(workers, DERIVED_MAX_IN_PROGRESS_CEILING),
+    )
+
+
+def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
+    """Return the effective global concurrency cap for a dispatch tick.
+
+    An explicit operator-configured value always wins. When unset, fall back
+    to the memory-derived default (see :func:`derive_default_max_in_progress`).
+    Callers that parse config (gateway dispatcher, ``hermes kanban dispatch``)
+    should route through this so both paths agree.
+    """
+    if configured is not None:
+        return configured
+    return derive_default_max_in_progress()
+
+
+def configured_max_in_progress() -> Optional[int]:
+    """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
+
+    Small shared parser so every dispatch entry point (gateway watcher, CLI
+    dispatch, standalone daemon) agrees on what "explicitly configured"
+    means: a positive integer wins, anything else falls through to the
+    memory-derived default via :func:`resolve_max_in_progress`.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "max_in_progress"
+        )
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        ival = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def count_running_tasks(conn: sqlite3.Connection) -> int:
+    """Return the number of tasks currently in ``status='running'``.
+
+    Used by the gateway's multi-board sweep to account for workers on
+    OTHER boards against the host-level concurrency budget (OOF-30): the
+    memory-derived cap bounds the machine, so each board's tick must see
+    the machine's total, not just its own. Fails open to 0 — a broken
+    board must not brick dispatch on healthy ones (corruption is handled
+    separately by the watcher's quarantine logic).
+    """
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0]
+        )
+    except Exception:
+        return 0
+
+
+def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+    """Total ``running`` tasks across every board EXCEPT ``board``.
+
+    The concurrency caps bound the HOST (workers are OS processes sharing
+    one machine's memory), but each board's dispatch tick only sees its own
+    DB. Without this, a memory-derived cap of N gets multiplied by the
+    number of active boards — reproduced in review of OOF-30: two boards
+    each spawned N workers on a derived N-worker host budget.
+
+    Boards are matched by resolved DB path, so the ``HERMES_KANBAN_DB``
+    override (which pins every board to one file) naturally yields 0.
+    Fails open per board: one broken/corrupt board must not brick dispatch
+    on the healthy ones.
+    """
+    try:
+        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return 0
+    total = 0
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        try:
+            path = kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = connect(board=slug)
+            try:
+                total += count_running_tasks(other)
+            finally:
+                try:
+                    other.close()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return total
+
+
+def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
+    """Classify current system memory pressure: ok/elevated/critical/unknown.
+
+    Reuses :func:`gateway.memory_status.classify_pressure` so the dispatcher's
+    idea of "critical" matches the memory banner users see on the dashboard
+    and the lifecycle ledger's OOM-suspicion heuristics (NS-608/NS-656).
+    ``unknown`` (non-Linux, read failure) imposes no restriction — the guard
+    must never brick dispatch on hosts where /proc isn't available.
+    """
+    if sample is None:
+        sample = _system_memory_sample()
+    if not sample:
+        return "unknown"
+    try:
+        from gateway.memory_status import classify_pressure
+        return classify_pressure(
+            sample.get("mem_available_kib"), sample.get("mem_total_kib")
+        )
+    except Exception:
+        return "unknown"
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9718,10 +10072,22 @@ def _dispatch_once_locked(
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
 
+    ``max_in_progress`` is a **host-level** concurrency cap (OOF-30): it
+    counts running tasks on every active board — not just this one — plus
+    this tick's spawns. Workers are OS processes sharing one machine's
+    memory, so a per-board interpretation would multiply the cap by the
+    number of active boards. ``max_spawn`` retains its historical per-board
+    semantics.
+
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    # Resolve the board once for the whole tick. The same canonical slug must
+    # feed binding creation and child launch; resolving only inside
+    # ``_default_spawn`` would leave a NULL-board binding for None-board callers.
+    board = _normalize_board_slug(board) or get_current_board()
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -9756,14 +10122,6 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    # Both knobs are total in-flight caps. Collapse them before either lane
-    # dispatches so ready and review workers consume the same budget without
-    # subtracting the already-running count twice.
-    if max_in_progress is not None and (
-        max_spawn is None or max_in_progress < max_spawn
-    ):
-        max_spawn = max_in_progress
-
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -9772,18 +10130,101 @@ def _dispatch_once_locked(
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
     running_count = 0
+    spawn_budget: Optional[int] = None
+    if max_spawn is not None or max_in_progress is not None:
+        running_count = count_running_tasks(conn)
+
+    # Convert any concurrency caps into a shared additional-spawns budget
+    # for this tick. Both ready and review loops consume from the same
+    # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
-        running_count = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
+        if running_count >= max_spawn:
+            return result
+        spawn_budget = max_spawn - running_count
+
+    # Honour kanban.max_in_progress across both ready and review queues: if
+    # the board already has enough running tasks, skip this tick entirely.
+    # When there is room left, intersect the remaining in-progress budget
+    # with any explicit max_spawn cap above.
+    #
+    # max_in_progress is a HOST-level cap, not a per-board one (OOF-30):
+    # workers are OS processes sharing one machine's memory, so running
+    # workers on every other board count against the same budget. Without
+    # this, N active boards multiply the cap by N — exactly the fan-out
+    # the memory-derived default exists to prevent.
+    if max_in_progress is not None:
+        total_running = running_count + count_running_tasks_other_boards(board)
+        if total_running >= max_in_progress:
+            return result
+        remaining = max_in_progress - total_running
+        if spawn_budget is None or spawn_budget > remaining:
+            spawn_budget = remaining
+
+    # Memory-pressure guard (OOF-30/OOF-77): even a well-chosen static cap
+    # can't see the host's actual memory state (other tenants, bloated
+    # long-lived workers, dashboard growth). Under observed pressure the
+    # dispatcher stops adding load: critical -> spawn nothing this tick;
+    # elevated -> at most one new worker. Reclaim/promotion above already
+    # ran, so board bookkeeping stays live either way, and deferred tasks
+    # simply wait for a later tick. "unknown" imposes no restriction.
+    pressure = _memory_pressure_level()
+    if pressure == "critical":
+        result.memory_pressure = pressure
+        _log.warning(
+            "kanban dispatch: system memory pressure is critical; "
+            "spawning no new workers this tick (deferred, not dropped)"
         )
+        return result
+    if pressure == "elevated":
+        result.memory_pressure = pressure
+        if spawn_budget is None or spawn_budget > 1:
+            _log.warning(
+                "kanban dispatch: system memory pressure is elevated; "
+                "limiting to at most 1 new worker this tick"
+            )
+            spawn_budget = 1
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    # Review rows are enumerated up front (not after the ready loop) so the
+    # budget split below can see whether review work exists at all.
+    review_rows = []
+    if review_dispatch_enabled():
+        review_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'review' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    # Review-lane reservation (OOF-30 review finding): the ready loop runs
+    # first and used to consume the ENTIRE shared budget, so a sustained
+    # ready backlog permanently starved autonomous reviews — completed work
+    # sat in 'review' forever while new work kept spawning. When spawnable
+    # review work exists and the tick has any budget, hold one slot back
+    # from the ready loop so the review lane always gets a spawn
+    # opportunity. The reservation is per-tick and self-releasing: with no
+    # spawnable review work (or no cap at all) the ready loop keeps the
+    # full budget. "Spawnable" mirrors the review loop's own gate
+    # (assigned + real profile) so a review column full of human-pulled
+    # control-plane lanes doesn't permanently tax ready throughput.
+    def _any_spawnable_review() -> bool:
+        if not review_rows:
+            return False
+        try:
+            from hermes_cli.profiles import profile_exists as _rpe
+        except Exception:
+            # Profiles module unavailable (test stubs, exotic envs) —
+            # assume spawnable, matching the review loop's own fallback.
+            return any(row["assignee"] for row in review_rows)
+        return any(
+            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+        )
+
+    ready_budget = spawn_budget
+    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
+        ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -9822,7 +10263,7 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if ready_budget is not None and spawned >= ready_budget:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -9959,6 +10400,25 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # WriteGate preassignment: derive ONE worker session id, store it on the
+        # exact current task_runs row, and create + verify the central active
+        # binding — all BEFORE the worker launches. Returns the captured id so
+        # the launched subprocess and set_worker_pid use the same value. When
+        # WriteGate is enabled this is a hard spawn failure; a failure aborts
+        # the spawn, abandons the prepared binding, and is recorded below.
+        try:
+            worker_session_id = prepare_worker_launch(
+                conn, claimed, str(workspace),
+                board=board, resolved_branch_name=resolved_branch_name,
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"writegate pre-spawn binding: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -9967,14 +10427,24 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
+                params = sig.parameters
+                if "board" in params and "worker_session_id" in params:
+                    pid = _spawn(claimed, str(workspace), board=board,
+                                 worker_session_id=worker_session_id)
+                elif "board" in params:
                     pid = _spawn(claimed, str(workspace), board=board)
+                elif "worker_session_id" in params:
+                    pid = _spawn(claimed, str(workspace),
+                                 worker_session_id=worker_session_id)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    worker_session_id=worker_session_id,
+                )
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -10019,15 +10489,15 @@ def _dispatch_once_locked(
     # ``sdlc-review`` skill and reviewer workers can now approve, request
     # changes without block-loop accounting, or escalate a genuine blocker.
     # Human-only boards can disable it with ``kanban.review_dispatch``.
-    review_rows = []
-    if review_dispatch_enabled():
-        review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
-        ).fetchall()
+    #
+    # ``review_rows`` was enumerated before the ready loop; when it is
+    # non-empty the ready loop ran against ``ready_budget`` (one slot held
+    # back) so this lane cannot be permanently starved by a sustained
+    # ready backlog. The review loop itself still checks the FULL shared
+    # ``spawn_budget`` — the reservation caps the ready lane, it does not
+    # grant the review lane extra capacity.
     for row in review_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if spawn_budget is not None and spawned >= spawn_budget:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
@@ -10094,19 +10564,48 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        # WriteGate preassignment: derive ONE worker session id, store it on the
+        # exact current task_runs row, and create + verify the central active
+        # binding — all BEFORE the worker launches. Returns the captured id so
+        # the launched subprocess and set_worker_pid use the same value. When
+        # WriteGate is enabled this is a hard spawn failure; a failure aborts
+        # the spawn, abandons the prepared binding, and is recorded below.
+        try:
+            worker_session_id = prepare_worker_launch(
+                conn, claimed, str(workspace),
+                board=board, resolved_branch_name=resolved_branch_name,
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"writegate pre-spawn binding: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
+                params = sig.parameters
+                if "board" in params and "worker_session_id" in params:
+                    pid = _spawn(claimed, str(workspace), board=board,
+                                 worker_session_id=worker_session_id)
+                elif "board" in params:
                     pid = _spawn(claimed, str(workspace), board=board)
+                elif "worker_session_id" in params:
+                    pid = _spawn(claimed, str(workspace),
+                                 worker_session_id=worker_session_id)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    worker_session_id=worker_session_id,
+                )
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -10416,11 +10915,367 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _writegate_binding_enabled() -> bool:
+    """Return whether the WriteGate plugin is active for this process.
+
+    The pre-spawn binding handshake is a hard spawn failure only when the
+    feature is enabled (``security.write_gate.enabled``). When the feature is
+    disabled the dispatcher behaves exactly as before — no binding, no abort.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
+        security = config.get("security") if isinstance(config, dict) else None
+        if not isinstance(security, dict):
+            return False
+        return bool(security.get("write_gate", {}).get("enabled", False))
+    except Exception:
+        return False
+
+
+def _ensure_writegate_importable() -> bool:
+    """Make the ``writegate`` package importable for the dispatcher.
+
+    The dispatcher shares primitives (``registry``) with the WriteGate plugin.
+    The package is a repo-root host package (``writegate/``) so it is
+    importable before plugin discovery, as long as the repository root is on
+    ``sys.path`` (it is, for the core import path).  Returns True when the
+    import now succeeds.
+    """
+    try:
+        import importlib
+        import importlib.util
+        import os
+        import sys
+
+        if "writegate" in sys.modules or importlib.util.find_spec("writegate") is not None:
+            return True
+
+        # The host package lives at the repository root.  Add it to ``sys.path``
+        # only if the root is not already importable, so the import does not
+        # depend on plugin-registration ordering.
+        here = os.path.dirname(os.path.abspath(__file__))
+        for _ in range(6):
+            if os.path.isdir(os.path.join(here, "writegate")):
+                root = os.path.abspath(here)
+                if root not in sys.path:
+                    sys.path.insert(0, root)
+                break
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
+
+        importlib.import_module("writegate")
+        return True
+    except Exception:
+        return False
+
+
+def prepare_worker_launch(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    resolved_branch_name: Optional[str] = None,
+) -> str:
+    """Prepare the worker launch for the WriteGate preassignment contract.
+
+    This is the dispatcher-side half of the preassignment handshake (brief §3 /
+    Canon §3d). It runs entirely within the *existing* Kanban connection and the
+    *exact* current run — it never opens a second connection and never falls
+    back to ``latest_run``.
+
+    Steps:
+
+    1. Generate **one** normal Hermes worker session id (the same shape the
+       worker itself would generate — ``<timestamp>_<uuid6>``), derived from
+       the task id + current run id so a retry yields a new id.
+    2. Persist it on the exact current ``task_runs`` row (the ``worker_session_id``
+       column), so the run record carries the id the launched subprocess will
+       use.
+    3. Create the central active binding for that id and read it back, verifying
+       profile / workspace / board lineage. Fail-closed: if the binding cannot
+       be created or verified, raise :class:`WriteGatePreSpawnError` so the
+       prepared binding is abandoned and the spawn aborted.
+    4. Return the captured id so the caller can (a) pass it to
+       ``_default_spawn`` to set the subprocess environment, and (b) abandon it
+       on failure.
+
+    When WriteGate is disabled the id is still derived and stored on the run
+    row (harmless), but the central-binding step is skipped and the id is
+    returned unchanged.
+    """
+    task_id = task.id
+    run_id = task.current_run_id
+    if run_id is None:
+        # No run to bind to — nothing is preassigned. The worker falls back to
+        # its own generated id.
+        return ""
+
+    # 1. Generate one normal worker session id.
+    worker_session_id = _generate_worker_session_id(task_id, int(run_id))
+
+    # 2. Persist it on the exact current run row (before spawn).
+    _persist_worker_session_id(conn, task_id, run_id, worker_session_id)
+
+    # 3. Central binding handshake (hard failure when WriteGate is enabled).
+    if _writegate_binding_enabled():
+        # Ensure the shared WriteGate primitives are importable before the
+        # binding handshake, regardless of plugin-registration ordering.
+        _ensure_writegate_importable()
+        try:
+            _create_and_verify_central_binding(
+                conn, task, workspace, worker_session_id, board,
+                resolved_branch_name,
+            )
+        except Exception as exc:
+            # Abandon the prepared binding before recording the failure.
+            _abandon_pre_spawn_binding(worker_session_id)
+            raise WriteGatePreSpawnError(
+                f"WriteGate: pre-spawn binding handshake failed: {exc}"
+            ) from exc
+
+    return worker_session_id
+
+
+def _generate_worker_session_id(task_id: str, run_id: int) -> str:
+    """Derive one normal Hermes worker session id from task + run.
+
+    Shape: ``<timestamp>_<uuid4-hex-first-6>`` — the same shape the worker
+    itself would generate, so the worker's own ``state.db`` transcript row and
+    the central WriteGate binding share the same id (lineage). A retry (new run)
+    yields a new id.
+    """
+    import time
+    import uuid
+    # Local datetime, matching the worker's own id generation.
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    # uuid4 hex, first six characters — the exact normal Hermes id shape.
+    raw = uuid.uuid4().hex[:6]
+    return f"{ts}_{raw}"
+
+
+def _persist_worker_session_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    worker_session_id: str,
+) -> None:
+    """Persist the preassigned worker session id on the exact run row.
+
+    Runs BEFORE Popen so the launched subprocess can read the same id. The
+    ``task_runs`` table's primary key is ``id`` (the run id) and the task
+    reference is ``task_id`` — there is no ``run_id`` column. Match on both the
+    exact run id and the task id, assert exactly one row, and read it back.
+    """
+    # This transaction must commit before Popen. The worker verifies the
+    # preassignment through a fresh connection during CLI startup; leaving the
+    # UPDATE pending on the dispatcher connection creates a visibility race.
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET worker_session_id = ? "
+            "WHERE id = ? AND task_id = ?",
+            [worker_session_id, int(run_id), task_id],
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"WriteGate: expected exactly one task_runs row for run "
+                f"{run_id} / task {task_id}, found {cur.rowcount}"
+            )
+
+
+def _create_and_verify_central_binding(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+    worker_session_id: str,
+    board: Optional[str],
+    resolved_branch_name: Optional[str],
+) -> None:
+    """Create and read-back the central WriteGate binding for the worker.
+
+    Fail-closed: the exact central active binding must exist and match the
+    prepared id before the worker launches. Lineage is verified against the
+    task and run.
+    """
+    from writegate import registry as _wg_registry
+    reg = _wg_registry.get_registry()
+    record = reg.create_binding(
+        session_id=worker_session_id,
+        worktree_path=str(workspace),
+        project=task.project_id or None,
+        initiative=task.id,
+        board=board,
+        git_branch=resolved_branch_name or task.branch_name or None,
+        profile=task.assignee,
+        producer=_wg_registry.PRODUCER_DISPATCHER,
+        event=_wg_registry.EVENT_DISPATCH,
+    )
+    verify = reg.get_active_binding(worker_session_id)
+    if verify is None or verify.id != record.id:
+        raise WriteGatePreSpawnError(
+            "WriteGate: pre-spawn binding could not be verified for "
+            f"session {worker_session_id}"
+        )
+
+
+class WriteGatePreSpawnError(Exception):
+    """Raised when the WriteGate pre-spawn binding handshake cannot complete.
+
+    A hard spawn failure: the prepared binding must be abandoned and the spawn
+    aborted rather than launching a worker whose first turn would race ahead of
+    unusable binding state.
+    """
+
+
+def _abandon_pre_spawn_binding(worker_session_id: str) -> None:
+    """Abandon a prepared WriteGate binding after a failed spawn attempt."""
+    if not worker_session_id:
+        return
+    try:
+        from writegate import registry as _wg_registry
+        _wg_registry.get_registry().mark_binding_abandoned(worker_session_id)
+    except Exception:  # pragma: no cover - best effort
+        pass
+
+
+def _trusted_worker_session_id(
+    task_id: str,
+    run_id: int,
+    *,
+    profile: Optional[str] = None,
+    workspace: Optional[str] = None,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Verify a dispatcher preassigned worker session id, fail-closed.
+
+    This is the CLI-side half of the WriteGate preassignment handshake (brief
+    §3 / Canon §3d). The dispatcher sets ``HERMES_KANBAN_WORKER_SESSION_ID`` on
+    the launch env; the worker honors it as *its own* session id only when
+    every trusted marker agrees. An arbitrary / injected / mismatched value
+    returns ``None`` and the worker keeps its own generated id, so an env
+    value can never masquerade as a bound worker identity.
+
+    Verification (all must hold, else return ``None``):
+
+    * the supplied ``task_id`` has a run row whose primary key ``id`` equals
+      ``run_id`` and whose ``task_id`` equals ``task_id``;
+    * that run row carries a non-null ``worker_session_id`` equal to the
+      preassigned value;
+    * the task's ``assignee`` matches ``profile`` when a profile is supplied;
+    * the task's canonical workspace matches ``workspace`` when supplied;
+    * the board database/slug is resolvable when supplied;
+    * the central WriteGate registry has an *active* binding whose
+      ``session_id`` equals the preassigned id and whose stored worktree,
+      board, task/initiative, and profile lineage match the run record.
+
+    A missing/failed check anywhere returns ``None`` — the worker then
+    generates its own id and stays unbound (read-only until a trusted
+    binding exists).
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        return None
+
+    # 1. The exact run row must exist with matching id + task_id. Open a
+    #    read-only connection to this board's DB (mirrors the read-only
+    #    pattern used elsewhere in the module).
+    try:
+        db_path = _kb.kanban_db_path(board=board)
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id, task_id, worker_session_id FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(run_id), task_id),
+        ).fetchone()
+        if row is None or row["worker_session_id"] is None:
+            return None
+        stored_id = row["worker_session_id"]
+
+        # 2. The task row must exist, be assigned to the expected profile, and
+        #    carry the expected canonical workspace. Read it on the same
+        #    read-only connection (the connection is closed in finally, so we
+        #    cannot defer this to after the finally block).
+        task = _kb.get_task(conn, task_id)
+        if task is None:
+            return None
+        if profile and (task.assignee is None or _normalize_assignee(task.assignee) != profile):
+            return None
+        if workspace and (
+            task.workspace_path is None
+            or os.path.realpath(task.workspace_path) != os.path.realpath(workspace)
+        ):
+            return None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # The supplied preassigned value must equal what the dispatcher persisted.
+    if not stored_id:
+        return None
+
+    # 3. The board must be resolvable when supplied.
+    if board:
+        try:
+            slug = _kb._normalize_board_slug(board)
+            if slug is None:
+                return None
+        except Exception:
+            return None
+
+    # 4. The central binding must exist, be active, and match the run record.
+    try:
+        from writegate import registry as _wg_registry
+        reg = _wg_registry.get_registry()
+    except Exception:
+        return None
+    try:
+        binding = reg.get_active_binding(stored_id)
+    except Exception:
+        return None
+    if binding is None or not binding.is_active:
+        return None
+    # Exact worktree match.
+    if workspace and (
+        binding.worktree_path is None
+        or os.path.realpath(binding.worktree_path) != os.path.realpath(workspace)
+    ):
+        return None
+    # Board lineage match (the dispatcher recorded the real board).
+    if board and binding.board not in (board, _kb._normalize_board_slug(board)):
+        return None
+    # Task/initiative lineage match.
+    if binding.initiative not in (task_id, None):
+        return None
+    if profile and binding.profile not in (profile, task.assignee):
+        return None
+
+    return stored_id
+
+
+def _normalize_assignee(assignee: Optional[str]) -> Optional[str]:
+    return _canonical_assignee(assignee)
+
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
+    worker_session_id: Optional[str] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10433,6 +11288,13 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
+
+    ``worker_session_id`` is the id the dispatcher pre-assigned (via
+    ``prepare_worker_launch``) and persisted on the run row before Popen. When
+    present it is exported so the worker's own ``state.db`` transcript row and
+    the central WriteGate binding share the same id. When absent (e.g. a
+    custom spawn_fn or a run with no preassigned id) the worker falls back to
+    its own generated id.
     """
     import subprocess
     if not task.assignee:
@@ -10499,6 +11361,20 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    # Trusted profile marker consumed by CLI preassignment verification.
+    # HERMES_PROFILE remains separately required for Kanban comment authorship.
+    env["HERMES_KANBAN_PROFILE"] = profile_arg
+    # WriteGate preassignment / lineage: the dispatcher pre-assigned the exact
+    # Hermes worker session id *before* Popen (via prepare_worker_launch) and
+    # persisted it on the run row. Use that captured value so the worker's own
+    # state.db transcript row and the central binding use the same id. The CLI
+    # honors this only when all trusted Kanban markers match (see cli.py); an
+    # arbitrary env value must fail closed and never become a session identity.
+    # The id is derived deterministically from task + run so a retry (new run)
+    # yields a new id, and so the dispatcher can persist the matching central
+    # binding.
+    if worker_session_id:
+        env["HERMES_KANBAN_WORKER_SESSION_ID"] = worker_session_id
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
@@ -10649,6 +11525,11 @@ def run_daemon(
     on SIGINT / SIGTERM so ``hermes kanban daemon`` is systemd-friendly.
     ``stop_event`` (a :class:`threading.Event`) and ``on_tick`` (a
     callable receiving the :class:`DispatchResult`) are test hooks.
+
+    Each tick resolves ``kanban.max_in_progress`` (explicit config, else
+    the memory-derived default) exactly like the gateway-embedded
+    dispatcher and ``hermes kanban dispatch`` — the standalone daemon must
+    not be the one uncapped entry point (OOF-30).
     """
     import signal
     import threading
@@ -10672,10 +11553,22 @@ def run_daemon(
 
     while not stop_event.is_set():
         try:
+            # Resolve the global concurrency cap the same way the gateway
+            # dispatcher and `hermes kanban dispatch` do (OOF-30): explicit
+            # kanban.max_in_progress wins, otherwise the memory-derived
+            # default applies. The standalone daemon previously passed no
+            # cap at all — the shipped systemd path could still fan out an
+            # entire backlog in one tick even with the derived default in
+            # place everywhere else. Re-resolved every tick (config load is
+            # mtime-cached) so operator edits apply without a restart.
+            max_in_progress = resolve_max_in_progress(
+                configured_max_in_progress()
+            )
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
+                    max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
