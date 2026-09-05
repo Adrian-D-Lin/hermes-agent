@@ -2822,6 +2822,34 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Canonical mutation authority for the shared Kanban board. This is the
+        # generic, fail-closed selection seam that S1 establishes and S2 wires
+        # to a production one-use admitted capability. It is intentionally
+        # backward-safe: the default ``native`` preserves the existing native
+        # Kanban behavior exactly, so no production behavior changes until an
+        # operator explicitly selects a future authority.
+        #
+        #   * ``native``      — the installed, in-tree Kanban engine is the
+        #                        sole mutation + dispatch authority (default).
+        #   * ``adrian-kanban`` — a named external plugin authority. When
+        #                        selected, native mutation and dispatch fail
+        #                        closed (no fallback) unless the configured
+        #                        provider is present, compatible, healthy, and
+        #                        supplies the expected admitted-operation
+        #                        interface (see ``adrian_kanban.seam``).
+        #
+        # S1 does not select ``adrian-kanban`` in production; it only proves
+        # the seam, the provider interface, and the fail-closed behavior.
+        "mutation_authority": "native",
+        # Absolute path to the authoritative Kanban database that the
+        # ``adrian-kanban`` authority operates on. Backward-safe default is
+        # null, which preserves the native board selection exactly. When
+        # ``adrian-kanban`` is selected this MUST be a single absolute path;
+        # a missing or relative value is rejected (fail closed) by the core
+        # seam's authority-path resolver, and the native board path is NOT
+        # used as a fallback for the plugin authority. ``native`` selection is
+        # unaffected — it keeps resolving the native board path.
+        "database_path": None,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

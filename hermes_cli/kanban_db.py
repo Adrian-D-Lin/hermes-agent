@@ -3099,6 +3099,381 @@ def _is_busy_error(exc: BaseException) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# S1 generic authority seam (generic, core-owned)
+# ---------------------------------------------------------------------------
+#
+# The seam is generic and core-owned: it knows only that a configured authority
+# provider must expose ``name``, ``is_healthy() -> bool``, and
+# ``admit_operation(operation) -> bool``. The core must NOT import concrete
+# plugin code (e.g. ``adrian_kanban.seam``) or private plugin APIs — the
+# concrete plugin registers through this generic interface. The selection
+# value and the provider registry live here so importing ``kanban_db`` never
+# requires any plugin package (the default ``native`` authority must work even
+# if the plugin is absent).
+#
+# When a non-native authority is selected, the seam enforces a fail-closed
+# gate: native mutation is rejected unless a healthy, interface-compatible
+# provider is registered.
+
+# The canonical authority identifiers. Kept in one place so the seam,
+# ``config_defaults``, and the plugin's own health report can never drift.
+AUTHORITY_NATIVE = "native"
+AUTHORITY_ADRIAN_KANBAN = "adrian-kanban"
+
+# The minimal interface a registered provider must supply. S2's production
+# capability is expected to implement this same surface.
+_REQUIRED_PROVIDER_ATTRS = ("name", "is_healthy", "admit_operation")
+
+# Process-local provider registry keyed by the resolved, absolute DB path so a
+# provider is only visible to the board it was registered against (mirroring
+# the machine-global DB identity the seam enforces). The key is ALWAYS the
+# resolved absolute path: there is no "_global" slot and no fallback, so a
+# provider registered for one board path is never visible to another.
+_PROVIDER_REGISTRY: "dict[str, object]" = {}
+
+
+def _normalize_authority_path(value: Optional[str]) -> str:
+    """Return the normalized absolute path for an explicit authority value.
+
+    Pure and side-effect free: the path is normalized with
+    ``Path.expanduser().resolve()`` but no file or directory is created.
+
+    Raises :class:`AuthorityAdmissionRejected` (fail closed) when *value* is
+    missing, empty, or relative -- the ``adrian-kanban`` authority requires a
+    single, explicit, absolute database path and never falls back to the
+    native board selection.
+    """
+    if value is None:
+        raise AuthorityAdmissionRejected(
+            "adrian-kanban requires kanban.database_path; no authoritative "
+            "database path is configured (no fallback to the native board)"
+        )
+    text = str(value).strip()
+    if not text:
+        raise AuthorityAdmissionRejected(
+            "adrian-kanban requires a non-empty kanban.database_path; the "
+            "configured value is empty (no fallback to the native board)"
+        )
+    # Check relativity on the ORIGINAL input BEFORE resolve(): Path.resolve()
+    # normalizes every path to absolute, so is_absolute() must be tested on
+    # the raw value or it could never reject relative input.
+    if not Path(text).is_absolute():
+        raise AuthorityAdmissionRejected(
+            f"adrian-kanban requires an absolute kanban.database_path, got "
+            f"{value!r} (relative paths are rejected; no fallback to the "
+            f"native board)"
+        )
+    # Pure normalization: expanduser().resolve() canonicalizes the path
+    # without creating any file or directory on disk.
+    return str(Path(text).expanduser().resolve())
+
+
+def resolve_authority_path(
+    *, override: Optional[str] = None, authority: Optional[str] = None
+) -> str:
+    """Return the authoritative Kanban database path for the seam.
+
+    This is the pure, public resolver the seam, plugin, and tests use. It
+    never creates files or directories.
+
+    Precedence:
+
+    * An explicit *override* (test or configured value) must be an absolute
+      path; it is normalized and returned, or :class:`AuthorityAdmissionRejected`
+      is raised when it is missing or relative.
+    * Otherwise the configured ``kanban.database_path`` is used when set; it
+      must also be absolute (same rejection rules).
+    * Otherwise, when the selected authority is the native engine, the existing
+      native board path is resolved via :func:`kanban_db_path`.
+    * Otherwise (``adrian-kanban`` selected with no configured path) the
+      missing configuration is rejected, since the plugin authority requires a
+      single absolute path and does not inherit the native board.
+
+    *authority* may be passed to short-circuit the config read (used by tests
+    and by callers that already know the selection).
+    """
+    if authority is None:
+        authority = resolve_selected_authority()
+
+    configured = None
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        configured = (load_config_readonly() or {}).get("kanban", {}).get(
+            "database_path"
+        )
+    except Exception:  # pragma: no cover - defensive
+        configured = None
+
+    source = override if override is not None else configured
+    if source is not None:
+        return _normalize_authority_path(source)
+
+    # No explicit path configured. Native selection keeps the historical
+    # native board path; the plugin authority has no fallback and is rejected
+    # by the caller (register/ensure_admitted/write_txn) via the override path.
+    if authority != AUTHORITY_ADRIAN_KANBAN:
+        try:
+            return str(kanban_db_path())
+        except Exception:  # pragma: no cover - defensive
+            return ""
+    raise AuthorityAdmissionRejected(
+        "adrian-kanban requires kanban.database_path; no authoritative "
+        "database path is configured (no fallback to the native board)"
+    )
+
+
+def register_authority_provider(provider: object, db_path: Optional[str] = None) -> None:
+    """Register a healthy provider through the generic, core-owned seam.
+
+    The concrete plugin (S2) registers its production provider here; S1 uses
+    only a test-only provider. This is the generic interface the plugin
+    registers *through* — the core never imports the plugin.
+
+    *db_path* is resolved to its absolute form via :func:`resolve_authority_path`
+    so the registry is keyed only by the resolved absolute path. A missing or
+    relative path raises :class:`AuthorityAdmissionRejected` (fail closed).
+    """
+    for attr in _REQUIRED_PROVIDER_ATTRS:
+        if not hasattr(provider, attr):
+            raise ValueError(
+                f"provider must supply {', '.join(_REQUIRED_PROVIDER_ATTRS)}"
+            )
+    key = resolve_authority_path(override=db_path)
+    _PROVIDER_REGISTRY[key] = provider
+
+
+def clear_authority_providers() -> None:  # pragma: no cover - test hygiene
+    """Drop all registered providers (test teardown)."""
+    _PROVIDER_REGISTRY.clear()
+
+
+def _provider_for_db(db_path: Optional[str]) -> Optional[object]:
+    # Registry is keyed only by the resolved absolute path: no "_global"
+    # fallback, no cross-board leakage.
+    return _PROVIDER_REGISTRY.get(resolve_authority_path(override=db_path))
+
+
+def _provider_is_available(provider: Optional[object]) -> bool:
+    if provider is None:
+        return False
+    for attr in _REQUIRED_PROVIDER_ATTRS:
+        if not hasattr(provider, attr):
+            return False
+    try:
+        if not bool(provider.is_healthy()):  # type: ignore[union-attr]
+            return False
+    except Exception:
+        return False
+    if not callable(getattr(provider, "admit_operation", None)):
+        return False
+    return True
+
+
+@dataclass
+class ProviderStatus:
+    """Read-only status for a provider registered against one database path.
+
+    Returned by :func:`provider_status` so plugin and caller code never needs
+    to reach the private registry or core lookup directly.
+    """
+
+    present: bool
+    healthy: bool
+    name: Optional[str]
+    reason: Optional[str]
+
+
+def provider_status(db_path: Optional[str] = None) -> ProviderStatus:
+    """Return presence, health, name, and reason for a database path.
+
+    This is the single public entry point for querying a registered provider.
+    Plugin code (and any other caller) uses it instead of reaching the private
+    registry or ``_provider_for_db``. ``present`` is False, and ``name``/
+    ``reason`` are None, when no provider is registered for *db_path*.
+    """
+    provider = _provider_for_db(db_path)
+    if provider is None:
+        return ProviderStatus(
+            present=False,
+            healthy=False,
+            name=None,
+            reason=(
+                "no authority provider is registered for this database path"
+            ),
+        )
+    healthy = _provider_is_available(provider)
+    reason = None
+    if not healthy:
+        reason = (
+            "registered authority provider is unavailable, unhealthy, or "
+            "incompatible"
+        )
+    name = getattr(provider, "name", None)
+    return ProviderStatus(present=True, healthy=healthy, name=name, reason=reason)
+
+
+def resolve_selected_authority() -> str:
+    """Return the configured mutation authority, fail-closed on error.
+
+    Reads ``kanban.mutation_authority`` from the live config. Any failure to
+    read config is treated as the safe default ``native`` (the seam only fails
+    closed *when the future value is selected*); a hard failure to read config
+    must not brick the in-tree engine that is still the default.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "mutation_authority", AUTHORITY_NATIVE
+        )
+    except Exception:  # pragma: no cover - defensive
+        return AUTHORITY_NATIVE
+    if not isinstance(raw, str) or not raw.strip():
+        return AUTHORITY_NATIVE
+    value = raw.strip().lower()
+    if value not in (AUTHORITY_NATIVE, AUTHORITY_ADRIAN_KANBAN):
+        return AUTHORITY_NATIVE
+    return value
+
+
+class AuthorityAdmissionRejected(Exception):
+    """Raised when native mutation/dispatch is rejected by the seam.
+
+    Raised whenever a non-native authority is selected but the registered
+    provider is missing, unhealthy, incompatible, or lacks the
+    admitted-operation interface. This is a *fail-closed* diagnostic: no
+    native fallback occurs. Defined in core so the seam never imports concrete
+    plugin code.
+    """
+
+    def __init__(self, reason: str, *, authority: str = AUTHORITY_ADRIAN_KANBAN) -> None:
+        self.authority = authority
+        self.reason = reason
+        super().__init__(f"[{authority}] mutation rejected: {reason}")
+
+
+def _require_admitted_provider(db_path: Optional[str]) -> object:
+    """Return a healthy, interface-compatible provider or raise.
+
+    Raises :class:`AuthorityAdmissionRejected` (fail closed) when the provider
+    is missing, unhealthy, or incompatible.
+    """
+    provider = _provider_for_db(db_path)
+    if provider is None:
+        raise AuthorityAdmissionRejected(
+            "selected authority has no configured provider available; "
+            "native mutation/dispatch fails closed (no fallback)"
+        )
+    if not _provider_is_available(provider):
+        raise AuthorityAdmissionRejected(
+            "selected authority provider is unavailable, unhealthy, or "
+            "incompatible; native mutation/dispatch fails closed "
+            "(no fallback)"
+        )
+    return provider
+
+
+def ensure_admitted(operation: str, *, db_path: Optional[str] = None) -> bool:
+    """Delegate an already-admitted operation across the generic seam.
+
+    Returns True only when a healthy provider admits *operation*. Raises
+    :class:`AuthorityAdmissionRejected` when no healthy provider is present, so
+    a caller cannot accidentally perform an un-admitted native mutation.
+
+    The *db_path* argument is resolved through the public authority-path
+    resolver before the provider is required, so the registry is always
+    queried by the resolved absolute path and a missing/relative value fails
+    closed.
+
+    This is the S1 delegation proof: it never creates, validates, binds, or
+    consumes a production capability — it only asks the provider whether an
+    operation was already admitted.
+    """
+    required_path = resolve_authority_path(override=db_path)
+    provider = _require_admitted_provider(required_path)
+    admitted = bool(provider.admit_operation(operation))  # type: ignore[union-attr]
+    if not admitted:
+        raise AuthorityAdmissionRejected(
+            f"operation {operation!r} was not admitted by the selected "
+            f"authority provider; native mutation fails closed"
+        )
+    return admitted
+
+
+def _sqlite_main_connection_file(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the on-disk file of the ``main`` connection from PRAGMA.
+
+    Queries ``PRAGMA database_list`` and returns the file for the ``main``
+    schema slot. Returns None when the list is empty or the slot is missing,
+    so the caller can reject a mismatch rather than trust ``conn.path`` alone.
+    """
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            # columns: seq, name, file
+            if row["name"] == "main":
+                file = row["file"]
+                if file:
+                    return file
+    except Exception:
+        return None
+    return None
+
+
+def _canonical_path(value: str) -> str:
+    """Return the canonical absolute form of *value* for equality comparison.
+
+    Uses the same pure normalization as the authority-path resolver (no file
+    or directory is created) so a configured path and a SQLite-reported file
+    are compared by canonical identity rather than by raw string, which may
+    differ in ``..``/`.` segments, ``~`` expansion, or symlink resolution.
+    """
+    return str(Path(value).expanduser().resolve())
+
+
+def _enforce_seam_on_write_txn(conn: sqlite3.Connection) -> None:
+    """Fail closed when a non-native authority is selected and no provider is ready.
+
+    No-op under the default ``native`` authority. When ``adrian-kanban`` is
+    selected the seam:
+
+    1. resolves the configured authoritative database path (raising
+       :class:`AuthorityAdmissionRejected` when it is missing or relative),
+    2. derives the SQLite ``main`` connection file from ``PRAGMA database_list``
+       and rejects any mismatch against the resolved path (fail closed), then
+    3. requires the provider registered for that exact path.
+
+    The comparison is canonical: both the configured path and the SQLite-
+    reported file are normalized through :func:`_canonical_path` before being
+    compared, so segment/symlink differences that denote the same file do not
+    cause a false mismatch.
+
+    The seam is generic and core-owned: it never imports concrete plugin code.
+    """
+    if resolve_selected_authority() != AUTHORITY_ADRIAN_KANBAN:
+        return
+    # (1) Resolve the configured authoritative path. This also rejects a
+    # missing or relative configuration before we touch the connection.
+    authoritative = resolve_authority_path()
+    # (2) Derive the actual SQLite main connection file and reject a mismatch.
+    actual_file = _sqlite_main_connection_file(conn)
+    if actual_file is None:
+        raise AuthorityAdmissionRejected(
+            "adrian-kanban: could not read the SQLite main connection file "
+            "from PRAGMA database_list; native mutation fails closed "
+            "(no fallback)"
+        )
+    if _canonical_path(authoritative) != _canonical_path(actual_file):
+        raise AuthorityAdmissionRejected(
+            f"adrian-kanban: connection file {actual_file!r} does not match "
+            f"the configured authoritative database path {authoritative!r}; "
+            "native mutation fails closed (no fallback)"
+        )
+    # (3) Require the provider registered for that exact path.
+    _require_admitted_provider(authoritative)
+
+
 def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
     for attempt in range(_BUSY_MAX_RETRIES + 1):
         try:
@@ -3134,6 +3509,12 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
+    # S1 generic authority seam: if ``adrian-kanban`` is selected, native
+    # mutation must fail closed unless the configured provider is present,
+    # compatible, healthy, and supplies the admitted-operation interface. This
+    # gate runs before BEGIN IMMEDIATE so no transaction begins on a rejected
+    # path. Native (default) selection is a no-op here.
+    _enforce_seam_on_write_txn(conn)
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(
