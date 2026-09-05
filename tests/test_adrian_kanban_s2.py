@@ -11,7 +11,7 @@ import pickle
 import sqlite3
 import sys
 import threading
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
@@ -63,6 +63,7 @@ def provider_modules():
         "capability": importlib.import_module(f"{name}.capability"),
         "contracts": importlib.import_module(f"{name}.contracts"),
         "diagnostics": importlib.import_module(f"{name}.diagnostics"),
+        "lifecycle": importlib.import_module(f"{name}.lifecycle"),
         "provider": importlib.import_module(f"{name}.provider"),
         "schema": importlib.import_module(f"{name}.schema"),
     }
@@ -1250,4 +1251,200 @@ def test_f08_unaccepted_phase_results_may_repeat_and_blank_segment_is_rejected(
     ).fetchone()[0] == 2
     with pytest.raises(sqlite3.IntegrityError):
         _insert_phase_result(conn, initiative_card_id, "R3", "   ", 1)
+    conn.close()
+
+
+def _d2_snapshot(provider_modules, initiative_id="I1"):
+    return provider_modules["contracts"].expand_contract(
+        step="D2",
+        initiative_id=initiative_id,
+        baseline_refs=("git:path@full-sha",),
+        governing_source_refs=("canon:path@full-sha",),
+    )
+
+
+def _skill_binding(provider_modules):
+    return provider_modules["lifecycle"].SkillBinding(
+        skill_id="adrian-kanban.lifecycle.d2",
+        skill_version="1",
+        skill_hash="sha256:skill",
+    )
+
+
+def test_h05_contract_attach_and_cold_hydration_are_exact_and_atomic(
+    provider_modules,
+):
+    conn, _ = _fresh_s2_schema(provider_modules)
+    task_card_id = _insert_task_card(conn, "T1")
+    repository = provider_modules["lifecycle"].LifecycleContractRepository(conn)
+    snapshot = _d2_snapshot(provider_modules)
+    skill = _skill_binding(provider_modules)
+
+    conn.execute("BEGIN IMMEDIATE")
+    record = repository.attach(
+        task_id="T1", snapshot=snapshot, skill=skill, created_at=10
+    )
+    assert conn.in_transaction is True
+    conn.commit()
+
+    assert record.task_card_id == task_card_id
+    assert record.snapshot is snapshot
+    assert repository.load("T1") == record
+    stored = conn.execute(
+        "SELECT canonical_contract_payload FROM task_lifecycle_contracts "
+        "WHERE task_card_id = ?",
+        (task_card_id,),
+    ).fetchone()[0]
+    assert stored == snapshot.canonical_payload()
+    assert json.loads(stored) == snapshot.canonical_dict()
+    conn.close()
+
+
+def test_f07_historical_task_without_contract_remains_legacy(provider_modules):
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "legacy-task")
+    repository = provider_modules["lifecycle"].LifecycleContractRepository(conn)
+
+    assert repository.load("legacy-task") is None
+    assert repository.load("missing-task") is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_lifecycle_contracts"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_f01_contract_attach_obeys_caller_rollback(provider_modules):
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = provider_modules["lifecycle"].LifecycleContractRepository(conn)
+
+    conn.execute("BEGIN IMMEDIATE")
+    repository.attach(
+        task_id="T1",
+        snapshot=_d2_snapshot(provider_modules),
+        skill=_skill_binding(provider_modules),
+        created_at=10,
+    )
+    conn.rollback()
+
+    assert repository.load("T1") is None
+    conn.close()
+
+
+def test_u03_contract_attach_requires_caller_transaction_and_exact_initiative(
+    provider_modules,
+):
+    lifecycle = provider_modules["lifecycle"]
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = lifecycle.LifecycleContractRepository(conn)
+
+    with pytest.raises(lifecycle.LifecycleRecordRejected, match="transaction"):
+        repository.attach(
+            task_id="T1",
+            snapshot=_d2_snapshot(provider_modules),
+            skill=_skill_binding(provider_modules),
+            created_at=10,
+        )
+
+    conn.execute("BEGIN IMMEDIATE")
+    with pytest.raises(lifecycle.LifecycleRecordRejected, match="initiative"):
+        repository.attach(
+            task_id="T1",
+            snapshot=_d2_snapshot(provider_modules, "other-initiative"),
+            skill=_skill_binding(provider_modules),
+            created_at=10,
+        )
+    conn.rollback()
+    conn.close()
+
+
+def test_u03_contract_and_skill_records_are_frozen(provider_modules):
+    lifecycle = provider_modules["lifecycle"]
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = lifecycle.LifecycleContractRepository(conn)
+    skill = _skill_binding(provider_modules)
+
+    conn.execute("BEGIN IMMEDIATE")
+    record = repository.attach(
+        task_id="T1",
+        snapshot=_d2_snapshot(provider_modules),
+        skill=skill,
+        created_at=10,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        skill.skill_hash = "changed"
+    with pytest.raises(FrozenInstanceError):
+        record.task_id = "changed"
+    conn.rollback()
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "reported"),
+    (
+        ("contract_id", "corrupt", "contract_id"),
+        ("contract_version", "2", "contract_version"),
+        ("step", "D4.1", "step"),
+        ("initiative_id", "corrupt", "initiative_id"),
+        ("execution_profile", "corrupt", "execution_profile"),
+        ("registry_hash", "corrupt", "registry_hash"),
+    ),
+)
+def test_h05_cold_hydration_rejects_duplicated_column_drift(
+    provider_modules, column, value, reported
+):
+    lifecycle = provider_modules["lifecycle"]
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = lifecycle.LifecycleContractRepository(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    repository.attach(
+        task_id="T1",
+        snapshot=_d2_snapshot(provider_modules),
+        skill=_skill_binding(provider_modules),
+        created_at=10,
+    )
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute(
+        f"UPDATE task_lifecycle_contracts SET {column} = ? WHERE task_id = 'T1'",
+        (value,),
+    )
+
+    with pytest.raises(lifecycle.LifecycleRecordRejected) as rejected:
+        repository.load("T1")
+
+    assert reported in str(rejected.value)
+    assert value not in str(rejected.value)
+    conn.close()
+
+
+def test_h05_cold_hydration_rejects_noncanonical_or_extra_payload(
+    provider_modules,
+):
+    lifecycle = provider_modules["lifecycle"]
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = lifecycle.LifecycleContractRepository(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    repository.attach(
+        task_id="T1",
+        snapshot=_d2_snapshot(provider_modules),
+        skill=_skill_binding(provider_modules),
+        created_at=10,
+    )
+    conn.commit()
+    payload = _d2_snapshot(provider_modules).canonical_dict()
+    payload["unexpected"] = "secret-value"
+    conn.execute(
+        "UPDATE task_lifecycle_contracts SET canonical_contract_payload = ? "
+        "WHERE task_id = 'T1'",
+        (json.dumps(payload),),
+    )
+
+    with pytest.raises(lifecycle.LifecycleRecordRejected, match="payload keys"):
+        repository.load("T1")
     conn.close()
