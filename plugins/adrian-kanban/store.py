@@ -50,6 +50,13 @@ class AdmittedStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
+        # Production-friendly pragmas, applied before schema use so the store
+        # supports concurrent readers/writers (WAL), structural FK enforcement,
+        # and a bounded, non-hanging wait on a held write lock.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -64,12 +71,23 @@ class AdmittedStore:
         """Create an initiative card. Requires a non-null initiative id."""
         canonical = validate_initiative_identity(initiative_id)
         now = int(time.time())
-        self._conn.execute(
-            "INSERT INTO adrian_kanban_cards (card_type, initiative_id, "
-            "task_id, title, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("initiative", canonical, None, title, now),
-        )
-        self._conn.commit()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            # Create the canonical initiative identity first; the card's FK
+            # requires it to exist before the card row can be inserted.
+            self._conn.execute(
+                "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES (?)",
+                (canonical,),
+            )
+            self._conn.execute(
+                "INSERT INTO adrian_kanban_cards (card_type, initiative_id, "
+                "task_id, title, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("initiative", canonical, None, title, now),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
         return canonical
 
     def task_card(
@@ -78,12 +96,16 @@ class AdmittedStore:
         """Create a task card. Requires BOTH initiative and task identity."""
         init_id, tid = validate_task_identity(initiative_id, task_id)
         now = int(time.time())
-        self._conn.execute(
-            "INSERT INTO adrian_kanban_cards (card_type, initiative_id, "
-            "task_id, title, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("task", init_id, tid, title, now),
-        )
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                "INSERT INTO adrian_kanban_cards (card_type, initiative_id, "
+                "task_id, title, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("task", init_id, tid, title, now),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
         return init_id, tid
 
 
@@ -121,58 +143,66 @@ class AdmittedStore:
         content; S2 owns admission policy.
         """
         current_id = validate_initiative_identity(initiative_id)
-        # Determine the last recorded transition id for this initiative.
-        row = self._conn.execute(
-            "SELECT MAX(transition_id) AS m FROM "
-            "adrian_kanban_initiative_transitions WHERE initiative_id = ?",
-            (current_id,),
-        ).fetchone()
-        current_max = row["m"] if row else None
-
-        # Require the predecessor to match the current highest (or be absent
-        # only when there is no prior transition), and require the new id to
-        # strictly increase.
-        if current_max is None:
-            if previous_transition_id is not None:
-                raise TransitionIntegrityError(
-                    "previous_transition_id must be None for the first "
-                    "transition of the initiative"
-                )
-        elif previous_transition_id != current_max:
-            raise TransitionIntegrityError(
-                f"previous_transition_id {previous_transition_id} does not "
-                f"match the current highest transition_id {current_max}"
-            )
-
-        validate_transition_id(current_max, transition_id)
-
         now = int(time.time())
-        self._conn.execute(
-            "INSERT INTO adrian_kanban_initiative_transitions ("
-            "initiative_id, previous_transition_id, transition_id, "
-            "from_phase, from_segment_id, to_phase, to_segment_id, "
-            "canon_route, repository_reconciliation_ref, trigger, "
-            "actor_evidence, canonical_payload, rendered_history_ref, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                current_id,
-                previous_transition_id,
-                int(validate_initiative_identity(transition_id)),
-                from_phase,
-                from_segment_id,
-                to_phase,
-                to_segment_id,
-                canon_route,
-                repository_reconciliation_ref,
-                trigger,
-                actor_evidence,
-                canonical_payload,
-                rendered_history_ref,
-                now,
-            ),
-        )
-        self._conn.commit()
-        return int(validate_initiative_identity(transition_id))
+        try:
+            # BEGIN IMMEDIATE before the head read so the read, predecessor/
+            # monotonic validation, insert, and commit happen in one transaction:
+            # a concurrent caller cannot both read the same head and validate it.
+            self._conn.execute("BEGIN IMMEDIATE")
+            # Determine the last recorded transition id for this initiative.
+            row = self._conn.execute(
+                "SELECT MAX(transition_id) AS m FROM "
+                "adrian_kanban_initiative_transitions WHERE initiative_id = ?",
+                (current_id,),
+            ).fetchone()
+            current_max = row["m"] if row else None
+
+            # Require the predecessor to match the current highest (or be absent
+            # only when there is no prior transition), and require the new id to
+            # strictly increase.
+            if current_max is None:
+                if previous_transition_id is not None:
+                    raise TransitionIntegrityError(
+                        "previous_transition_id must be None for the first "
+                        "transition of the initiative"
+                    )
+            elif previous_transition_id != current_max:
+                raise TransitionIntegrityError(
+                    f"previous_transition_id {previous_transition_id} does not "
+                    f"match the current highest transition_id {current_max}"
+                )
+
+            validated_id = validate_transition_id(current_max, transition_id)
+
+            self._conn.execute(
+                "INSERT INTO adrian_kanban_initiative_transitions ("
+                "initiative_id, previous_transition_id, transition_id, "
+                "from_phase, from_segment_id, to_phase, to_segment_id, "
+                "canon_route, repository_reconciliation_ref, trigger, "
+                "actor_evidence, canonical_payload, rendered_history_ref, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    current_id,
+                    previous_transition_id,
+                    validated_id,
+                    from_phase,
+                    from_segment_id,
+                    to_phase,
+                    to_segment_id,
+                    canon_route,
+                    repository_reconciliation_ref,
+                    trigger,
+                    actor_evidence,
+                    canonical_payload,
+                    rendered_history_ref,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return validated_id
 
     def close(self) -> None:
         self._conn.close()

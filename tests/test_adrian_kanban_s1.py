@@ -35,6 +35,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -439,9 +441,66 @@ def test_task_identity_is_globally_unique(
     store = AdmittedStore(
         database_path=kanban_home.parent / "adrian-task-unq" / "kanban.db"
     )
+    store.initiative_card(initiative_id="init_a", title="A")
+    store.initiative_card(initiative_id="init_b", title="B")
     store.task_card(initiative_id="init_a", task_id="t_global", title="first")
     with pytest.raises(sqlite3.IntegrityError):
         store.task_card(initiative_id="init_b", task_id="t_global", title="second")
+
+
+def test_task_card_requires_existing_initiative(
+    adrian_plugin_modules: dict[str, ModuleType], kanban_home: Path
+):
+    """Oracle: unified-card ownership and distinct initiative creation.
+
+    Path: unhappy. A task cannot silently manufacture an initiative identity;
+    the distinct initiative-card operation must establish it first.
+    """
+    AdmittedStore = adrian_plugin_modules["store"].AdmittedStore
+    with AdmittedStore(
+        database_path=kanban_home.parent / "missing-parent" / "kanban.db"
+    ) as store:
+        with pytest.raises(sqlite3.IntegrityError):
+            store.task_card(
+                initiative_id="init_missing",
+                task_id="t_orphan",
+                title="orphan",
+            )
+
+
+def test_schema_enforces_card_type_and_task_identity_shape(
+    adrian_plugin_modules: dict[str, ModuleType], kanban_home: Path
+):
+    """Oracle: brief §5.3 and ratified unified-card identity.
+
+    Path: fringe. Structural defense rejects a task without task identity, an
+    initiative carrying task identity, and an unknown card type even when a
+    low-level writer bypasses the store helper.
+    """
+    AdmittedStore = adrian_plugin_modules["store"].AdmittedStore
+    with AdmittedStore(
+        database_path=kanban_home.parent / "card-shape" / "kanban.db"
+    ) as store:
+        for initiative_id in ("init_task_null", "init_with_task", "init_unknown"):
+            store._conn.execute(
+                "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES (?)",
+                (initiative_id,),
+            )
+        store._conn.commit()
+
+        invalid_rows = (
+            ("task", "init_task_null", None, "task missing id"),
+            ("initiative", "init_with_task", "t_illegal", "initiative with id"),
+            ("other", "init_unknown", "t_unknown", "unknown type"),
+        )
+        for card_type, initiative_id, task_id, title in invalid_rows:
+            with pytest.raises(sqlite3.IntegrityError):
+                store._conn.execute(
+                    "INSERT INTO adrian_kanban_cards "
+                    "(card_type, initiative_id, task_id, title, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (card_type, initiative_id, task_id, title, int(time.time())),
+                )
 
 
 def test_initiative_transition_monotonic_and_predecessor(
@@ -762,6 +821,261 @@ def test_store_and_health_report_authoritative_path(
         assert report["provider_healthy"] is True
     finally:
         kb.clear_authority_providers()
+
+
+# ---------------------------------------------------------------------------
+# 5.5 / 9.5 — WAL, contention, rollback, integrity, and recovery
+# ---------------------------------------------------------------------------
+
+
+def test_foundational_store_enables_wal_and_foreign_keys(
+    adrian_plugin_modules: dict[str, ModuleType], kanban_home: Path
+):
+    """Oracle: brief §5.5 / §9.5 and ratified design §12.
+
+    Path: happy. The disposable machine-global store uses WAL for concurrent
+    readers/writers and enables SQLite foreign-key structural enforcement.
+    """
+    AdmittedStore = adrian_plugin_modules["store"].AdmittedStore
+    db_path = (kanban_home.parent / "wal" / "kanban.db").resolve()
+    with AdmittedStore(database_path=db_path) as store:
+        journal_mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        foreign_keys = store._conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        busy_timeout_ms = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert journal_mode.lower() == "wal"
+    assert foreign_keys == 1
+    assert 0 < busy_timeout_ms <= 30_000
+
+
+def test_foundational_store_handles_short_writer_contention_within_bound(
+    adrian_plugin_modules: dict[str, ModuleType], kanban_home: Path
+):
+    """Oracle: brief §5.5 bounded-contention requirement.
+
+    Path: fringe. A second process-equivalent connection waits through a short
+    writer lock, completes after release, and does not hang beyond the bounded
+    production-friendly tolerance.
+    """
+    AdmittedStore = adrian_plugin_modules["store"].AdmittedStore
+    db_path = (kanban_home.parent / "contention" / "kanban.db").resolve()
+    holder = AdmittedStore(database_path=db_path)
+    holder._conn.execute("BEGIN IMMEDIATE")
+
+    started = threading.Event()
+    errors: list[BaseException] = []
+    elapsed: list[float] = []
+
+    def _writer() -> None:
+        started.set()
+        began = time.monotonic()
+        try:
+            with AdmittedStore(database_path=db_path) as peer:
+                peer.initiative_card(initiative_id="init_contended", title="ok")
+        except BaseException as exc:  # recorded and asserted in test thread
+            errors.append(exc)
+        finally:
+            elapsed.append(time.monotonic() - began)
+
+    worker = threading.Thread(target=_writer, daemon=True)
+    worker.start()
+    assert started.wait(timeout=1.0)
+    time.sleep(0.1)
+    holder._conn.rollback()
+    holder.close()
+    worker.join(timeout=3.0)
+
+    assert not worker.is_alive(), "contended writer exceeded the bounded wait"
+    assert errors == []
+    assert elapsed and elapsed[0] < 3.0
+    with AdmittedStore(database_path=db_path) as check:
+        row = check._conn.execute(
+            "SELECT initiative_id FROM adrian_kanban_cards "
+            "WHERE initiative_id = 'init_contended'"
+        ).fetchone()
+        assert row is not None
+
+
+def test_admitted_write_transaction_rolls_back_on_crash(
+    kanban_home: Path,
+):
+    """Oracle: brief §5.5 / §9.5 crash-rollback requirement.
+
+    Path: unhappy. An exception after a write inside the admitted transaction
+    leaves no partial row and the connection remains usable.
+    """
+    authority_db = (kanban_home.parent / "rollback" / "kanban.db").resolve()
+    authority_db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(authority_db))
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE crash_probe (id INTEGER PRIMARY KEY, value TEXT)")
+    conn.commit()
+
+    class _Provider:
+        name = "rollback-provider"
+
+        def is_healthy(self) -> bool:
+            return True
+
+        def admit_operation(self, operation: str) -> bool:
+            return True
+
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  mutation_authority: adrian-kanban\n"
+        f"  database_path: {authority_db.as_posix()}\n",
+        encoding="utf-8",
+    )
+    kb.register_authority_provider(_Provider(), str(authority_db))
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            with kb.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO crash_probe (id, value) VALUES (1, 'partial')"
+                )
+                raise RuntimeError("simulated crash")
+        count = conn.execute("SELECT COUNT(*) FROM crash_probe").fetchone()[0]
+        assert count == 0
+        assert conn.in_transaction is False
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_transition_schema_rejects_two_successors_for_one_predecessor(
+    adrian_plugin_modules: dict[str, ModuleType], kanban_home: Path
+):
+    """Oracle: brief §5.3 predecessor integrity under concurrent writers.
+
+    Path: fringe. Database structural defense rejects a branched transition
+    chain even if two process-equivalent callers race after reading the same
+    current head.
+    """
+    AdmittedStore = adrian_plugin_modules["store"].AdmittedStore
+    db_path = (kanban_home.parent / "transition-race" / "kanban.db").resolve()
+    with AdmittedStore(database_path=db_path) as store:
+        store.initiative_card(initiative_id="init_chain", title="chain")
+        store.record_transition(
+            initiative_id="init_chain",
+            transition_id=10,
+            previous_transition_id=None,
+            to_phase="DEV1",
+        )
+        store.record_transition(
+            initiative_id="init_chain",
+            transition_id=20,
+            previous_transition_id=10,
+            from_phase="DEV1",
+            to_phase="DEV2",
+            to_segment_id="S1",
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store._conn.execute(
+                "INSERT INTO adrian_kanban_initiative_transitions "
+                "(initiative_id, previous_transition_id, transition_id, "
+                "to_phase, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("init_chain", 10, 30, "DEV3", int(time.time())),
+            )
+
+
+def test_concurrent_transition_writers_cannot_branch_the_chain(
+    adrian_plugin_modules: dict[str, ModuleType], kanban_home: Path
+):
+    """Oracle: brief §5.3/§5.5 predecessor integrity under contention.
+
+    Path: fringe. Two process-equivalent stores race from the same accepted
+    predecessor. Exactly one appends; the loser re-reads the committed head and
+    receives the domain integrity error rather than creating a branch.
+    """
+    AdmittedStore = adrian_plugin_modules["store"].AdmittedStore
+    TransitionIntegrityError = (
+        adrian_plugin_modules["validation"].TransitionIntegrityError
+    )
+    db_path = (kanban_home.parent / "transition-writers" / "kanban.db").resolve()
+    with AdmittedStore(database_path=db_path) as seed:
+        seed.initiative_card(initiative_id="init_race", title="race")
+        seed.record_transition(
+            initiative_id="init_race",
+            transition_id=10,
+            previous_transition_id=None,
+            to_phase="DEV1",
+        )
+
+    barrier = threading.Barrier(2)
+    successes: list[int] = []
+    failures: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def _append(transition_id: int) -> None:
+        with AdmittedStore(database_path=db_path) as peer:
+            barrier.wait(timeout=2.0)
+            try:
+                result = peer.record_transition(
+                    initiative_id="init_race",
+                    transition_id=transition_id,
+                    previous_transition_id=10,
+                    from_phase="DEV1",
+                    to_phase="DEV2",
+                    to_segment_id="S1",
+                )
+                with result_lock:
+                    successes.append(result)
+            except BaseException as exc:  # recorded and asserted by main thread
+                with result_lock:
+                    failures.append(exc)
+
+    workers = [
+        threading.Thread(target=_append, args=(20,), daemon=True),
+        threading.Thread(target=_append, args=(30,), daemon=True),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=4.0)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], TransitionIntegrityError)
+    with AdmittedStore(database_path=db_path) as check:
+        count = check._conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_initiative_transitions "
+            "WHERE initiative_id = 'init_race'"
+        ).fetchone()[0]
+        assert count == 2
+
+
+def test_disposable_database_integrity_and_recovery_copy(
+    adrian_plugin_modules: dict[str, ModuleType], kanban_home: Path
+):
+    """Oracle: brief §5.5 / §9.5 and ratified design §12 recovery.
+
+    Path: happy. A consistent SQLite backup of the live disposable store opens,
+    passes integrity checks, and retains the foundational rows.
+    """
+    AdmittedStore = adrian_plugin_modules["store"].AdmittedStore
+    source = (kanban_home.parent / "recovery" / "source.db").resolve()
+    recovered = (kanban_home.parent / "recovery" / "recovered.db").resolve()
+
+    with AdmittedStore(database_path=source) as store:
+        store.initiative_card(initiative_id="init_recovery", title="recover")
+        assert store._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert store._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        backup = sqlite3.connect(str(recovered))
+        try:
+            store._conn.backup(backup)
+        finally:
+            backup.close()
+
+    check = sqlite3.connect(str(recovered))
+    try:
+        assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert check.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_cards "
+            "WHERE initiative_id = 'init_recovery'"
+        ).fetchone()[0] == 1
+    finally:
+        check.close()
 
 
 # ---------------------------------------------------------------------------
