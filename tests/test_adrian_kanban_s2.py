@@ -60,6 +60,7 @@ def provider_modules():
     sys.modules[name] = package
     spec.loader.exec_module(package)
     modules = {
+        "actor": importlib.import_module(f"{name}.actor"),
         "capability": importlib.import_module(f"{name}.capability"),
         "contracts": importlib.import_module(f"{name}.contracts"),
         "diagnostics": importlib.import_module(f"{name}.diagnostics"),
@@ -1802,3 +1803,115 @@ def test_policy_fact_types_are_frozen_strict_and_model_agnostic(provider_modules
     with pytest.raises(policy.PolicyInputRejected):
         policy.ExecutionLaunchDecision(True, record.task_id, "profile", object())
     assert "model_name" not in policy.ExecutionLaunchFacts.__annotations__
+
+
+def test_h12_actor_adapter_validates_live_opaque_evidence_and_renders_durable_form(
+    provider_modules,
+):
+    actor = provider_modules["actor"]
+    evidence = _trusted_evidence()
+
+    validated = actor.validate_authorizer_evidence(
+        evidence, expected_request_id="request-1", now=1_050
+    )
+
+    assert validated.evidence_type == "trusted_authorizer"
+    assert validated.evidence_version == 1
+    assert validated.canonical_payload == evidence._canonical_for_writegate()
+    assert json.loads(validated.canonical_payload) == {
+        "connection_id": "connection-1",
+        "expires_at": 1_121,
+        "issued_at": 1_001,
+        "peer_identity": "adrian@tailnet",
+        "request_id": "request-1",
+        "route": "gateway/tailscale",
+        "type": "trusted_authorizer",
+        "version": 1,
+    }
+    assert "session_id" not in validated.__dataclass_fields__
+    assert "execution_profile" not in validated.__dataclass_fields__
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected_request_id", "now"),
+    (
+        ({"type": "trusted_authorizer"}, "request-1", 1_050),
+        ("trusted", "request-1", 1_050),
+        (object(), "request-1", 1_050),
+        (None, "request-1", 1_050),
+    ),
+)
+def test_u08_actor_adapter_rejects_caller_constructible_identity_material(
+    provider_modules, evidence, expected_request_id, now
+):
+    actor = provider_modules["actor"]
+    with pytest.raises(actor.ActorEvidenceRejected):
+        actor.validate_authorizer_evidence(
+            evidence, expected_request_id=expected_request_id, now=now
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_request_id", "now", "reported"),
+    (
+        ("different-request", 1_050, "request_id"),
+        ("request-1", 1_000, "time_range"),
+        ("request-1", 1_121, "time_range"),
+        ("request-1", 1_122, "time_range"),
+    ),
+)
+def test_f05_actor_request_and_expiry_bindings_are_exact(
+    provider_modules, expected_request_id, now, reported
+):
+    actor = provider_modules["actor"]
+    with pytest.raises(actor.ActorEvidenceRejected) as rejected:
+        actor.validate_authorizer_evidence(
+            _trusted_evidence(),
+            expected_request_id=expected_request_id,
+            now=now,
+        )
+
+    assert reported in str(rejected.value)
+    assert expected_request_id not in str(rejected.value)
+
+
+def test_u08_actor_adapter_rejects_noncanonical_or_duplicate_source_json(
+    provider_modules, monkeypatch
+):
+    actor = provider_modules["actor"]
+    evidence = _trusted_evidence()
+    duplicate = (
+        '{"connection_id":"connection-1","expires_at":1121,'
+        '"issued_at":1001,"peer_identity":"adrian@tailnet",'
+        '"request_id":"request-1","route":"gateway/tailscale",'
+        '"type":"trusted_authorizer","type":"trusted_authorizer",'
+        '"version":1}'
+    )
+    monkeypatch.setattr(
+        trusted.TrustedAuthorizerEvidence,
+        "_canonical_for_writegate",
+        lambda self: duplicate,
+    )
+
+    with pytest.raises(actor.ActorEvidenceRejected, match="duplicate_key"):
+        actor.validate_authorizer_evidence(
+            evidence, expected_request_id="request-1", now=1_050
+        )
+
+
+def test_u08_validated_actor_record_cannot_claim_inconsistent_canonical_payload(
+    provider_modules,
+):
+    actor = provider_modules["actor"]
+    with pytest.raises(actor.ActorEvidenceRejected, match="canonical_payload"):
+        actor.ValidatedAuthorizerEvidence(
+            evidence_type="trusted_authorizer",
+            evidence_version=1,
+            route="gateway/tailscale",
+            connection_id="connection-1",
+            peer_identity="adrian@tailnet",
+            request_id="request-1",
+            issued_at=1_001,
+            expires_at=1_121,
+            canonical_payload="{}",
+        )
