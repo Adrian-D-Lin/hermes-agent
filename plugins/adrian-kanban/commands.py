@@ -842,6 +842,127 @@ TOOL_SCHEMAS: dict[str, Any] = {
 TOOL_SCHEMAS = MappingProxyType(dict(TOOL_SCHEMAS))
 
 
+def _target_for_operation(operation: str, args: dict[str, Any]) -> Any:
+    if operation in INITIATIVE_OPERATIONS:
+        return args.get("initiative_id")
+    if operation == "kanban_link":
+        return args.get("child_id")
+    if operation in ORDINARY_TASK_OPERATIONS:
+        return args.get("task_id")
+    return None
+
+
+class _ModelToolRequestNormalizer:
+    def __init__(
+        self,
+        boundary: Any,
+        *,
+        board_resolver: Any = None,
+        version_resolver: Any = None,
+    ) -> None:
+        self._boundary = boundary
+        self._board_resolver = board_resolver
+        self._version_resolver = version_resolver
+
+    def submit(
+        self,
+        operation: str,
+        args: dict[str, Any],
+        runtime_fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        attempt_id = None
+        try:
+            if type(args) is not dict or type(runtime_fields) is not dict:
+                raise ValueError("args and runtime_fields must be dicts")
+
+            payload = dict(args)
+            runtime = dict(runtime_fields)
+            schema = TOOL_SCHEMAS[operation]
+            declared = schema["parameters"]["properties"]
+            for key in args:
+                if key not in declared:
+                    raise ValueError(f"undeclared parameter: {key}")
+
+            attempt_id = payload.pop("attempt_id", None)
+            idempotency_key = payload.pop("idempotency_key", None)
+
+            if operation in READ_ONLY_OPERATIONS:
+                if self._board_resolver is not None:
+                    resolved = self._board_resolver(
+                        operation,
+                        dict(args),
+                        dict(runtime_fields),
+                    )
+                    if type(resolved) is not tuple or len(resolved) != 2:
+                        raise ValueError(
+                            "board_resolver must return a two-item tuple"
+                        )
+                    board, _workspace_id = resolved
+                    if not isinstance(board, str) or not board.strip():
+                        raise ValueError("resolved board must be nonblank")
+                    if "board" in payload and payload["board"] != board:
+                        raise ValueError("public board mismatch")
+                    payload["board"] = board
+                return self._boundary.submit(
+                    operation,
+                    attempt_id=attempt_id,
+                    payload=payload,
+                )
+
+            if self._board_resolver is None or self._version_resolver is None:
+                raise ValueError(
+                    "mutation requires board_resolver and version_resolver"
+                )
+            session_id = runtime.get("session_id")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be nonblank str")
+
+            resolved = self._board_resolver(
+                operation,
+                dict(args),
+                dict(runtime_fields),
+            )
+            if type(resolved) is not tuple or len(resolved) != 2:
+                raise ValueError("board_resolver must return a two-item tuple")
+            board, workspace_id = resolved
+            if not isinstance(board, str) or not board.strip():
+                raise ValueError("resolved board must be nonblank str")
+            if workspace_id is not None and (
+                not isinstance(workspace_id, str) or not workspace_id.strip()
+            ):
+                raise ValueError("workspace_id must be None or nonblank str")
+            if "board" in payload and payload["board"] != board:
+                raise ValueError("public board mismatch")
+            payload["board"] = board
+
+            target = _target_for_operation(operation, payload)
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError("target must be nonblank str")
+            expected_version = self._version_resolver(
+                operation,
+                target,
+                board,
+            )
+
+            return self._boundary.submit(
+                operation,
+                attempt_id=attempt_id,
+                idempotency_key=idempotency_key,
+                target=target,
+                expected_version=expected_version,
+                session_id=session_id.strip(),
+                workspace_id=workspace_id,
+                execution_context="model-tool",
+                payload=payload,
+            )
+        except Exception:
+            return self._boundary._rejection_internal(
+                _resolve_attempt_id({"attempt_id": attempt_id}),
+                operation,
+                _PUBLIC_REQUEST_NORMALIZATION_FAILED,
+            )
+
+
 def _handle_create(context: Any) -> dict[str, Any]:
     payload = context.payload
     allowed_fields = {
@@ -1017,7 +1138,13 @@ def _handle_link(context: Any) -> dict[str, Any]:
     return {"parent_id": parent_id, "child_id": child_id}
 
 
-def register_public_tools(ctx: Any, boundary: Any) -> None:
+def register_public_tools(
+    ctx: Any,
+    boundary: Any,
+    *,
+    board_resolver: Any = None,
+    version_resolver: Any = None,
+) -> None:
     """Register the 18 ratified public model-tools on the given toolset.
 
     Each tool is bound to a distinct handler closure that delegates to the
@@ -1026,10 +1153,15 @@ def register_public_tools(ctx: Any, boundary: Any) -> None:
     stored.
     """
 
+    normalizer = _ModelToolRequestNormalizer(
+        boundary,
+        board_resolver=board_resolver,
+        version_resolver=version_resolver,
+    )
+
     def _make_handler(operation: str):
         def _handler(args: dict[str, Any], **_runtime_fields: Any) -> str:
-            copied = dict(args)
-            result = boundary.submit(operation, **copied)
+            result = normalizer.submit(operation, args, _runtime_fields)
             return json.dumps(result, sort_keys=True, separators=(",", ":"))
 
         return _handler
@@ -1051,6 +1183,7 @@ _OPERATION_NOT_IMPLEMENTED = "OPERATION_NOT_IMPLEMENTED"
 _COMMAND_EXECUTION_FAILED = "COMMAND_EXECUTION_FAILED"
 _IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 _IDEMPOTENCY_KEY_REQUIRED = "IDEMPOTENCY_KEY_REQUIRED"
+_PUBLIC_REQUEST_NORMALIZATION_FAILED = "PUBLIC_REQUEST_NORMALIZATION_FAILED"
 
 _BOUNDARY_SOURCE = "adrian-kanban"
 _BOUNDARY_DESTINATION = "adrian-kanban"
