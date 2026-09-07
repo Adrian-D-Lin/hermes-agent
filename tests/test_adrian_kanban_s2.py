@@ -2348,7 +2348,7 @@ def test_diagnostic_rejects_unknown_authority_labels(provider_modules, actor):
 
 _EXPECTED_CONTRACT_TEMPLATES = {
     "D2": (
-        "design-lifecycle.d2",
+        "adrian-kanban.lifecycle.d2",
         "D2",
         "independent-reviewer",
         ("baseline_refs", "governing_source_refs"),
@@ -2357,7 +2357,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         None,
     ),
     "D4.1": (
-        "design-lifecycle.d4",
+        "adrian-kanban.lifecycle.d4",
         "D4",
         "independent-reviewer",
         ("baseline_refs", "prior_record_refs"),
@@ -2366,7 +2366,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         ("d4", 1, None, "accepted_completion"),
     ),
     "D4.2": (
-        "design-lifecycle.d4",
+        "adrian-kanban.lifecycle.d4",
         "D4",
         "test-authority-reviewer",
         ("baseline_refs", "prior_record_refs"),
@@ -2375,7 +2375,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         ("d4", 2, "D4.1", "accepted_completion"),
     ),
     "D4.5": (
-        "design-lifecycle.d4",
+        "adrian-kanban.lifecycle.d4",
         "D4",
         "test-authority-reviewer",
         ("baseline_refs", "prior_record_refs"),
@@ -2384,7 +2384,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         ("d4", 5, "D4.4", "initiative_checkpoint"),
     ),
     "DEV1.1a": (
-        "design-lifecycle.dev1",
+        "adrian-kanban.lifecycle.dev1",
         "DEV1",
         "independent-reviewer",
         ("baseline_refs",),
@@ -2393,7 +2393,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         ("dev1_angles", 1, None, "accepted_completion"),
     ),
     "DEV1.1b": (
-        "design-lifecycle.dev1",
+        "adrian-kanban.lifecycle.dev1",
         "DEV1",
         "independent-reviewer",
         ("baseline_refs",),
@@ -2402,7 +2402,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         ("dev1_angles", 2, "DEV1.1a", "accepted_completion"),
     ),
     "DEV1.1c": (
-        "design-lifecycle.dev1",
+        "adrian-kanban.lifecycle.dev1",
         "DEV1",
         "independent-reviewer",
         ("baseline_refs",),
@@ -2411,7 +2411,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         ("dev1_angles", 3, "DEV1.1b", "accepted_completion"),
     ),
     "DEV1.1d": (
-        "design-lifecycle.dev1",
+        "adrian-kanban.lifecycle.dev1",
         "DEV1",
         "independent-reviewer",
         ("baseline_refs",),
@@ -2420,7 +2420,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         ("dev1_angles", 4, "DEV1.1c", "accepted_completion"),
     ),
     "DEV1.1e": (
-        "design-lifecycle.dev1",
+        "adrian-kanban.lifecycle.dev1",
         "DEV1",
         "independent-reviewer",
         ("baseline_refs",),
@@ -2429,7 +2429,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         ("dev1_angles", 5, "DEV1.1d", "accepted_completion"),
     ),
     "DEV1.4": (
-        "design-lifecycle.dev1",
+        "adrian-kanban.lifecycle.dev1",
         "DEV1",
         "test-authority-reviewer",
         ("baseline_refs", "prior_record_refs"),
@@ -2438,7 +2438,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         None,
     ),
     "DEV1.5": (
-        "design-lifecycle.dev1",
+        "adrian-kanban.lifecycle.dev1",
         "DEV1",
         "independent-reviewer",
         ("prior_record_refs",),
@@ -2447,7 +2447,7 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         None,
     ),
     "DEV1.6": (
-        "design-lifecycle.dev1",
+        "adrian-kanban.lifecycle.dev1",
         "DEV1",
         "test-authority-reviewer",
         ("prior_record_refs",),
@@ -2455,11 +2455,173 @@ _EXPECTED_CONTRACT_TEMPLATES = {
         "dev1_6_segment_review_v1",
         None,
     ),
+    "DEV2.1": (
+        "adrian-kanban.lifecycle.dev2",
+        "DEV2",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "nine_section_brief", "segment_isolation"),
+        "dev2_1_brief_v1",
+        ("dev2", 1, None, "accepted_completion"),
+    ),
+    "DEV2.2": (
+        "adrian-kanban.lifecycle.dev2",
+        "DEV2",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "design_is_oracle", "segment_isolation"),
+        "dev2_2_design_to_brief_v1",
+        ("dev2", 2, "DEV2.1", "accepted_completion"),
+    ),
+    "DEV3.1": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "builder-tester",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "ratified_brief", "segment_isolation"),
+        "dev3_1_build_v1",
+        ("dev3", 1, None, "accepted_completion"),
+    ),
+    "DEV3.2": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "builder-tester",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "happy_unhappy_fringe_isolation", "untrusted_candidate_tests"),
+        "dev3_2_candidate_tests_v1",
+        ("dev3", 2, "DEV3.1", "accepted_completion"),
+    ),
+    "DEV3.3": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "design_is_oracle", "ratify_rewrite_or_reject_tests"),
+        "dev3_3_design_to_tests_v1",
+        ("dev3", 3, "DEV3.2", "accepted_completion"),
+    ),
+    "DEV3.4": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "complete_exhaustive_test_store", "no_failed_test_carryover"),
+        "dev3_4_test_execution_v1",
+        ("dev3", 4, "DEV3.3", "accepted_completion"),
+    ),
+    "DEV3.5": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "design_and_brief_to_code", "independence_embargo"),
+        "dev3_5_code_review_v1",
+        ("dev3", 5, "DEV3.4", "accepted_completion"),
+    ),
+    "DEV3.6": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "design_and_tests_to_results", "passing_tests_not_proof"),
+        "dev3_6_test_results_review_v1",
+        ("dev3", 6, "DEV3.5", "accepted_completion"),
+    ),
+    "DEV3.7": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "independent_code_review", "independence_embargo"),
+        "dev3_7_independent_code_review_v1",
+        ("dev3", 7, "DEV3.6", "accepted_completion"),
+    ),
+    "DEV3.8": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "synthesize_both_code_reviews", "no_unresolved_carryover"),
+        "dev3_8_review_synthesis_v1",
+        ("dev3", 8, "DEV3.7", "accepted_completion"),
+    ),
+    "DEV3.10": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "builder-tester",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "bounded_revision_brief", "preserve_ratified_intent"),
+        "dev3_10_revision_brief_v1",
+        ("dev3_revision", 1, None, "accepted_completion"),
+    ),
+    "DEV3.11": (
+        "adrian-kanban.lifecycle.dev3",
+        "DEV3",
+        "builder-tester",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "apply_bounded_revision", "record_revision_evidence"),
+        "dev3_11_revision_build_v1",
+        ("dev3_revision", 2, "DEV3.10", "accepted_completion"),
+    ),
+    "DEV4.1a": (
+        "adrian-kanban.lifecycle.dev4",
+        "DEV4",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "archival_scan", "uncertainty_means_retain"),
+        "dev4_1a_archive_scan_v1",
+        ("dev4", 1, None, "accepted_completion"),
+    ),
+    "DEV4.1b": (
+        "adrian-kanban.lifecycle.dev4",
+        "DEV4",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "archive_overreach_underreach_check", "read_only_verification"),
+        "dev4_1b_archive_verification_v1",
+        ("dev4", 2, "DEV4.1a", "accepted_completion"),
+    ),
+    "DEV4.1c": (
+        "adrian-kanban.lifecycle.dev4",
+        "DEV4",
+        "builder-tester",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "execute_only_verified_disposition", "preserve_references"),
+        "dev4_1c_archive_execution_v1",
+        ("dev4", 3, "DEV4.1b", "accepted_completion"),
+    ),
+    "DEV4.2a": (
+        "adrian-kanban.lifecycle.dev4",
+        "DEV4",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("active_segment_workspace", "implementation_to_design_observations", "recommend_not_ratify"),
+        "dev4_2a_ratification_package_v1",
+        ("dev4", 4, "DEV4.1c", "accepted_completion"),
+    ),
+    "PC1.1a": (
+        "adrian-kanban.lifecycle.pc1",
+        "PC1",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("milestone_scope", "read_only_parity_review", "no_dev3_repetition"),
+        "pc1_1a_parity_matrix_v1",
+        ("pc1", 1, None, "accepted_completion"),
+    ),
+    "PC1.1b": (
+        "adrian-kanban.lifecycle.pc1",
+        "PC1",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("milestone_scope", "verify_complete_matrix", "design_is_oracle"),
+        "pc1_1b_matrix_verification_v1",
+        ("pc1", 2, "PC1.1a", "accepted_completion"),
+    ),
 }
 
 
 @pytest.mark.parametrize("step", tuple(_EXPECTED_CONTRACT_TEMPLATES))
-def test_h07_registry_contains_only_the_fixed_v028_task_templates(
+def test_h07_registry_contains_the_fixed_v028_task_templates(
     provider_modules, step
 ):
     contracts = provider_modules["contracts"]
@@ -2489,7 +2651,28 @@ def test_h07_registry_contains_only_the_fixed_v028_task_templates(
 
 @pytest.mark.parametrize(
     "checkpoint",
-    ("D1", "D3", "D4.3", "D4.4", "DEV1.2", "DEV1.3", "DEV1.7"),
+    (
+        "D1",
+        "D3",
+        "D4.3",
+        "D4.4",
+        "DEV1.2",
+        "DEV1.3",
+        "DEV1.7",
+        "DEV2.3",
+        "DEV3.9",
+        "DEV3.12",
+        "DEV4.2b",
+        "DEV4.2c",
+        "DEV4.2d",
+        "DEV4.2e",
+        "DEV4.3",
+        "DEV4.4",
+        "DEV4.5",
+        "PC1.1c",
+        "PC1.2",
+        "PC1.3",
+    ),
 )
 def test_h07_initiative_checkpoints_are_not_task_contract_templates(
     provider_modules, checkpoint
@@ -2614,7 +2797,7 @@ def test_h18_sequence_expansion_rejects_missing_or_unexpected_predecessor(
         )
 
 
-def test_u10_expansion_rejects_missing_duplicate_and_segment_inputs(
+def test_u10_expansion_rejects_missing_duplicate_and_invalid_segment_inputs(
     provider_modules,
 ):
     contracts = provider_modules["contracts"]
@@ -2637,7 +2820,7 @@ def test_u10_expansion_rejects_missing_duplicate_and_segment_inputs(
             governing_source_refs=("g",),
             segment_id="S1",
         )
-    with pytest.raises(contracts.ContractRejected, match="initial templates"):
+    with pytest.raises(contracts.ContractRejected, match="does not accept"):
         contracts.expand_contract(
             step="D2",
             initiative_id="initiative-1",
@@ -2645,6 +2828,55 @@ def test_u10_expansion_rejects_missing_duplicate_and_segment_inputs(
             governing_source_refs=("g",),
             segment_id="S1",
             segment_workspace_id="workspace-1",
+        )
+
+
+def test_h07_segment_contract_requires_and_preserves_exact_segment_scope(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    with pytest.raises(contracts.ContractRejected, match="required"):
+        contracts.expand_contract(
+            step="DEV2.1",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            prior_record_refs=("p",),
+        )
+
+    snapshot = contracts.expand_contract(
+        step="DEV2.1",
+        initiative_id="initiative-1",
+        baseline_refs=("b",),
+        prior_record_refs=("p",),
+        segment_id=" S1 ",
+        segment_workspace_id=" ws:initiative-1:S1 ",
+    )
+    assert snapshot.segment_id == "S1"
+    assert snapshot.segment_workspace_id == "ws:initiative-1:S1"
+    assert contracts.validate_snapshot(snapshot) is True
+
+
+def test_h07_pc1_is_milestone_scoped_not_bound_to_one_segment_workspace(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    snapshot = contracts.expand_contract(
+        step="PC1.1a",
+        initiative_id="initiative-1",
+        baseline_refs=("milestone:baseline",),
+        prior_record_refs=("segments:S1,S2",),
+    )
+    assert snapshot.segment_id is None
+    assert snapshot.segment_workspace_id is None
+
+    with pytest.raises(contracts.ContractRejected, match="does not accept"):
+        contracts.expand_contract(
+            step="PC1.1a",
+            initiative_id="initiative-1",
+            baseline_refs=("milestone:baseline",),
+            prior_record_refs=("segments:S1,S2",),
+            segment_id="S1",
+            segment_workspace_id="ws:S1",
         )
 
 

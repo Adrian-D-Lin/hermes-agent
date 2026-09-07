@@ -219,7 +219,7 @@ def _sequence_template(
 
 _TEMPLATES: tuple[ContractTemplate, ...] = (
     ContractTemplate(
-        contract_id="design-lifecycle.d2",
+        contract_id="adrian-kanban.lifecycle.d2",
         contract_version=_CONTRACT_VERSION,
         phase="D2",
         step="D2",
@@ -229,7 +229,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         output_validator="d2_review_v1",
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.d4",
+        contract_id="adrian-kanban.lifecycle.d4",
         contract_version=_CONTRACT_VERSION,
         phase="D4",
         step="D4.1",
@@ -240,7 +240,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         sequence=_sequence_template("d4", 1, None, "accepted_completion"),
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.d4",
+        contract_id="adrian-kanban.lifecycle.d4",
         contract_version=_CONTRACT_VERSION,
         phase="D4",
         step="D4.2",
@@ -251,7 +251,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         sequence=_sequence_template("d4", 2, "D4.1", "accepted_completion"),
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.d4",
+        contract_id="adrian-kanban.lifecycle.d4",
         contract_version=_CONTRACT_VERSION,
         phase="D4",
         step="D4.5",
@@ -262,7 +262,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         sequence=_sequence_template("d4", 5, "D4.4", "initiative_checkpoint"),
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.dev1",
+        contract_id="adrian-kanban.lifecycle.dev1",
         contract_version=_CONTRACT_VERSION,
         phase="DEV1",
         step="DEV1.1a",
@@ -273,7 +273,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         sequence=_sequence_template("dev1_angles", 1, None, "accepted_completion"),
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.dev1",
+        contract_id="adrian-kanban.lifecycle.dev1",
         contract_version=_CONTRACT_VERSION,
         phase="DEV1",
         step="DEV1.1b",
@@ -284,7 +284,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         sequence=_sequence_template("dev1_angles", 2, "DEV1.1a", "accepted_completion"),
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.dev1",
+        contract_id="adrian-kanban.lifecycle.dev1",
         contract_version=_CONTRACT_VERSION,
         phase="DEV1",
         step="DEV1.1c",
@@ -295,7 +295,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         sequence=_sequence_template("dev1_angles", 3, "DEV1.1b", "accepted_completion"),
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.dev1",
+        contract_id="adrian-kanban.lifecycle.dev1",
         contract_version=_CONTRACT_VERSION,
         phase="DEV1",
         step="DEV1.1d",
@@ -306,7 +306,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         sequence=_sequence_template("dev1_angles", 4, "DEV1.1c", "accepted_completion"),
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.dev1",
+        contract_id="adrian-kanban.lifecycle.dev1",
         contract_version=_CONTRACT_VERSION,
         phase="DEV1",
         step="DEV1.1e",
@@ -317,7 +317,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         sequence=_sequence_template("dev1_angles", 5, "DEV1.1d", "accepted_completion"),
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.dev1",
+        contract_id="adrian-kanban.lifecycle.dev1",
         contract_version=_CONTRACT_VERSION,
         phase="DEV1",
         step="DEV1.4",
@@ -327,7 +327,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         output_validator="dev1_4_design_to_scope_v1",
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.dev1",
+        contract_id="adrian-kanban.lifecycle.dev1",
         contract_version=_CONTRACT_VERSION,
         phase="DEV1",
         step="DEV1.5",
@@ -337,7 +337,7 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         output_validator="dev1_5_segmentation_v1",
     ),
     ContractTemplate(
-        contract_id="design-lifecycle.dev1",
+        contract_id="adrian-kanban.lifecycle.dev1",
         contract_version=_CONTRACT_VERSION,
         phase="DEV1",
         step="DEV1.6",
@@ -345,6 +345,204 @@ _TEMPLATES: tuple[ContractTemplate, ...] = (
         required_reference_groups=("prior_record_refs",),
         constraints=("ratified_scope", "proposed_segment_list"),
         output_validator="dev1_6_segment_review_v1",
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev2",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV2",
+        step="DEV2.1",
+        execution_profile="independent-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "nine_section_brief", "segment_isolation"),
+        output_validator="dev2_1_brief_v1",
+        sequence=_sequence_template("dev2", 1, None, "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev2",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV2",
+        step="DEV2.2",
+        execution_profile="test-authority-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "design_is_oracle", "segment_isolation"),
+        output_validator="dev2_2_design_to_brief_v1",
+        sequence=_sequence_template("dev2", 2, "DEV2.1", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.1",
+        execution_profile="builder-tester",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "ratified_brief", "segment_isolation"),
+        output_validator="dev3_1_build_v1",
+        sequence=_sequence_template("dev3", 1, None, "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.2",
+        execution_profile="builder-tester",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "happy_unhappy_fringe_isolation", "untrusted_candidate_tests"),
+        output_validator="dev3_2_candidate_tests_v1",
+        sequence=_sequence_template("dev3", 2, "DEV3.1", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.3",
+        execution_profile="test-authority-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "design_is_oracle", "ratify_rewrite_or_reject_tests"),
+        output_validator="dev3_3_design_to_tests_v1",
+        sequence=_sequence_template("dev3", 3, "DEV3.2", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.4",
+        execution_profile="test-authority-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "complete_exhaustive_test_store", "no_failed_test_carryover"),
+        output_validator="dev3_4_test_execution_v1",
+        sequence=_sequence_template("dev3", 4, "DEV3.3", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.5",
+        execution_profile="test-authority-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "design_and_brief_to_code", "independence_embargo"),
+        output_validator="dev3_5_code_review_v1",
+        sequence=_sequence_template("dev3", 5, "DEV3.4", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.6",
+        execution_profile="independent-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "design_and_tests_to_results", "passing_tests_not_proof"),
+        output_validator="dev3_6_test_results_review_v1",
+        sequence=_sequence_template("dev3", 6, "DEV3.5", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.7",
+        execution_profile="independent-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "independent_code_review", "independence_embargo"),
+        output_validator="dev3_7_independent_code_review_v1",
+        sequence=_sequence_template("dev3", 7, "DEV3.6", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.8",
+        execution_profile="independent-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "synthesize_both_code_reviews", "no_unresolved_carryover"),
+        output_validator="dev3_8_review_synthesis_v1",
+        sequence=_sequence_template("dev3", 8, "DEV3.7", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.10",
+        execution_profile="builder-tester",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "bounded_revision_brief", "preserve_ratified_intent"),
+        output_validator="dev3_10_revision_brief_v1",
+        sequence=_sequence_template("dev3_revision", 1, None, "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev3",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV3",
+        step="DEV3.11",
+        execution_profile="builder-tester",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "apply_bounded_revision", "record_revision_evidence"),
+        output_validator="dev3_11_revision_build_v1",
+        sequence=_sequence_template("dev3_revision", 2, "DEV3.10", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev4",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV4",
+        step="DEV4.1a",
+        execution_profile="independent-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "archival_scan", "uncertainty_means_retain"),
+        output_validator="dev4_1a_archive_scan_v1",
+        sequence=_sequence_template("dev4", 1, None, "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev4",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV4",
+        step="DEV4.1b",
+        execution_profile="test-authority-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "archive_overreach_underreach_check", "read_only_verification"),
+        output_validator="dev4_1b_archive_verification_v1",
+        sequence=_sequence_template("dev4", 2, "DEV4.1a", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev4",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV4",
+        step="DEV4.1c",
+        execution_profile="builder-tester",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "execute_only_verified_disposition", "preserve_references"),
+        output_validator="dev4_1c_archive_execution_v1",
+        sequence=_sequence_template("dev4", 3, "DEV4.1b", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.dev4",
+        contract_version=_CONTRACT_VERSION,
+        phase="DEV4",
+        step="DEV4.2a",
+        execution_profile="independent-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("active_segment_workspace", "implementation_to_design_observations", "recommend_not_ratify"),
+        output_validator="dev4_2a_ratification_package_v1",
+        sequence=_sequence_template("dev4", 4, "DEV4.1c", "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.pc1",
+        contract_version=_CONTRACT_VERSION,
+        phase="PC1",
+        step="PC1.1a",
+        execution_profile="independent-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("milestone_scope", "read_only_parity_review", "no_dev3_repetition"),
+        output_validator="pc1_1a_parity_matrix_v1",
+        sequence=_sequence_template("pc1", 1, None, "accepted_completion"),
+    ),
+    ContractTemplate(
+        contract_id="adrian-kanban.lifecycle.pc1",
+        contract_version=_CONTRACT_VERSION,
+        phase="PC1",
+        step="PC1.1b",
+        execution_profile="test-authority-reviewer",
+        required_reference_groups=("baseline_refs", "prior_record_refs"),
+        constraints=("milestone_scope", "verify_complete_matrix", "design_is_oracle"),
+        output_validator="pc1_1b_matrix_verification_v1",
+        sequence=_sequence_template("pc1", 2, "PC1.1a", "accepted_completion"),
     ),
 )
 
@@ -434,8 +632,13 @@ def expand_contract(
 
     template = template_for(step)
 
-    if segment_id is not None or segment_workspace_id is not None:
-        raise ContractRejected("initial templates reject segment and segment_workspace")
+    requires_segment = template.phase in ("DEV2", "DEV3", "DEV4")
+    if requires_segment:
+        if segment_id is None or segment_workspace_id is None:
+            raise ContractRejected("segment_id and segment_workspace_id are required for this step")
+    else:
+        if segment_id is not None or segment_workspace_id is not None:
+            raise ContractRejected("this step does not accept segment and segment_workspace")
 
     baseline_refs = _normalize_refs(baseline_refs)
     governing_source_refs = _normalize_refs(governing_source_refs)
@@ -478,8 +681,8 @@ def expand_contract(
         phase=template.phase,
         step=template.step,
         initiative_id=initiative_id.strip(),
-        segment_id=segment_id,
-        segment_workspace_id=segment_workspace_id,
+        segment_id=segment_id.strip() if segment_id is not None else None,
+        segment_workspace_id=segment_workspace_id.strip() if segment_workspace_id is not None else None,
         execution_profile=template.execution_profile,
         baseline_refs=baseline_refs,
         governing_source_refs=governing_source_refs,
@@ -562,10 +765,16 @@ def validate_snapshot(snapshot: ContractSnapshot) -> bool:
     if snapshot.registry_hash != registry_hash():
         mismatches.append("registry_hash")
 
-    if snapshot.segment_id is not None:
-        mismatches.append("segment_id")
-    if snapshot.segment_workspace_id is not None:
-        mismatches.append("segment_workspace_id")
+    requires_segment = template.phase in ("DEV2", "DEV3", "DEV4")
+    if requires_segment:
+        if snapshot.segment_id is None or snapshot.segment_workspace_id is None:
+            mismatches.append("segment_id")
+            mismatches.append("segment_workspace_id")
+    else:
+        if snapshot.segment_id is not None:
+            mismatches.append("segment_id")
+        if snapshot.segment_workspace_id is not None:
+            mismatches.append("segment_workspace_id")
 
     if mismatches:
         raise ContractRejected("snapshot mismatch: " + ",".join(mismatches))
