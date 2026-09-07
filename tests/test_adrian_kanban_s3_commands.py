@@ -194,6 +194,46 @@ def _plugin_database(tmp_path, monkeypatch, provider_module):
     return database_path, provider
 
 
+def test_schema_additively_upgrades_unified_cards_with_route_and_version(
+    commands_module,
+):
+    schema_module = importlib.import_module(f"{commands_module.__package__}.schema")
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(
+            "CREATE TABLE adrian_kanban_initiatives ("
+            "initiative_id TEXT PRIMARY KEY);"
+            "CREATE TABLE adrian_kanban_cards ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "card_type TEXT NOT NULL,"
+            "initiative_id TEXT NOT NULL,"
+            "task_id TEXT,"
+            "title TEXT NOT NULL,"
+            "created_at INTEGER NOT NULL);"
+            "INSERT INTO adrian_kanban_initiatives VALUES ('legacy-init');"
+            "INSERT INTO adrian_kanban_cards "
+            "(card_type, initiative_id, task_id, title, created_at) "
+            "VALUES ('initiative', 'legacy-init', NULL, 'Legacy', 1);"
+        )
+
+        schema_module.create_schema(conn)
+
+        columns = {
+            row[1]: row
+            for row in conn.execute("PRAGMA table_info(adrian_kanban_cards)")
+        }
+        assert columns["board_slug"][3] == 1
+        assert columns["board_slug"][4] == "'default'"
+        assert columns["record_version"][3] == 1
+        assert columns["record_version"][4] == "0"
+        assert conn.execute(
+            "SELECT board_slug, record_version FROM adrian_kanban_cards "
+            "WHERE initiative_id = 'legacy-init'"
+        ).fetchone() == ("default", 0)
+    finally:
+        conn.close()
+
+
 def test_read_handler_never_mints_or_consumes_a_mutation_capability(
     commands_module,
     tmp_path,
@@ -1306,6 +1346,7 @@ def _insert_unified_card(
     initiative_id: str,
     task_id: str | None,
     title: str,
+    board: str = "orchestrator",
 ) -> None:
     with sqlite3.connect(database_path, isolation_level=None) as conn:
         conn.execute(
@@ -1316,20 +1357,21 @@ def _insert_unified_card(
         if task_id is not None:
             conn.execute(
                 "INSERT OR IGNORE INTO adrian_kanban_cards "
-                "(card_type, initiative_id, task_id, title, created_at) "
-                "VALUES ('initiative', ?, NULL, ?, ?)",
-                (initiative_id, f"Initiative {initiative_id}", 999),
+                "(card_type, initiative_id, task_id, title, created_at, "
+                "board_slug) VALUES ('initiative', ?, NULL, ?, ?, ?)",
+                (initiative_id, f"Initiative {initiative_id}", 999, board),
             )
         conn.execute(
             "INSERT INTO adrian_kanban_cards "
-            "(card_type, initiative_id, task_id, title, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "(card_type, initiative_id, task_id, title, created_at, board_slug) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 "task" if task_id is not None else "initiative",
                 initiative_id,
                 task_id,
                 title,
                 1_000,
+                board,
             ),
         )
 
@@ -1371,7 +1413,11 @@ def test_link_handler_atomically_links_two_unified_task_cards(
         session_id="session-link",
         workspace_id=None,
         execution_context="run-link",
-        payload={"parent_id": "task-parent", "child_id": "task-child"},
+        payload={
+            "parent_id": "task-parent",
+            "child_id": "task-child",
+            "board": "orchestrator",
+        },
     )
 
     assert result["result"] == "ACCEPTED"
@@ -1384,6 +1430,10 @@ def test_link_handler_atomically_links_two_unified_task_cards(
             "SELECT COUNT(*) FROM task_links "
             "WHERE parent_id = ? AND child_id = ?",
             ("task-parent", "task-child"),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards "
+            "WHERE task_id = 'task-child'"
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
@@ -1438,7 +1488,11 @@ def test_link_handler_rejects_non_task_endpoint_without_state_or_receipt(
         session_id="session-link-reject",
         workspace_id=None,
         execution_context="run-link-reject",
-        payload={"parent_id": parent_id, "child_id": "task-child"},
+        payload={
+            "parent_id": parent_id,
+            "child_id": "task-child",
+            "board": "orchestrator",
+        },
     )
 
     _assert_canonical_rejection(
@@ -1493,7 +1547,11 @@ def test_link_binding_target_must_be_the_child(
         session_id="session-link-target-mismatch",
         workspace_id=None,
         execution_context="run-link-target-mismatch",
-        payload={"parent_id": "task-parent", "child_id": "task-child"},
+        payload={
+            "parent_id": "task-parent",
+            "child_id": "task-child",
+            "board": "orchestrator",
+        },
     )
 
     _assert_canonical_rejection(
@@ -1741,8 +1799,8 @@ def _seed_initiative_card(database_path, initiative_id="initiative-create"):
         )
         conn.execute(
             "INSERT INTO adrian_kanban_cards "
-            "(card_type, initiative_id, task_id, title, created_at) "
-            "VALUES ('initiative', ?, NULL, ?, 1)",
+            "(card_type, initiative_id, task_id, title, created_at, board_slug) "
+            "VALUES ('initiative', ?, NULL, ?, 1, 'orchestrator')",
             (initiative_id, f"Initiative {initiative_id}"),
         )
 
@@ -1753,6 +1811,7 @@ def _submit_create(boundary, *, task_id="task-create-public", **payload_override
         "initiative_id": "initiative-create",
         "title": "Public task creation",
         "assignee": "builder",
+        "board": "orchestrator",
     }
     payload.update(payload_overrides)
     return boundary.submit(
@@ -1924,9 +1983,10 @@ def test_create_handler_allows_cross_initiative_task_parent(
         )
         conn.execute(
             "INSERT INTO adrian_kanban_cards "
-            "(card_type, initiative_id, task_id, title, created_at) "
+            "(card_type, initiative_id, task_id, title, created_at, "
+            "board_slug) "
             "VALUES ('task', 'initiative-parent', 'cross-parent', "
-            "'Cross parent', 1)"
+            "'Cross parent', 1, 'orchestrator')"
         )
     boundary = commands_module._CommandBoundary(
         database_path=str(database_path),
