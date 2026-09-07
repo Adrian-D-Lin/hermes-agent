@@ -242,6 +242,12 @@ _OPERATION_ARGUMENT_TYPES = MappingProxyType(
 )
 
 
+# Only operations whose native mutators already use nested savepoint
+# semantics may be admitted inside the boundary's outer transaction. Any
+# other operation is rejected explicitly rather than falsely claimed safe.
+_ACTIVE_TRANSACTION_OPERATIONS = frozenset({"kanban_comment"})
+
+
 class _PrivateNativeAdapter:
     def __init__(
         self,
@@ -261,10 +267,12 @@ class _PrivateNativeAdapter:
         self._provider = provider
         self._conn = conn
         self._spawn_fn = spawn_fn
+        self._active_capability: Optional[Any] = None
+        self._active_binding: Optional[CapabilityBinding] = None
 
-    def execute(
+    def _validate_binding_and_arguments(
         self, capability: Any, binding: CapabilityBinding, arguments: Any
-    ) -> Any:
+    ) -> str:
         if type(binding) is not CapabilityBinding:
             raise _PrivateAdapterRejected("binding must be a CapabilityBinding")
 
@@ -282,6 +290,73 @@ class _PrivateNativeAdapter:
             raise _PrivateAdapterRejected(
                 "binding.target does not match arguments.task_id"
             )
+
+        return operation
+
+    def _dispatch_native(
+        self, operation: str, binding: CapabilityBinding, arguments: Any
+    ) -> Any:
+        if operation == "kanban_complete":
+            return _kb.complete_task(
+                self._conn,
+                arguments.task_id,
+                result=arguments.result,
+                summary=arguments.summary,
+                metadata=arguments.metadata,
+                created_cards=arguments.created_cards,
+                expected_run_id=arguments.expected_run_id,
+                fire_lifecycle_hook=False,
+            )
+        elif operation == "kanban_block":
+            return _kb.block_task(
+                self._conn,
+                arguments.task_id,
+                reason=arguments.reason,
+                kind=arguments.kind,
+                expected_run_id=arguments.expected_run_id,
+            )
+        elif operation == "kanban_unblock":
+            return _kb.unblock_task(self._conn, arguments.task_id)
+        elif operation == "kanban_comment":
+            return _kb.add_comment(
+                self._conn,
+                arguments.task_id,
+                arguments.author,
+                arguments.body,
+            )
+        elif operation == "kanban_heartbeat":
+            return _kb.heartbeat_worker(
+                self._conn,
+                arguments.task_id,
+                note=arguments.note,
+                expected_run_id=arguments.expected_run_id,
+            )
+        elif operation == "kanban_request_changes":
+            return _kb.request_changes(
+                self._conn,
+                arguments.task_id,
+                reason=arguments.reason,
+                expected_run_id=arguments.expected_run_id,
+            )
+        elif operation == "kanban_request_review":
+            return _kb.request_review(
+                self._conn,
+                arguments.task_id,
+                summary=arguments.summary,
+                metadata=arguments.metadata,
+                reviewer=arguments.reviewer,
+                expected_run_id=arguments.expected_run_id,
+                force=arguments.force,
+                with_reason=arguments.with_reason,
+            )
+        raise _PrivateAdapterRejected("unreachable")
+
+    def execute(
+        self, capability: Any, binding: CapabilityBinding, arguments: Any
+    ) -> Any:
+        operation = self._validate_binding_and_arguments(
+            capability, binding, arguments
+        )
 
         if operation == "kanban_launch":
             with _capability_scope(
@@ -301,70 +376,49 @@ class _PrivateNativeAdapter:
                     board=arguments.board,
                 )
 
-        with _capability_scope(
-            self._provider, self._conn, capability, binding
+        with _capability_scope(self._provider, self._conn, capability, binding):
+            return self._dispatch_native(operation, binding, arguments)
+
+    def _execute_in_active_transaction(
+        self, capability: Any, binding: CapabilityBinding, arguments: Any
+    ) -> Any:
+        if (
+            self._active_capability is None
+            or self._active_binding is None
+            or not self._conn.in_transaction
         ):
-            if operation == "kanban_complete":
-                return _kb.complete_task(
-                    self._conn,
-                    arguments.task_id,
-                    result=arguments.result,
-                    summary=arguments.summary,
-                    metadata=arguments.metadata,
-                    created_cards=arguments.created_cards,
-                    expected_run_id=arguments.expected_run_id,
-                    fire_lifecycle_hook=False,
-                )
-            elif operation == "kanban_block":
-                return _kb.block_task(
-                    self._conn,
-                    arguments.task_id,
-                    reason=arguments.reason,
-                    kind=arguments.kind,
-                    expected_run_id=arguments.expected_run_id,
-                )
-            elif operation == "kanban_unblock":
-                return _kb.unblock_task(self._conn, arguments.task_id)
-            elif operation == "kanban_comment":
-                return _kb.add_comment(
-                    self._conn,
-                    arguments.task_id,
-                    arguments.author,
-                    arguments.body,
-                )
-            elif operation == "kanban_heartbeat":
-                return _kb.heartbeat_worker(
-                    self._conn,
-                    arguments.task_id,
-                    note=arguments.note,
-                    expected_run_id=arguments.expected_run_id,
-                )
-            elif operation == "kanban_request_changes":
-                return _kb.request_changes(
-                    self._conn,
-                    arguments.task_id,
-                    reason=arguments.reason,
-                    expected_run_id=arguments.expected_run_id,
-                )
-            elif operation == "kanban_request_review":
-                return _kb.request_review(
-                    self._conn,
-                    arguments.task_id,
-                    summary=arguments.summary,
-                    metadata=arguments.metadata,
-                    reviewer=arguments.reviewer,
-                    expected_run_id=arguments.expected_run_id,
-                    force=arguments.force,
-                    with_reason=arguments.with_reason,
-                )
-        raise _PrivateAdapterRejected("unreachable")
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if capability is not self._active_capability:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if binding is not self._active_binding:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+
+        operation = self._validate_binding_and_arguments(
+            capability, binding, arguments
+        )
+        if operation not in _ACTIVE_TRANSACTION_OPERATIONS:
+            raise _PrivateAdapterRejected(
+                "operation is not admitted inside the active boundary transaction"
+            )
+
+        return self._dispatch_native(operation, binding, arguments)
 
     @contextlib.contextmanager
-    def mutation_transaction(self, capability: Any, binding: CapabilityBinding):
+    def mutation_transaction(
+        self, capability: Any, binding: CapabilityBinding
+    ):
         if type(binding) is not CapabilityBinding:
             raise _PrivateAdapterRejected("binding must be a CapabilityBinding")
-        with _capability_scope(
-            self._provider, self._conn, capability, binding
-        ):
-            with _kb.write_txn(self._conn):
-                yield self._conn
+        if self._active_capability is not None or self._active_binding is not None:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        self._active_capability = capability
+        self._active_binding = binding
+        try:
+            with _capability_scope(
+                self._provider, self._conn, capability, binding
+            ):
+                with _kb.write_txn(self._conn):
+                    yield self._conn
+        finally:
+            self._active_capability = None
+            self._active_binding = None

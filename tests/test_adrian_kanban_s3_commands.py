@@ -160,6 +160,7 @@ def test_missing_attempt_id_is_generated_but_never_blank(commands_module):
 def _runtime_modules(commands_module):
     package = commands_module.__package__
     return {
+        "capability": importlib.import_module(f"{package}.capability"),
         "provider": importlib.import_module(f"{package}.provider"),
         "private_adapter": importlib.import_module(f"{package}.private_adapter"),
     }
@@ -687,3 +688,181 @@ def test_nonserializable_result_rolls_back_mutation_and_receipt(
         assert conn.execute(
             "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
         ).fetchone()[0] == 0
+
+
+def _insert_native_task(database_path, task_id: str) -> None:
+    with sqlite3.connect(database_path, isolation_level=None) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "S3 adapter transaction probe", "ready", 1_000),
+        )
+
+
+def test_private_adapter_can_dispatch_inside_the_boundary_transaction(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _insert_native_task(database_path, "task-active-success")
+
+    def handler(context):
+        comment_id = context.mutation_executor._execute_in_active_transaction(
+            context.capability,
+            context.binding,
+            modules["private_adapter"]._CommentArgs(
+                task_id="task-active-success",
+                author="orchestrator",
+                body="one admitted transaction",
+            ),
+        )
+        assert context.connection.in_transaction is True
+        return {"comment_id": comment_id}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": handler},
+    )
+
+    result = boundary.submit(
+        "kanban_comment",
+        attempt_id="attempt-active-success",
+        idempotency_key="key-active-success",
+        target="task-active-success",
+        expected_version=0,
+        session_id="session-active-success",
+        workspace_id=None,
+        execution_context="run-active-success",
+        payload={"author": "orchestrator", "body": "one admitted transaction"},
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"]["comment_id"] > 0
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
+            ("task-active-success",),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
+            "WHERE idempotency_key = ?",
+            ("key-active-success",),
+        ).fetchone()[0] == 1
+
+
+def test_boundary_failure_rolls_back_native_adapter_write_and_receipt_together(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _insert_native_task(database_path, "task-active-rollback")
+
+    def handler(context):
+        context.mutation_executor._execute_in_active_transaction(
+            context.capability,
+            context.binding,
+            modules["private_adapter"]._CommentArgs(
+                task_id="task-active-rollback",
+                author="orchestrator",
+                body="must roll back",
+            ),
+        )
+        raise RuntimeError("fail after private adapter mutation")
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": handler},
+    )
+
+    result = boundary.submit(
+        "kanban_comment",
+        attempt_id="attempt-active-rollback",
+        idempotency_key="key-active-rollback",
+        target="task-active-rollback",
+        expected_version=0,
+        session_id="session-active-rollback",
+        workspace_id=None,
+        execution_context="run-active-rollback",
+        payload={"author": "orchestrator", "body": "must roll back"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_comment",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
+            ("task-active-rollback",),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
+            "WHERE idempotency_key = ?",
+            ("key-active-rollback",),
+        ).fetchone()[0] == 0
+
+
+def test_active_transaction_entry_rejects_outside_its_exact_boundary_scope(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _insert_native_task(database_path, "task-active-outside")
+    payload = {"author": "orchestrator", "body": "outside"}
+    binding = modules["capability"].CapabilityBinding(
+        operation="kanban_comment",
+        target="task-active-outside",
+        expected_version=0,
+        canonical_digest=hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+        session_id="session-active-outside",
+        workspace_id=None,
+        plugin_version=modules["provider"].PLUGIN_VERSION,
+        protocol_version=modules["provider"].PROTOCOL_VERSION,
+        execution_context="run-active-outside",
+    )
+    capability = provider._mint_after_admission(binding)
+
+    conn = sqlite3.connect(database_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        adapter = provider._create_mutation_executor(conn)
+        with pytest.raises(
+            modules["private_adapter"]._PrivateAdapterRejected,
+            match="active boundary transaction",
+        ):
+            adapter._execute_in_active_transaction(
+                capability,
+                binding,
+                modules["private_adapter"]._CommentArgs(
+                    task_id="task-active-outside",
+                    author="orchestrator",
+                    body="outside",
+                ),
+            )
+        assert provider.is_consumed(capability) is False
+    finally:
+        conn.close()
