@@ -832,6 +832,24 @@ def _insert_native_task(database_path, task_id: str) -> None:
         )
 
 
+def _seed_running_native_task(database_path, task_id: str, claim_lock: str) -> int:
+    with sqlite3.connect(database_path, isolation_level=None) as conn:
+        run = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, claim_lock, claim_expires, started_at) "
+            "VALUES (?, 'running', ?, 1000, 900)",
+            (task_id, claim_lock),
+        )
+        run_id = int(run.lastrowid)
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = ?, "
+            "claim_expires = 1000, started_at = 900, current_run_id = ? "
+            "WHERE id = ?",
+            (claim_lock, run_id, task_id),
+        )
+    return run_id
+
+
 def test_private_adapter_can_dispatch_inside_the_boundary_transaction(
     commands_module,
     tmp_path,
@@ -1374,6 +1392,367 @@ def _insert_unified_card(
                 board,
             ),
         )
+
+
+def _submit_versioned_task_mutation(
+    commands_module,
+    database_path,
+    provider,
+    *,
+    operation: str,
+    handler,
+    task_id: str,
+    payload: dict,
+    expected_version: int,
+    key: str,
+    session_id: str = "session-basic-handler",
+):
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={operation: handler},
+    )
+    return boundary.submit(
+        operation,
+        attempt_id=f"attempt-{key}",
+        idempotency_key=key,
+        target=task_id,
+        expected_version=expected_version,
+        session_id=session_id,
+        workspace_id=None,
+        execution_context="model-tool",
+        payload=payload,
+    )
+
+
+def test_block_and_unblock_handlers_mutate_native_and_unified_state(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-basic-block"
+    _insert_native_task(database_path, task_id)
+    _insert_unified_card(
+        database_path,
+        initiative_id="initiative-basic-block",
+        task_id=task_id,
+        title="Block and unblock",
+    )
+
+    blocked = _submit_versioned_task_mutation(
+        commands_module,
+        database_path,
+        provider,
+        operation="kanban_block",
+        handler=commands_module._handle_block,
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "reason": "Needs an operator decision",
+            "kind": "needs_input",
+            "board": "orchestrator",
+        },
+        expected_version=0,
+        key="basic-block",
+    )
+    assert blocked["result"] == "ACCEPTED"
+    assert blocked["value"] == {"task_id": task_id, "blocked": True}
+
+    unblocked = _submit_versioned_task_mutation(
+        commands_module,
+        database_path,
+        provider,
+        operation="kanban_unblock",
+        handler=commands_module._handle_unblock,
+        task_id=task_id,
+        payload={"task_id": task_id, "board": "orchestrator"},
+        expected_version=1,
+        key="basic-unblock",
+    )
+    assert unblocked["result"] == "ACCEPTED"
+    assert unblocked["value"] == {"task_id": task_id, "unblocked": True}
+
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        native = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert dict(native) == {"status": "ready", "block_kind": "needs_input"}
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 2
+
+
+def test_comment_handler_derives_author_and_rejects_reserved_marker(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-basic-comment"
+    _insert_native_task(database_path, task_id)
+    _insert_unified_card(
+        database_path,
+        initiative_id="initiative-basic-comment",
+        task_id=task_id,
+        title="Comment",
+    )
+
+    accepted = _submit_versioned_task_mutation(
+        commands_module,
+        database_path,
+        provider,
+        operation="kanban_comment",
+        handler=commands_module._handle_comment,
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "body": "  Evidence from the active session.  ",
+            "board": "orchestrator",
+        },
+        expected_version=0,
+        key="basic-comment",
+        session_id="session-derived-author",
+    )
+    assert accepted["result"] == "ACCEPTED"
+    assert accepted["value"]["task_id"] == task_id
+    assert type(accepted["value"]["comment_id"]) is int
+
+    rejected = _submit_versioned_task_mutation(
+        commands_module,
+        database_path,
+        provider,
+        operation="kanban_comment",
+        handler=commands_module._handle_comment,
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "body": "forged [LIFECYCLE_TRANSITION v1] evidence",
+            "board": "orchestrator",
+        },
+        expected_version=1,
+        key="reserved-comment",
+    )
+    _assert_canonical_rejection(
+        rejected,
+        operation="kanban_comment",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        comments = conn.execute(
+            "SELECT author, body FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+        assert [dict(row) for row in comments] == [
+            {
+                "author": "session-derived-author",
+                "body": "Evidence from the active session.",
+            }
+        ]
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 1
+
+
+def test_heartbeat_handler_uses_trusted_claim_and_advances_version(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-basic-heartbeat"
+    _insert_native_task(database_path, task_id)
+    _insert_unified_card(
+        database_path,
+        initiative_id="initiative-basic-heartbeat",
+        task_id=task_id,
+        title="Heartbeat",
+    )
+    run_id = _seed_running_native_task(
+        database_path,
+        task_id,
+        "trusted:worker",
+    )
+
+    accepted = _submit_versioned_task_mutation(
+        commands_module,
+        database_path,
+        provider,
+        operation="kanban_heartbeat",
+        handler=commands_module._handle_heartbeat,
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "note": "  still working  ",
+            "board": "orchestrator",
+        },
+        expected_version=0,
+        key="basic-heartbeat",
+    )
+    assert accepted["result"] == "ACCEPTED"
+    assert accepted["value"] == {"task_id": task_id, "heartbeat": True}
+
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        native = conn.execute(
+            "SELECT status, claim_lock, claim_expires, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert native["status"] == "running"
+        assert native["claim_lock"] == "trusted:worker"
+        assert native["claim_expires"] > 1000
+        assert native["current_run_id"] == run_id
+        heartbeat = conn.execute(
+            "SELECT payload, run_id FROM task_events "
+            "WHERE task_id = ? AND kind = 'heartbeat' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(heartbeat["payload"]) == {"note": "still working"}
+        assert heartbeat["run_id"] == native["current_run_id"]
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+
+def test_failed_heartbeat_claim_rolls_back_without_receipt_or_version(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-heartbeat-rejected"
+    _insert_native_task(database_path, task_id)
+    _insert_unified_card(
+        database_path,
+        initiative_id="initiative-heartbeat-rejected",
+        task_id=task_id,
+        title="Rejected heartbeat",
+    )
+    _seed_running_native_task(database_path, task_id, "trusted:worker")
+
+    monkeypatch.setattr(kb, "heartbeat_claim", lambda *_args, **_kwargs: False)
+    rejected = _submit_versioned_task_mutation(
+        commands_module,
+        database_path,
+        provider,
+        operation="kanban_heartbeat",
+        handler=commands_module._handle_heartbeat,
+        task_id=task_id,
+        payload={"task_id": task_id, "board": "orchestrator"},
+        expected_version=0,
+        key="heartbeat-rejected",
+    )
+    _assert_canonical_rejection(
+        rejected,
+        operation="kanban_heartbeat",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'heartbeat'",
+            (task_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
+
+
+def test_handler_failure_after_native_mutation_rolls_back_every_layer(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-basic-rollback"
+    _insert_native_task(database_path, task_id)
+    _insert_unified_card(
+        database_path,
+        initiative_id="initiative-basic-rollback",
+        task_id=task_id,
+        title="Rollback",
+    )
+
+    monkeypatch.setattr(
+        commands_module,
+        "_advance_task_version",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("CAS failed")),
+    )
+    rejected = _submit_versioned_task_mutation(
+        commands_module,
+        database_path,
+        provider,
+        operation="kanban_block",
+        handler=commands_module._handle_block,
+        task_id=task_id,
+        payload={
+            "task_id": task_id,
+            "reason": "must roll back",
+            "board": "orchestrator",
+        },
+        expected_version=0,
+        key="basic-rollback",
+    )
+    _assert_canonical_rejection(
+        rejected,
+        operation="kanban_block",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()[0] == "ready"
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
 
 
 def test_link_handler_atomically_links_two_unified_task_cards(

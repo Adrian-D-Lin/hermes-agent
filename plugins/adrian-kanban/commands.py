@@ -1163,6 +1163,219 @@ def _handle_link(context: Any) -> dict[str, Any]:
     return {"parent_id": parent_id, "child_id": child_id}
 
 
+def _load_versioned_task(
+    context: Any,
+    task_id: Any,
+    board: Any,
+) -> tuple[sqlite3.Row, sqlite3.Row]:
+    if not (type(task_id) is str and task_id.strip()):
+        raise ValueError("task_id must be a nonblank string")
+    if not (type(board) is str and board.strip()):
+        raise ValueError("board must be a nonblank string")
+    task_id = task_id.strip()
+    board = board.strip()
+
+    card_rows = context.connection.execute(
+        "SELECT card_type, initiative_id, task_id, board_slug, record_version "
+        "FROM adrian_kanban_cards WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    if len(card_rows) != 1:
+        raise ValueError(f"expected exactly one task card, found {len(card_rows)}")
+    card = card_rows[0]
+    if (
+        card["card_type"] != "task"
+        or card["task_id"] != task_id
+        or card["board_slug"] != board
+    ):
+        raise ValueError("task card does not match the resolved board")
+
+    initiative_rows = context.connection.execute(
+        "SELECT card_type, task_id, board_slug FROM adrian_kanban_cards "
+        "WHERE initiative_id = ? AND task_id IS NULL",
+        (card["initiative_id"],),
+    ).fetchall()
+    if len(initiative_rows) != 1:
+        raise ValueError(
+            "task must belong to exactly one canonical initiative card"
+        )
+    initiative = initiative_rows[0]
+    if (
+        initiative["card_type"] != "initiative"
+        or initiative["board_slug"] != board
+    ):
+        raise ValueError("task initiative does not match the resolved board")
+    if card["record_version"] != context.binding.expected_version:
+        raise ValueError("task version changed before mutation")
+
+    native_rows = context.connection.execute(
+        "SELECT id, current_run_id, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchall()
+    if len(native_rows) != 1 or native_rows[0]["id"] != task_id:
+        raise ValueError("canonical native task not found")
+    return card, native_rows[0]
+
+
+def _advance_task_version(context: Any, task_id: str, board: str) -> None:
+    updated = context.connection.execute(
+        "UPDATE adrian_kanban_cards "
+        "SET record_version = record_version + 1 "
+        "WHERE task_id = ? AND board_slug = ? AND record_version = ?",
+        (task_id, board, context.binding.expected_version),
+    )
+    if updated.rowcount != 1:
+        raise ValueError("task version changed during mutation")
+
+
+def _handle_block(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    unknown = set(payload.keys()) - {"task_id", "reason", "kind", "board"}
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+    task_id = payload.get("task_id")
+    reason = payload.get("reason")
+    board = payload.get("board")
+    kind = payload.get("kind")
+    for field_name, value in (
+        ("task_id", task_id),
+        ("reason", reason),
+        ("board", board),
+    ):
+        if not (type(value) is str and value.strip()):
+            raise ValueError(f"{field_name} must be a nonblank string")
+    if kind is not None and not (type(kind) is str and kind.strip()):
+        raise ValueError("kind must be absent or a nonblank string")
+    task_id = task_id.strip()
+    reason = reason.strip()
+    board = board.strip()
+    kind = kind.strip() if kind is not None else None
+
+    _card, native = _load_versioned_task(context, task_id, board)
+    expected_run_id = native["current_run_id"]
+    if expected_run_id is not None and not (
+        type(expected_run_id) is int and expected_run_id > 0
+    ):
+        raise ValueError("native current_run_id must be a positive integer")
+    changed = context.mutation_executor._block_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+        reason=reason,
+        kind=kind,
+        expected_run_id=expected_run_id,
+    )
+    if changed is not True:
+        raise ValueError("native task was not blockable")
+    _advance_task_version(context, task_id, board)
+    return {"task_id": task_id, "blocked": True}
+
+
+def _handle_unblock(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    unknown = set(payload.keys()) - {"task_id", "board"}
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+    task_id = payload.get("task_id")
+    board = payload.get("board")
+    if not (type(task_id) is str and task_id.strip()):
+        raise ValueError("task_id must be a nonblank string")
+    if not (type(board) is str and board.strip()):
+        raise ValueError("board must be a nonblank string")
+    task_id = task_id.strip()
+    board = board.strip()
+
+    _load_versioned_task(context, task_id, board)
+    changed = context.mutation_executor._unblock_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+    )
+    if changed is not True:
+        raise ValueError("native task was not unblockable")
+    _advance_task_version(context, task_id, board)
+    return {"task_id": task_id, "unblocked": True}
+
+
+def _handle_comment(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    unknown = set(payload.keys()) - {"task_id", "body", "board"}
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+    task_id = payload.get("task_id")
+    body = payload.get("body")
+    board = payload.get("board")
+    for field_name, value in (
+        ("task_id", task_id),
+        ("body", body),
+        ("board", board),
+    ):
+        if not (type(value) is str and value.strip()):
+            raise ValueError(f"{field_name} must be a nonblank string")
+    task_id = task_id.strip()
+    body = body.strip()
+    board = board.strip()
+    if "[LIFECYCLE_TRANSITION v1]" in body:
+        raise ValueError("generic comments cannot contain lifecycle markers")
+
+    _load_versioned_task(context, task_id, board)
+    author = context.binding.session_id
+    if not (type(author) is str and author.strip()):
+        raise ValueError("binding session_id must be a nonblank string")
+    comment_id = context.mutation_executor._comment_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+        author=author.strip(),
+        body=body,
+    )
+    if not (type(comment_id) is int and comment_id > 0):
+        raise ValueError("native comment id must be a positive integer")
+    _advance_task_version(context, task_id, board)
+    return {"task_id": task_id, "comment_id": comment_id}
+
+
+def _handle_heartbeat(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    unknown = set(payload.keys()) - {"task_id", "note", "board"}
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+    task_id = payload.get("task_id")
+    board = payload.get("board")
+    note = payload.get("note")
+    if not (type(task_id) is str and task_id.strip()):
+        raise ValueError("task_id must be a nonblank string")
+    if not (type(board) is str and board.strip()):
+        raise ValueError("board must be a nonblank string")
+    if note is not None and type(note) is not str:
+        raise ValueError("note must be absent or a string")
+    task_id = task_id.strip()
+    board = board.strip()
+    note = note.strip() if note is not None else None
+
+    _card, native = _load_versioned_task(context, task_id, board)
+    claim_lock = native["claim_lock"]
+    if not (type(claim_lock) is str and claim_lock.strip()):
+        raise ValueError("native task has no active claim")
+    expected_run_id = native["current_run_id"]
+    if expected_run_id is not None and not (
+        type(expected_run_id) is int and expected_run_id > 0
+    ):
+        raise ValueError("native current_run_id must be a positive integer")
+    changed = context.mutation_executor._heartbeat_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+        claim_lock=claim_lock.strip(),
+        note=note,
+        expected_run_id=expected_run_id,
+    )
+    if changed is not True:
+        raise ValueError("native claim could not be extended")
+    _advance_task_version(context, task_id, board)
+    return {"task_id": task_id, "heartbeat": True}
+
+
 def register_public_tools(
     ctx: Any,
     boundary: Any,
@@ -1651,5 +1864,10 @@ __all__ = [
     "RECOGNIZED_OPERATIONS",
     "command_boundary",
     "_CommandBoundary",
+    "_handle_block",
+    "_handle_comment",
+    "_handle_create",
+    "_handle_heartbeat",
     "_handle_link",
+    "_handle_unblock",
 ]
