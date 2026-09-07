@@ -2543,6 +2543,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    _allow_nested: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2554,6 +2555,8 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -3049,6 +3052,9 @@ def request_review(
     task stays ``running`` and retryable, with no attachments and no event.
     """
 
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
+
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
@@ -3172,7 +3178,7 @@ def request_changes(
     if not reason:
         return False, "reason is required"
 
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
