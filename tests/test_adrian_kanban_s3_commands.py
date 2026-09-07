@@ -66,36 +66,30 @@ def _assert_canonical_rejection(result: object, *, operation: str, code: str) ->
 
 
 def test_operation_taxonomy_exactly_matches_ratified_canon(commands_module):
-    assert commands_module.READ_ONLY_OPERATIONS == frozenset(
-        {
-            "kanban_show",
-            "kanban_list",
-            "kanban_attachments",
-        }
-    )
-    assert commands_module.ORDINARY_TASK_OPERATIONS == frozenset(
-        {
-            "kanban_create",
-            "kanban_complete",
-            "kanban_block",
-            "kanban_unblock",
-            "kanban_comment",
-            "kanban_link",
-            "kanban_heartbeat",
-            "kanban_attach",
-            "kanban_attach_url",
-            "kanban_request_changes",
-            "kanban_request_review",
-        }
-    )
-    assert commands_module.INITIATIVE_OPERATIONS == frozenset(
-        {
-            "kanban_create_initiative",
-            "kanban_update_initiative",
-            "kanban_transition_initiative",
-            "kanban_close_initiative",
-        }
-    )
+    assert commands_module.READ_ONLY_OPERATIONS == frozenset({
+        "kanban_show",
+        "kanban_list",
+        "kanban_attachments",
+    })
+    assert commands_module.ORDINARY_TASK_OPERATIONS == frozenset({
+        "kanban_create",
+        "kanban_complete",
+        "kanban_block",
+        "kanban_unblock",
+        "kanban_comment",
+        "kanban_link",
+        "kanban_heartbeat",
+        "kanban_attach",
+        "kanban_attach_url",
+        "kanban_request_changes",
+        "kanban_request_review",
+    })
+    assert commands_module.INITIATIVE_OPERATIONS == frozenset({
+        "kanban_create_initiative",
+        "kanban_update_initiative",
+        "kanban_transition_initiative",
+        "kanban_close_initiative",
+    })
     assert commands_module.RECOGNIZED_OPERATIONS == (
         commands_module.READ_ONLY_OPERATIONS
         | commands_module.ORDINARY_TASK_OPERATIONS
@@ -122,13 +116,11 @@ def test_unknown_operation_rejects_without_runtime_or_state_change(commands_modu
 
 @pytest.mark.parametrize(
     "operation",
-    sorted(
-        {
-            "kanban_show",
-            "kanban_comment",
-            "kanban_create_initiative",
-        }
-    ),
+    sorted({
+        "kanban_show",
+        "kanban_comment",
+        "kanban_create_initiative",
+    }),
 )
 def test_recognized_operation_rejects_when_boundary_runtime_is_unavailable(
     commands_module,
@@ -175,8 +167,7 @@ def _plugin_database(tmp_path, monkeypatch, provider_module):
     with kb.connect_closing(database_path) as conn:
         schema_module.create_schema(conn)
         conn.execute(
-            "CREATE TABLE boundary_probe ("
-            "value TEXT PRIMARY KEY, audit TEXT NOT NULL)"
+            "CREATE TABLE boundary_probe (value TEXT PRIMARY KEY, audit TEXT NOT NULL)"
         )
         conn.commit()
 
@@ -234,6 +225,123 @@ def test_schema_additively_upgrades_unified_cards_with_route_and_version(
         conn.close()
 
 
+def test_schema_adds_immutable_manifest_and_handoff_records(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, _provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    expected_tables = {
+        "task_input_manifests",
+        "task_input_entries",
+        "task_handoff_requirements",
+        "task_candidate_handoffs",
+        "task_handoff_rejections",
+        "task_reviewer_verdicts",
+    }
+    with sqlite3.connect(database_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert expected_tables <= tables
+        requirement_columns = {
+            row[1]: row
+            for row in conn.execute("PRAGMA table_info(task_handoff_requirements)")
+        }
+        assert requirement_columns["task_card_id"][5] == 1
+        assert requirement_columns["version"][3] == 1
+        assert requirement_columns["reviewer"][3] == 1
+        rejection_columns = {
+            row[1]: row
+            for row in conn.execute("PRAGMA table_info(task_handoff_rejections)")
+        }
+        assert rejection_columns["task_card_id"][3] == 1
+        assert rejection_columns["execution_run_id"][3] == 1
+        assert rejection_columns["findings_json"][3] == 1
+        verdict_foreign_keys = list(
+            conn.execute("PRAGMA foreign_key_list(task_reviewer_verdicts)")
+        )
+        candidate_fk_columns = {
+            (row[3], row[4])
+            for row in verdict_foreign_keys
+            if row[2] == "task_candidate_handoffs"
+        }
+        assert candidate_fk_columns == {
+            ("task_card_id", "task_card_id"),
+            ("candidate_id", "candidate_id"),
+        }
+
+
+def test_manifest_entries_require_their_exact_parent_manifest(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, _provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-manifest-parent"
+    _insert_native_task(database_path, task_id)
+    _insert_unified_card(
+        database_path,
+        initiative_id="initiative-manifest-parent",
+        task_id=task_id,
+        title="Manifest parent",
+    )
+    with sqlite3.connect(database_path, isolation_level=None) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        entry = (
+            card_id,
+            task_id,
+            "Canon/design.md",
+            "a" * 64,
+            "git_commit",
+            "b" * 40,
+            "Use as the design oracle",
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO task_input_entries "
+                "(task_card_id, task_id, workspace_path, sha256, source_kind, "
+                "source_locator, context_guidance) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                entry,
+            )
+        conn.execute(
+            "INSERT INTO task_input_manifests "
+            "(task_card_id, task_id, canonical_payload, "
+            "declared_inputs_accessible, created_at) VALUES (?, ?, '{}', 1, 1000)",
+            (card_id, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_input_entries "
+            "(task_card_id, task_id, workspace_path, sha256, source_kind, "
+            "source_locator, context_guidance) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            entry,
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_input_entries WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
 def test_read_handler_never_mints_or_consumes_a_mutation_capability(
     commands_module,
     tmp_path,
@@ -277,9 +385,12 @@ def test_read_handler_never_mints_or_consumes_a_mutation_capability(
         "value": {"projection": "visible"},
     }
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_mutation_uses_one_adapter_owned_transaction_and_consumes_exact_binding(
@@ -297,7 +408,10 @@ def test_mutation_uses_one_adapter_owned_transaction_and_consumes_exact_binding(
 
     def mutation_handler(context):
         assert context.connection.in_transaction is True
-        assert type(context.mutation_executor) is modules["private_adapter"]._PrivateNativeAdapter
+        assert (
+            type(context.mutation_executor)
+            is modules["private_adapter"]._PrivateNativeAdapter
+        )
         observed["binding"] = context.binding
         observed["capability"] = context.capability
         context.connection.execute(
@@ -339,14 +453,17 @@ def test_mutation_uses_one_adapter_owned_transaction_and_consumes_exact_binding(
     assert binding.session_id == "session-1"
     assert binding.workspace_id == "workspace-1"
     assert binding.execution_context == "run-1"
-    assert binding.canonical_digest == hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    assert (
+        binding.canonical_digest
+        == hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
     assert provider.is_consumed(observed["capability"]) is True
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT value, audit FROM boundary_probe"
-        ).fetchall() == [("committed", "same-transaction")]
+        assert conn.execute("SELECT value, audit FROM boundary_probe").fetchall() == [
+            ("committed", "same-transaction")
+        ]
 
 
 def test_mutation_failure_rolls_back_and_returns_canonical_rejection(
@@ -462,9 +579,7 @@ def test_derived_state_is_revalidated_after_serialized_transaction_begins(
     boundary = commands_module._CommandBoundary(
         database_path=str(database_path),
         provider=provider,
-        handlers={
-            "kanban_comment": lambda _context: handler_calls.append("called")
-        },
+        handlers={"kanban_comment": lambda _context: handler_calls.append("called")},
         state_resolver=lambda *_: next(versions),
     )
 
@@ -713,9 +828,12 @@ def test_same_idempotency_key_with_different_request_rejects_without_handler(
     )
     assert len(calls) == 1
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_failed_attempt_leaves_no_receipt_and_same_key_can_retry(
@@ -763,18 +881,140 @@ def test_failed_attempt_leaves_no_receipt_and_same_key_can_retry(
     )
     with sqlite3.connect(database_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
     accepted = boundary.submit("kanban_comment", attempt_id="attempt-success", **fields)
     assert accepted["result"] == "ACCEPTED"
     assert attempts == ["attempt-failed", "attempt-success"]
     with sqlite3.connect(database_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_audited_rejection_commits_only_safe_audit_without_acceptance_receipt(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    checks = (
+        commands_module.FailedCheck(
+            code="HANDOFF_FIELD_INVALID:artifact_ref",
+            target="artifact_ref",
+            expected="a declared nonblank text value",
+            observed="invalid",
+            accepted_format="nonblank string",
+            remediation="supply the required artifact reference and retry",
+            responsible_actor="session_agent",
+            retry="same_operation",
+        ),
+        commands_module.FailedCheck(
+            code="HANDOFF_FIELD_INVALID:tests_passed",
+            target="tests_passed",
+            expected="a declared boolean value",
+            observed="invalid",
+            accepted_format="true or false",
+            remediation="supply the required test result and retry",
+            responsible_actor="session_agent",
+            retry="same_operation",
+        ),
+    )
+
+    def handler(context):
+        context.connection.execute(
+            "INSERT INTO boundary_probe (value, audit) VALUES (?, ?)",
+            ("rejected-attempt", "field names and reasons only"),
+        )
+        raise commands_module._AuditedMutationRejection(checks)
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_request_review": handler},
+    )
+    result = boundary.submit(
+        "kanban_request_review",
+        attempt_id="attempt-audited-rejection",
+        idempotency_key="idempotency-audited-rejection",
+        target="task-audited-rejection",
+        expected_version=0,
+        session_id="session-audited-rejection",
+        workspace_id=None,
+        execution_context="run-audited-rejection",
+        payload={"task_id": "task-audited-rejection"},
+    )
+
+    assert result["result"] == "REJECTED"
+    assert result["state_changed"] is False
+    assert [finding["code"] for finding in result["failed_checks"]] == [
+        "HANDOFF_FIELD_INVALID:artifact_ref",
+        "HANDOFF_FIELD_INVALID:tests_passed",
+    ]
+    with sqlite3.connect(database_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT audit FROM boundary_probe WHERE value = ?",
+                ("rejected-attempt",),
+            ).fetchone()[0]
+            == "field names and reasons only"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("invalid", "expected_error"),
+    (
+        ([], TypeError),
+        ((), ValueError),
+        (("not-a-failed-check",), TypeError),
+        (["not-a-failed-check"], TypeError),
+    ),
+)
+def test_audited_rejection_requires_nonempty_exact_failed_check_tuple(
+    commands_module,
+    invalid,
+    expected_error,
+):
+    with pytest.raises(expected_error):
+        commands_module._AuditedMutationRejection(invalid)
+
+
+def test_audited_rejection_rejects_failed_check_subclasses(commands_module):
+    class DerivedFailedCheck(commands_module.FailedCheck):
+        pass
+
+    derived = DerivedFailedCheck(
+        code="DERIVED",
+        target="task",
+        expected="base FailedCheck",
+        observed="subclass",
+        accepted_format="base FailedCheck",
+        remediation="use the exact diagnostic type",
+        responsible_actor="system_operator",
+        retry="same_operation",
+    )
+    with pytest.raises(TypeError):
+        commands_module._AuditedMutationRejection((derived,))
 
 
 def test_nonserializable_result_rolls_back_mutation_and_receipt(
@@ -819,9 +1059,12 @@ def test_nonserializable_result_rolls_back_mutation_and_receipt(
     )
     with sqlite3.connect(database_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def _insert_native_task(database_path, task_id: str) -> None:
@@ -897,15 +1140,21 @@ def test_private_adapter_can_dispatch_inside_the_boundary_transaction(
     assert result["result"] == "ACCEPTED"
     assert result["value"]["comment_id"] > 0
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
-            ("task-active-success",),
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
-            "WHERE idempotency_key = ?",
-            ("key-active-success",),
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
+                ("task-active-success",),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
+                "WHERE idempotency_key = ?",
+                ("key-active-success",),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_boundary_failure_rolls_back_native_adapter_write_and_receipt_together(
@@ -957,15 +1206,21 @@ def test_boundary_failure_rolls_back_native_adapter_write_and_receipt_together(
         code="COMMAND_EXECUTION_FAILED",
     )
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
-            ("task-active-rollback",),
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
-            "WHERE idempotency_key = ?",
-            ("key-active-rollback",),
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
+                ("task-active-rollback",),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
+                "WHERE idempotency_key = ?",
+                ("key-active-rollback",),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_active_transaction_entry_rejects_outside_its_exact_boundary_scope(
@@ -986,9 +1241,7 @@ def test_active_transaction_entry_rejects_outside_its_exact_boundary_scope(
         target="task-active-outside",
         expected_version=0,
         canonical_digest=hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
         session_id="session-active-outside",
         workspace_id=None,
@@ -1056,6 +1309,7 @@ def test_all_retained_s2_mutations_use_the_active_boundary_transaction(
 
     monkeypatch.setattr(kb, native_name, native_spy)
     if operation == "kanban_heartbeat":
+
         def claim_spy(*args, **kwargs):
             observed["claim_args"] = args
             observed["claim_kwargs"] = kwargs
@@ -1129,19 +1383,17 @@ def test_active_transaction_operation_allowlist_matches_implemented_mutations(
 ):
     adapter_module = _runtime_modules(commands_module)["private_adapter"]
 
-    assert adapter_module._ACTIVE_TRANSACTION_OPERATIONS == frozenset(
-        {
-            "kanban_create",
-            "kanban_complete",
-            "kanban_block",
-            "kanban_unblock",
-            "kanban_comment",
-            "kanban_heartbeat",
-            "kanban_request_changes",
-            "kanban_request_review",
-            "kanban_link",
-        }
-    )
+    assert adapter_module._ACTIVE_TRANSACTION_OPERATIONS == frozenset({
+        "kanban_create",
+        "kanban_complete",
+        "kanban_block",
+        "kanban_unblock",
+        "kanban_comment",
+        "kanban_heartbeat",
+        "kanban_request_changes",
+        "kanban_request_review",
+        "kanban_link",
+    })
 
 
 @pytest.mark.parametrize(
@@ -1358,6 +1610,129 @@ def test_private_heartbeat_stops_when_exact_claim_cannot_be_extended(
     assert heartbeat_called is False
 
 
+def test_private_complete_composes_inside_boundary_owned_transaction(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _insert_native_task(database_path, "task-complete-active-transaction")
+    cleanup_transaction_states = []
+    monkeypatch.setattr(
+        kb,
+        "_cleanup_workspace",
+        lambda conn, _task_id: cleanup_transaction_states.append(conn.in_transaction),
+    )
+    conn = sqlite3.connect(database_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        binding = modules["capability"].CapabilityBinding(
+            operation="kanban_complete",
+            target="task-complete-active-transaction",
+            expected_version=0,
+            canonical_digest="digest-complete-active",
+            session_id="session-complete-active",
+            workspace_id=None,
+            plugin_version=commands_module.PLUGIN_VERSION,
+            protocol_version=commands_module.PROTOCOL_VERSION,
+            execution_context="test",
+            actor_profile="builder",
+        )
+        capability = provider._mint_after_admission(binding)
+        adapter = provider._create_mutation_executor(conn)
+        with adapter.mutation_transaction(capability, binding):
+            assert (
+                adapter._complete_in_active_transaction(
+                    capability,
+                    binding,
+                    task_id="task-complete-active-transaction",
+                    summary="Atomic completion.",
+                )
+                is True
+            )
+            assert cleanup_transaction_states == []
+        assert cleanup_transaction_states == [False]
+    finally:
+        conn.close()
+
+
+def test_private_complete_rollback_discards_deferred_workspace_cleanup(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-complete-rollback-cleanup"
+    _insert_native_task(database_path, task_id)
+    cleanup_calls = []
+    monkeypatch.setattr(
+        kb,
+        "_cleanup_workspace",
+        lambda _conn, cleaned_task_id: cleanup_calls.append(cleaned_task_id),
+    )
+
+    def handler(context):
+        assert (
+            context.mutation_executor._complete_in_active_transaction(
+                context.capability,
+                context.binding,
+                task_id=task_id,
+                summary="Must roll back after native completion.",
+            )
+            is True
+        )
+        raise RuntimeError("fail after nested completion")
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_complete": handler},
+    )
+    result = boundary.submit(
+        "kanban_complete",
+        attempt_id="attempt-complete-rollback-cleanup",
+        idempotency_key="key-complete-rollback-cleanup",
+        target=task_id,
+        expected_version=0,
+        session_id="session-complete-rollback-cleanup",
+        workspace_id=None,
+        execution_context="test",
+        actor_profile="builder",
+        payload={"task_id": task_id},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_complete",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    assert cleanup_calls == []
+    with sqlite3.connect(database_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == "ready"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def _insert_unified_card(
     database_path,
     *,
@@ -1485,13 +1860,19 @@ def test_block_and_unblock_handlers_mutate_native_and_unified_state(
             (task_id,),
         ).fetchone()
         assert dict(native) == {"status": "ready", "block_kind": "needs_input"}
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()[0] == 2
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 2
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 2
+        )
 
 
 def test_comment_handler_derives_author_and_rejects_reserved_marker(
@@ -1567,13 +1948,19 @@ def test_comment_handler_derives_author_and_rejects_reserved_marker(
                 "body": "Evidence from the active session.",
             }
         ]
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_heartbeat_handler_uses_trusted_claim_and_advances_version(
@@ -1637,10 +2024,13 @@ def test_heartbeat_handler_uses_trusted_claim_and_advances_version(
         ).fetchone()
         assert json.loads(heartbeat["payload"]) == {"note": "still working"}
         assert heartbeat["run_id"] == native["current_run_id"]
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_failed_heartbeat_claim_rolls_back_without_receipt_or_version(
@@ -1682,18 +2072,27 @@ def test_failed_heartbeat_claim_rolls_back_without_receipt_or_version(
         code="COMMAND_EXECUTION_FAILED",
     )
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM task_events "
-            "WHERE task_id = ? AND kind = 'heartbeat'",
-            (task_id,),
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_events "
+                "WHERE task_id = ? AND kind = 'heartbeat'",
+                (task_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_handler_failure_after_native_mutation_rolls_back_every_layer(
@@ -1742,17 +2141,26 @@ def test_handler_failure_after_native_mutation_rolls_back_every_layer(
         code="COMMAND_EXECUTION_FAILED",
     )
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()[0] == "ready"
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == "ready"
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_link_handler_atomically_links_two_unified_task_cards(
@@ -1805,20 +2213,28 @@ def test_link_handler_atomically_links_two_unified_task_cards(
         "child_id": "task-child",
     }
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM task_links "
-            "WHERE parent_id = ? AND child_id = ?",
-            ("task-parent", "task-child"),
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards "
-            "WHERE task_id = 'task-child'"
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
-            "WHERE idempotency_key = ?",
-            ("idempotency-link",),
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_links WHERE parent_id = ? AND child_id = ?",
+                ("task-parent", "task-child"),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards "
+                "WHERE task_id = 'task-child'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
+                "WHERE idempotency_key = ?",
+                ("idempotency-link",),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 @pytest.mark.parametrize("invalid_kind", ("initiative", "legacy"))
@@ -1881,9 +2297,12 @@ def test_link_handler_rejects_non_task_endpoint_without_state_or_receipt(
     )
     with sqlite3.connect(database_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_link_native_nested_transaction_switch_requires_an_exact_bool():
@@ -1940,9 +2359,12 @@ def test_link_binding_target_must_be_the_child(
     )
     with sqlite3.connect(database_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_create_adapter_uses_explicit_identity_and_ready_native_transport(
@@ -2016,11 +2438,14 @@ def test_create_adapter_uses_explicit_identity_and_ready_native_transport(
             "priority": 4,
             "session_id": "session-create-explicit",
         }
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
-            "WHERE idempotency_key = ?",
-            ("idempotency-create-explicit",),
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
+                "WHERE idempotency_key = ?",
+                ("idempotency-create-explicit",),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_create_adapter_rolls_back_native_task_with_boundary_failure(
@@ -2068,13 +2493,19 @@ def test_create_adapter_rolls_back_native_task_with_boundary_failure(
         code="COMMAND_EXECUTION_FAILED",
     )
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE id = ?",
-            ("task-create-rollback",),
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?",
+                ("task-create-rollback",),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_create_adapter_binding_target_must_equal_explicit_task_id(
@@ -2122,10 +2553,13 @@ def test_create_adapter_binding_target_must_equal_explicit_task_id(
         code="COMMAND_EXECUTION_FAILED",
     )
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE id = ?",
-            ("task-create-target",),
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?",
+                ("task-create-target",),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize("invalid", (1, True, "", "   "))
@@ -2235,6 +2669,7 @@ def test_create_handler_atomically_persists_native_and_unified_task_cards(
     assert result["value"] == {
         "initiative_id": "initiative-create",
         "task_id": "task-create-public",
+        "handoff_governed": False,
     }
     with sqlite3.connect(database_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -2259,6 +2694,152 @@ def test_create_handler_atomically_persists_native_and_unified_task_cards(
             "task_id": "task-create-public",
             "title": "Public task creation",
         }
+
+
+def test_create_handler_atomically_fixes_handoff_requirements(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _seed_initiative_card(database_path)
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": commands_module._handle_create},
+        known_profiles={
+            "default",
+            "independent-reviewer",
+            "test-authority-reviewer",
+        },
+    )
+    requirements = {
+        "version": 1,
+        "reviewer": "default",
+        "fields": {
+            "sources_consulted": {"type": "list", "min_items": 1},
+            "recommendation": {
+                "type": "enum",
+                "values": ["DRY", "NOT DRY"],
+            },
+        },
+    }
+    result = _submit_create(
+        boundary,
+        task_id="task-handoff-create",
+        assignee="independent-reviewer",
+        goal_mode=True,
+        handoff_requirements_v1=requirements,
+    )
+    assert result["result"] == "ACCEPTED"
+    assert result["value"]["handoff_governed"] is True
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT h.version, h.execution_profile, h.reviewer, "
+            "h.canonical_payload, c.task_id "
+            "FROM task_handoff_requirements h "
+            "JOIN adrian_kanban_cards c ON c.id = h.task_card_id "
+            "WHERE h.task_id = ?",
+            ("task-handoff-create",),
+        ).fetchone()
+        assert row["version"] == 1
+        assert row["execution_profile"] == "independent-reviewer"
+        assert row["reviewer"] == "default"
+        assert row["task_id"] == "task-handoff-create"
+        assert json.loads(row["canonical_payload"]) == requirements
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"goal_mode": False},
+        {
+            "goal_mode": True,
+            "handoff_requirements_v1": {
+                "version": 1,
+                "reviewer": "missing-profile",
+                "fields": {"evidence": {"type": "text"}},
+            },
+        },
+        {
+            "goal_mode": True,
+            "handoff_requirements_v1": {
+                "version": True,
+                "reviewer": "default",
+                "fields": {},
+            },
+        },
+    ),
+)
+def test_create_handler_rejects_invalid_handoff_without_partial_state(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+    override,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _seed_initiative_card(database_path)
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": commands_module._handle_create},
+        known_profiles={"default", "independent-reviewer"},
+    )
+    payload = {
+        "assignee": "independent-reviewer",
+        "goal_mode": True,
+        "handoff_requirements_v1": {
+            "version": 1,
+            "reviewer": "default",
+            "fields": {"evidence": {"type": "text"}},
+        },
+    }
+    payload.update(override)
+    result = _submit_create(
+        boundary,
+        task_id="task-invalid-handoff",
+        **payload,
+    )
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_create",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'task-invalid-handoff'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_cards "
+                "WHERE task_id = 'task-invalid-handoff'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM task_handoff_requirements").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_create_handler_rejects_missing_canonical_initiative_without_native_task(
@@ -2287,12 +2868,15 @@ def test_create_handler_rejects_missing_canonical_initiative_without_native_task
     )
     with sqlite3.connect(database_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_cards"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM adrian_kanban_cards").fetchone()[0] == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_create_handler_rejects_native_only_parent_dependency_endpoint(
@@ -2328,16 +2912,25 @@ def test_create_handler_rejects_native_only_parent_dependency_endpoint(
         code="COMMAND_EXECUTION_FAILED",
     )
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE id = 'task-create-public'"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM task_links WHERE child_id = 'task-create-public'"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_cards "
-            "WHERE task_id = 'task-create-public'"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'task-create-public'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_links WHERE child_id = 'task-create-public'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_cards "
+                "WHERE task_id = 'task-create-public'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_create_handler_allows_cross_initiative_task_parent(
@@ -2377,10 +2970,13 @@ def test_create_handler_allows_cross_initiative_task_parent(
 
     assert result["result"] == "ACCEPTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM task_links "
-            "WHERE parent_id = 'cross-parent' AND child_id = 'task-create-public'"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_links "
+                "WHERE parent_id = 'cross-parent' AND child_id = 'task-create-public'"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_create_handler_rolls_back_both_identity_levels_on_unified_card_failure(
@@ -2416,16 +3012,25 @@ def test_create_handler_rolls_back_both_identity_levels_on_unified_card_failure(
         code="COMMAND_EXECUTION_FAILED",
     )
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE id = 'task-duplicate-card'"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_cards "
-            "WHERE task_id = 'task-duplicate-card'"
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'task-duplicate-card'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_cards "
+                "WHERE task_id = 'task-duplicate-card'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(
@@ -2468,7 +3073,583 @@ def test_create_handler_rejects_invalid_or_unknown_payload_fields(
     )
     with sqlite3.connect(database_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_cards WHERE card_type = 'task'"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_cards WHERE card_type = 'task'"
+            ).fetchone()[0]
+            == 0
+        )
     assert field
+
+
+_GOVERNED_REQUIREMENTS = {
+    "version": 1,
+    "reviewer": "independent-reviewer",
+    "fields": {
+        "artifact_ref": {"type": "text"},
+        "tests_passed": {"type": "boolean"},
+    },
+}
+
+
+def _seed_governed_running_task(
+    database_path,
+    *,
+    task_id: str,
+    execution_profile: str = "builder",
+    reviewer: str = "independent-reviewer",
+) -> int:
+    _insert_native_task(database_path, task_id)
+    _insert_unified_card(
+        database_path,
+        initiative_id=f"initiative-{task_id}",
+        task_id=task_id,
+        title=f"Governed {task_id}",
+    )
+    run_id = _seed_running_native_task(
+        database_path,
+        task_id,
+        f"{execution_profile}:claim",
+    )
+    requirements = {
+        **_GOVERNED_REQUIREMENTS,
+        "reviewer": reviewer,
+    }
+    with sqlite3.connect(database_path) as conn:
+        card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET assignee = ? WHERE id = ?",
+            (execution_profile, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET profile = ? WHERE id = ?",
+            (execution_profile, run_id),
+        )
+        conn.execute(
+            "INSERT INTO task_handoff_requirements "
+            "(task_card_id, task_id, version, execution_profile, reviewer, "
+            "canonical_payload, created_at) VALUES (?, ?, 1, ?, ?, ?, 1000)",
+            (
+                card_id,
+                task_id,
+                execution_profile,
+                reviewer,
+                json.dumps(requirements, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+    return run_id
+
+
+def _governed_boundary(commands_module, database_path, provider):
+    handler_names = {
+        "kanban_request_review": "_handle_request_review",
+        "kanban_request_changes": "_handle_request_changes",
+        "kanban_complete": "_handle_complete",
+    }
+    return commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            operation: getattr(commands_module, name)
+            for operation, name in handler_names.items()
+            if hasattr(commands_module, name)
+        },
+        known_profiles={"builder", "independent-reviewer"},
+    )
+
+
+def _submit_governed(
+    boundary,
+    *,
+    operation: str,
+    task_id: str,
+    actor_profile: str,
+    expected_version: int,
+    payload: dict,
+    suffix: str,
+):
+    return boundary.submit(
+        operation,
+        attempt_id=f"attempt-{suffix}",
+        idempotency_key=f"idempotency-{suffix}",
+        target=task_id,
+        expected_version=expected_version,
+        session_id=f"session-{actor_profile}",
+        workspace_id=None,
+        execution_context="model-tool",
+        actor_profile=actor_profile,
+        payload={"task_id": task_id, "board": "orchestrator", **payload},
+    )
+
+
+def _claim_governed_review(database_path, task_id: str) -> int:
+    with sqlite3.connect(database_path) as conn:
+        run = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, claim_lock, claim_expires, started_at) "
+            "VALUES (?, 'independent-reviewer', 'running', "
+            "'independent-reviewer:claim', 2000, 1100)",
+            (task_id,),
+        )
+        run_id = int(run.lastrowid)
+        conn.execute(
+            "UPDATE tasks SET status = 'running', current_run_id = ?, "
+            "claim_lock = 'independent-reviewer:claim', claim_expires = 2000, "
+            "assignee = 'independent-reviewer' WHERE id = ?",
+            (run_id, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'claimed', ?, 1100)",
+            (task_id, run_id, '{"source_status":"review"}'),
+        )
+    return run_id
+
+
+def test_governed_request_review_admits_candidate_and_routes_fixed_reviewer(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-governed-review"
+    execution_run_id = _seed_governed_running_task(
+        database_path,
+        task_id=task_id,
+    )
+    boundary = _governed_boundary(commands_module, database_path, provider)
+    metadata = {
+        "artifact_ref": "artifacts/change-set.md",
+        "tests_passed": True,
+        "extra_evidence": ["pytest"],
+    }
+
+    result = _submit_governed(
+        boundary,
+        operation="kanban_request_review",
+        task_id=task_id,
+        actor_profile="builder",
+        expected_version=0,
+        payload={
+            "summary": "Implementation and tests are ready.",
+            "reviewer": "independent-reviewer",
+            "metadata": metadata,
+        },
+        suffix="governed-review",
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"]["task_id"] == task_id
+    assert result["value"]["reviewer"] == "independent-reviewer"
+    assert result["value"]["candidate_id"]
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        task = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert dict(task) == {
+            "status": "review",
+            "assignee": "independent-reviewer",
+            "current_run_id": None,
+        }
+        candidate = conn.execute(
+            "SELECT candidate_id, execution_run_id, reviewer, summary, "
+            "metadata_json, submitted_by FROM task_candidate_handoffs "
+            "WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert candidate["candidate_id"] == result["value"]["candidate_id"]
+        assert candidate["execution_run_id"] == execution_run_id
+        assert candidate["reviewer"] == "independent-reviewer"
+        assert candidate["summary"] == "Implementation and tests are ready."
+        assert json.loads(candidate["metadata_json"]) == metadata
+        assert candidate["submitted_by"] == "builder"
+        assert (
+            conn.execute(
+                "SELECT outcome FROM task_runs WHERE id = ?",
+                (execution_run_id,),
+            ).fetchone()[0]
+            == "review_requested"
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_invalid_governed_handoff_audits_fields_without_values_or_state_change(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-invalid-handoff"
+    execution_run_id = _seed_governed_running_task(
+        database_path,
+        task_id=task_id,
+    )
+    boundary = _governed_boundary(commands_module, database_path, provider)
+
+    result = _submit_governed(
+        boundary,
+        operation="kanban_request_review",
+        task_id=task_id,
+        actor_profile="builder",
+        expected_version=0,
+        payload={
+            "summary": "Candidate with malformed metadata.",
+            "metadata": {
+                "artifact_ref": "   ",
+                "secret_extra": "DO_NOT_PERSIST_THIS_VALUE",
+            },
+        },
+        suffix="invalid-handoff",
+    )
+
+    assert result["result"] == "REJECTED"
+    assert [item["target"] for item in result["failed_checks"]] == [
+        "artifact_ref",
+        "tests_passed",
+    ]
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        task = conn.execute(
+            "SELECT status, assignee, current_run_id, claim_lock "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert dict(task) == {
+            "status": "running",
+            "assignee": "builder",
+            "current_run_id": execution_run_id,
+            "claim_lock": "builder:claim",
+        }
+        run = conn.execute(
+            "SELECT ended_at, outcome, summary, metadata FROM task_runs WHERE id = ?",
+            (execution_run_id,),
+        ).fetchone()
+        assert tuple(run) == (None, None, None, None)
+        audit = conn.execute(
+            "SELECT findings_json, submitted_by FROM task_handoff_rejections "
+            "WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert audit["submitted_by"] == "builder"
+        assert "DO_NOT_PERSIST_THIS_VALUE" not in audit["findings_json"]
+        assert json.loads(audit["findings_json"]) == [
+            {"field": "artifact_ref", "reason": "must be a nonblank string"},
+            {"field": "tests_passed", "reason": "is required"},
+        ]
+        assert (
+            conn.execute("SELECT COUNT(*) FROM task_candidate_handoffs").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_governed_request_changes_returns_same_card_to_execution_profile(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-governed-changes"
+    _seed_governed_running_task(database_path, task_id=task_id)
+    boundary = _governed_boundary(commands_module, database_path, provider)
+    admitted = _submit_governed(
+        boundary,
+        operation="kanban_request_review",
+        task_id=task_id,
+        actor_profile="builder",
+        expected_version=0,
+        payload={
+            "summary": "Ready for review.",
+            "metadata": {
+                "artifact_ref": "artifact.md",
+                "tests_passed": True,
+            },
+        },
+        suffix="changes-admit",
+    )
+    assert admitted["result"] == "ACCEPTED"
+    review_run_id = _claim_governed_review(database_path, task_id)
+
+    result = _submit_governed(
+        boundary,
+        operation="kanban_request_changes",
+        task_id=task_id,
+        actor_profile="independent-reviewer",
+        expected_version=1,
+        payload={"reason": "Add the missing rollback regression."},
+        suffix="changes-return",
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {
+        "task_id": task_id,
+        "execution_profile": "builder",
+    }
+    with sqlite3.connect(database_path) as conn:
+        task = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert task == ("ready", "builder", None)
+        assert (
+            conn.execute(
+                "SELECT outcome FROM task_runs WHERE id = ?",
+                (review_run_id,),
+            ).fetchone()[0]
+            == "changes_requested"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_candidate_handoffs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM task_reviewer_verdicts WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 2
+        )
+
+
+def test_governed_reviewer_completion_accepts_latest_candidate_immutably(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-governed-complete"
+    _seed_governed_running_task(database_path, task_id=task_id)
+    boundary = _governed_boundary(commands_module, database_path, provider)
+    admitted = _submit_governed(
+        boundary,
+        operation="kanban_request_review",
+        task_id=task_id,
+        actor_profile="builder",
+        expected_version=0,
+        payload={
+            "summary": "Ready for acceptance.",
+            "metadata": {
+                "artifact_ref": "artifact.md",
+                "tests_passed": True,
+            },
+        },
+        suffix="complete-admit",
+    )
+    candidate_id = admitted["value"]["candidate_id"]
+    review_run_id = _claim_governed_review(database_path, task_id)
+
+    result = _submit_governed(
+        boundary,
+        operation="kanban_complete",
+        task_id=task_id,
+        actor_profile="independent-reviewer",
+        expected_version=1,
+        payload={
+            "summary": "Accepted after independent verification.",
+            "result": "accepted",
+            "metadata": {"review_evidence": "tests/review.txt"},
+            "artifacts": ["artifacts/review-report.md"],
+        },
+        suffix="complete-accept",
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {
+        "task_id": task_id,
+        "accepted_candidate_id": candidate_id,
+    }
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        assert (
+            conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == "done"
+        )
+        verdict = conn.execute(
+            "SELECT candidate_id, review_run_id, reviewer, verdict, summary "
+            "FROM task_reviewer_verdicts WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert dict(verdict) == {
+            "candidate_id": candidate_id,
+            "review_run_id": review_run_id,
+            "reviewer": "independent-reviewer",
+            "verdict": "accepted",
+            "summary": "Accepted after independent verification.",
+        }
+        run_metadata = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (review_run_id,),
+        ).fetchone()[0]
+        assert json.loads(run_metadata) == {
+            "artifacts": ["artifacts/review-report.md"],
+            "review_evidence": "tests/review.txt",
+        }
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 2
+        )
+
+
+def test_governed_direct_completion_outside_review_is_rejected_without_state_change(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-governed-bypass"
+    execution_run_id = _seed_governed_running_task(
+        database_path,
+        task_id=task_id,
+    )
+    boundary = _governed_boundary(commands_module, database_path, provider)
+
+    result = _submit_governed(
+        boundary,
+        operation="kanban_complete",
+        task_id=task_id,
+        actor_profile="builder",
+        expected_version=0,
+        payload={"summary": "Attempted direct completion."},
+        suffix="complete-bypass",
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_complete",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone() == ("running", execution_run_id)
+        assert (
+            conn.execute("SELECT COUNT(*) FROM task_reviewer_verdicts").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_ordinary_task_retains_direct_native_completion_without_handoff_verdict(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    task_id = "task-ordinary-complete"
+    _insert_native_task(database_path, task_id)
+    _insert_unified_card(
+        database_path,
+        initiative_id="initiative-ordinary-complete",
+        task_id=task_id,
+        title="Ordinary completion",
+    )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_complete": commands_module._handle_complete},
+        known_profiles={"builder", "independent-reviewer"},
+    )
+
+    result = _submit_governed(
+        boundary,
+        operation="kanban_complete",
+        task_id=task_id,
+        actor_profile="builder",
+        expected_version=0,
+        payload={"summary": "Ordinary task done."},
+        suffix="ordinary-complete",
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {
+        "task_id": task_id,
+        "accepted_candidate_id": None,
+    }
+    with sqlite3.connect(database_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            == "done"
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM task_reviewer_verdicts").fetchone()[0]
+            == 0
+        )

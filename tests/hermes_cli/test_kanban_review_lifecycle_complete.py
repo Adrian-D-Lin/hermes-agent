@@ -24,7 +24,8 @@ from hermes_cli import kanban_diagnostics as kd
 def conn(tmp_path: Path):
     db = kb.connect(tmp_path / "kanban.db")
     try:
-        yield db
+        with kb._scoped_mutation_authority("dispatcher_orchestrator"):
+            yield db
     finally:
         db.close()
 

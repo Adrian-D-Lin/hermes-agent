@@ -60,7 +60,7 @@ class ModelToolBoardResolver:
         operation: str,
         public_args: dict[str, Any],
         runtime_fields: dict[str, Any],
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, str]:
         if not isinstance(operation, str) or not operation.strip():
             raise RouteResolutionRejected("operation must be a nonblank string")
         if type(public_args) is not dict or type(runtime_fields) is not dict:
@@ -82,6 +82,12 @@ class ModelToolBoardResolver:
             ) from exc
         if binding is None:
             raise RouteResolutionRejected("no active binding for session")
+        actor_profile = getattr(binding, "profile", None)
+        if not (type(actor_profile) is str and actor_profile.strip()):
+            raise RouteResolutionRejected(
+                "binding profile must be a nonblank string"
+            )
+        actor_profile = actor_profile.strip()
         worktree_path = getattr(binding, "worktree_path", None)
         if not isinstance(worktree_path, str) or not worktree_path.strip():
             raise RouteResolutionRejected(
@@ -219,7 +225,7 @@ class ModelToolBoardResolver:
                     f"failed to query lifecycle workspace: {exc}"
                 ) from exc
 
-        return resolved_board, workspace_id
+        return resolved_board, workspace_id, actor_profile
 
 
 def resolve_expected_version(

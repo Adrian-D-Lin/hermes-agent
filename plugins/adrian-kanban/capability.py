@@ -24,6 +24,7 @@ class CapabilityBinding:
     plugin_version: str
     protocol_version: str
     execution_context: str
+    actor_profile: Optional[str] = None
 
     def __post_init__(self):
         required_strings = [
@@ -49,6 +50,10 @@ class CapabilityBinding:
         if self.workspace_id is not None:
             if not isinstance(self.workspace_id, str) or not self.workspace_id.strip():
                 raise CapabilityRejected("invalid workspace_id")
+        if self.actor_profile is not None and not (
+            type(self.actor_profile) is str and self.actor_profile.strip()
+        ):
+            raise CapabilityRejected("invalid actor_profile")
 
 
 _CAPABILITY_MINT = object()

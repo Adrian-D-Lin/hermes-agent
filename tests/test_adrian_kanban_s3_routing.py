@@ -80,6 +80,7 @@ def test_project_binding_precedes_default_workdir_route(
     binding = SimpleNamespace(
         project="project-1",
         board="orchestrator",
+        profile="default",
         worktree_path=str(tmp_path),
         producer="confirm_binding",
     )
@@ -94,7 +95,7 @@ def test_project_binding_precedes_default_workdir_route(
         "kanban_create",
         {"task_id": "task-1", "project": "orchestrator-project"},
         {"session_id": "session-1"},
-    ) == ("orchestrator", None)
+    ) == ("orchestrator", None, "default")
 
 
 def test_unique_exact_default_workdir_is_fallback_and_ambiguity_rejects(
@@ -113,6 +114,7 @@ def test_unique_exact_default_workdir_is_fallback_and_ambiguity_rejects(
     binding = SimpleNamespace(
         project=None,
         board=None,
+        profile="default",
         worktree_path=str(tmp_path),
         producer="confirm_binding",
     )
@@ -134,7 +136,7 @@ def test_unique_exact_default_workdir_is_fallback_and_ambiguity_rejects(
 
     assert one(
         "kanban_list", {}, {"session_id": "session-1"}
-    ) == ("orchestrator", None)
+    ) == ("orchestrator", None, "default")
     with pytest.raises(
         routing.RouteResolutionRejected,
         match="multiple boards",
@@ -151,6 +153,7 @@ def test_dispatcher_binding_is_pinned_and_public_project_cannot_be_forged(
     binding = SimpleNamespace(
         project="project-1",
         board="orchestrator",
+        profile="builder-tester",
         worktree_path=str(tmp_path),
         producer="dispatcher",
     )
@@ -160,7 +163,7 @@ def test_dispatcher_binding_is_pinned_and_public_project_cannot_be_forged(
         "kanban_heartbeat",
         {"task_id": "task-1"},
         {"session_id": "session-1"},
-    ) == ("orchestrator", None)
+    ) == ("orchestrator", None, "builder-tester")
     with pytest.raises(
         routing.RouteResolutionRejected,
         match="cannot verify public project",
@@ -209,6 +212,7 @@ def test_task_contract_supplies_logical_workspace_without_path_inference(
     binding = SimpleNamespace(
         project=None,
         board="orchestrator",
+        profile="builder-tester",
         worktree_path=str(tmp_path),
         producer="dispatcher",
     )
@@ -218,7 +222,32 @@ def test_task_contract_supplies_logical_workspace_without_path_inference(
         "kanban_heartbeat",
         {"task_id": "task-1"},
         {"session_id": "session-1"},
-    ) == ("orchestrator", "workspace-S1")
+    ) == ("orchestrator", "workspace-S1", "builder-tester")
+
+
+def test_route_rejects_a_binding_without_a_trusted_profile(
+    routing_modules,
+    tmp_path,
+):
+    routing = routing_modules["routing"]
+    database_path = _database(tmp_path, routing_modules["schema"])
+    binding = SimpleNamespace(
+        project=None,
+        board="orchestrator",
+        profile=None,
+        worktree_path=str(tmp_path),
+        producer="dispatcher",
+    )
+    resolver = _resolver(routing, database_path, binding)
+    with pytest.raises(
+        routing.RouteResolutionRejected,
+        match="profile must be a nonblank string",
+    ):
+        resolver(
+            "kanban_heartbeat",
+            {"task_id": "task-1"},
+            {"session_id": "session-1", "profile": "forged"},
+        )
 
 
 def test_expected_version_uses_unified_card_and_canonical_board(

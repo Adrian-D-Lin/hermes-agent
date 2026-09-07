@@ -36,7 +36,8 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
-    return home
+    with kb._scoped_mutation_authority("dispatcher_orchestrator"):
+        yield home
 
 
 def _row(conn, tid):

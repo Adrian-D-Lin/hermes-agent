@@ -104,6 +104,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_adrian_kanban_cards_task
 CREATE UNIQUE INDEX IF NOT EXISTS uq_adrian_kanban_cards_id_initiative
     ON adrian_kanban_cards (id, initiative_id);
 
+-- Composite parent key used by immutable task-owned metadata. ``id`` is
+-- already unique; retaining ``task_id`` in the key makes accidental metadata
+-- attachment to the wrong unified task identity fail at the FK boundary.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_adrian_kanban_cards_id_task
+    ON adrian_kanban_cards (id, task_id);
+
 -- Initiative transition log. ``transition_id`` is the plugin-owned monotonic
 -- identifier; it starts at the first transition (no ``previous_transition_id``
 -- seed) and every later row names the current accepted predecessor transition.
@@ -318,6 +324,103 @@ CREATE TABLE IF NOT EXISTS adrian_kanban_command_receipts (
     request_digest TEXT NOT NULL,
     response_json TEXT NOT NULL,
     created_at INTEGER NOT NULL
+);
+
+-- Immutable task-input manifest. Historical and human-created ordinary tasks
+-- may have no manifest; an admitted agent/automation source-dependent task has
+-- exactly one manifest with one or more child entries.
+CREATE TABLE IF NOT EXISTS task_input_manifests (
+    task_card_id INTEGER PRIMARY KEY NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
+    canonical_payload TEXT NOT NULL,
+    declared_inputs_accessible INTEGER NOT NULL
+        CHECK (declared_inputs_accessible IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    UNIQUE (task_card_id, task_id),
+    FOREIGN KEY (task_card_id, task_id)
+        REFERENCES adrian_kanban_cards (id, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_input_entries (
+    task_card_id INTEGER NOT NULL,
+    task_id TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    source_kind TEXT NOT NULL
+        CHECK (source_kind IN ('git_commit', 'snapshot_attachment')),
+    source_locator TEXT NOT NULL,
+    context_guidance TEXT NOT NULL,
+    PRIMARY KEY (task_card_id, workspace_path),
+    FOREIGN KEY (task_card_id, task_id)
+        REFERENCES task_input_manifests (task_card_id, task_id)
+);
+
+-- Nullable, immutable one-per-task declaration governing the same-card review
+-- route. Absence means the ordinary task retains native completion behavior.
+CREATE TABLE IF NOT EXISTS task_handoff_requirements (
+    task_card_id INTEGER PRIMARY KEY NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
+    version INTEGER NOT NULL CHECK (version = 1),
+    execution_profile TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    canonical_payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (task_card_id, task_id)
+        REFERENCES adrian_kanban_cards (id, task_id)
+);
+
+-- Each structurally admitted review request is one immutable candidate tied
+-- to the exact execution run it ended. Rework produces a new candidate row.
+CREATE TABLE IF NOT EXISTS task_candidate_handoffs (
+    candidate_id TEXT PRIMARY KEY NOT NULL,
+    task_card_id INTEGER NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_run_id INTEGER NOT NULL UNIQUE,
+    reviewer TEXT NOT NULL,
+    summary TEXT,
+    metadata_json TEXT NOT NULL,
+    submitted_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (task_card_id, candidate_id),
+    FOREIGN KEY (task_card_id, task_id)
+        REFERENCES adrian_kanban_cards (id, task_id),
+    FOREIGN KEY (execution_run_id) REFERENCES task_runs (id)
+);
+
+-- Append-only diagnostic log for malformed governed review submissions.
+-- Records only safe structural metadata and canonical field names; never
+-- stores caller-submitted values.
+CREATE TABLE IF NOT EXISTS task_handoff_rejections (
+    rejection_id TEXT PRIMARY KEY NOT NULL,
+    task_card_id INTEGER NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_run_id INTEGER NOT NULL,
+    attempt_id TEXT NOT NULL,
+    submitted_by TEXT NOT NULL,
+    findings_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (task_card_id, task_id)
+        REFERENCES adrian_kanban_cards (id, task_id),
+    FOREIGN KEY (execution_run_id) REFERENCES task_runs (id)
+);
+
+-- Reviewer acceptance is immutable and claim-scoped. A task can have several
+-- rejected candidates but only the accepted candidate receives this verdict.
+CREATE TABLE IF NOT EXISTS task_reviewer_verdicts (
+    verdict_id TEXT PRIMARY KEY NOT NULL,
+    task_card_id INTEGER NOT NULL,
+    task_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL UNIQUE,
+    review_run_id INTEGER NOT NULL UNIQUE,
+    reviewer TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict = 'accepted'),
+    summary TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (task_card_id, task_id)
+        REFERENCES adrian_kanban_cards (id, task_id),
+    FOREIGN KEY (task_card_id, candidate_id)
+        REFERENCES task_candidate_handoffs (task_card_id, candidate_id),
+    FOREIGN KEY (review_run_id) REFERENCES task_runs (id)
 );
 """
 
