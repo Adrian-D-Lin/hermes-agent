@@ -59,6 +59,817 @@ RECOGNIZED_OPERATIONS = (
     READ_ONLY_OPERATIONS | ORDINARY_TASK_OPERATIONS | INITIATIVE_OPERATIONS
 )
 
+TOOL_SCHEMAS: dict[str, Any] = {
+    "kanban_show": {
+        "name": "kanban_show",
+        "description": (
+            "Read a single kanban task by its immutable identifier."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to show.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the read.",
+                },
+            },
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_list": {
+        "name": "kanban_list",
+        "description": (
+            "List kanban tasks within a scope without mutating state."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "initiative_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional initiative scope to list tasks within."
+                    ),
+                },
+                "assignee": {
+                    "type": "string",
+                    "description": "Optional assignee filter.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Optional status filter.",
+                },
+                "tenant": {
+                    "type": "string",
+                    "description": "Optional tenant scope.",
+                },
+                "include_archived": {
+                    "type": "boolean",
+                    "description": (
+                        "Optional flag to include archived tasks."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional maximum number of tasks to return.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the read.",
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_attachments": {
+        "name": "kanban_attachments",
+        "description": (
+            "Read the attachments associated with a kanban task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to inspect.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the read.",
+                },
+            },
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_create": {
+        "name": "kanban_create",
+        "description": (
+            "Create a new ordinary kanban task at both identity levels."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the new task.",
+                },
+                "initiative_id": {
+                    "type": "string",
+                    "description": "Initiative the new task belongs to.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Human-readable task title.",
+                },
+                "assignee": {
+                    "type": "string",
+                    "description": "Assignee responsible for the task.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Free-form task body or rationale.",
+                },
+                "parents": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional parent task identifiers.",
+                },
+                "tenant": {
+                    "type": "string",
+                    "description": "Optional tenant scope.",
+                },
+                "priority": {
+                    "type": "integer",
+                    "description": "Optional task priority.",
+                },
+                "workspace_kind": {
+                    "type": "string",
+                    "enum": ["scratch", "dir", "worktree"],
+                    "description": "Optional workspace kind.",
+                },
+                "workspace_path": {
+                    "type": "string",
+                    "description": "Optional workspace path.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Optional project reference.",
+                },
+                "goal_mode": {
+                    "type": "boolean",
+                    "description": "Optional goal mode.",
+                },
+                "goal_max_turns": {
+                    "type": "integer",
+                    "description": "Optional maximum goal turns.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model reference.",
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "Optional provider reference.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": [
+                "task_id",
+                "initiative_id",
+                "title",
+                "assignee",
+                "idempotency_key",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_complete": {
+        "name": "kanban_complete",
+        "description": (
+            "Mark an ordinary kanban task as complete."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to complete.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional completion summary.",
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Optional completion metadata.",
+                },
+                "result": {
+                    "type": "string",
+                    "description": "Optional completion result.",
+                },
+                "created_cards": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional created card references.",
+                },
+                "artifacts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional completion artifacts.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_block": {
+        "name": "kanban_block",
+        "description": (
+            "Block an ordinary kanban task, halting its forward progress."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to block.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Reason for blocking the task.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "dependency",
+                        "needs_input",
+                        "capability",
+                        "transient",
+                    ],
+                    "description": "Kind of block to apply.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "reason", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_unblock": {
+        "name": "kanban_unblock",
+        "description": (
+            "Unblock an ordinary kanban task, resuming its forward progress."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to unblock.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_comment": {
+        "name": "kanban_comment",
+        "description": (
+            "Attach a comment to an ordinary kanban task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to comment on.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Comment body text.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "body", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_link": {
+        "name": "kanban_link",
+        "description": (
+            "Link an ordinary kanban task to external references."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "parent_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the parent task.",
+                },
+                "child_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the child task.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["parent_id", "child_id", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_heartbeat": {
+        "name": "kanban_heartbeat",
+        "description": (
+            "Send a heartbeat for an ordinary kanban task to signal liveness."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to heartbeat.",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Optional heartbeat note.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_attach": {
+        "name": "kanban_attach",
+        "description": (
+            "Attach a local artifact to an ordinary kanban task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to attach to.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Filename of the local artifact.",
+                },
+                "content_base64": {
+                    "type": "string",
+                    "description": "Base64-encoded artifact content.",
+                },
+                "content_type": {
+                    "type": "string",
+                    "description": "MIME content type of the artifact.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "filename", "content_base64", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_attach_url": {
+        "name": "kanban_attach_url",
+        "description": (
+            "Attach a remote URL to an ordinary kanban task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to attach to.",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Remote URL to attach.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Optional filename for the remote artifact.",
+                },
+                "content_type": {
+                    "type": "string",
+                    "description": "Optional MIME content type of the artifact.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "url", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_request_changes": {
+        "name": "kanban_request_changes",
+        "description": (
+            "Request changes to an ordinary kanban task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to revise.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Reason requesting the changes.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "reason", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_request_review": {
+        "name": "kanban_request_review",
+        "description": (
+            "Request a review of an ordinary kanban task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the task to review.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional review summary.",
+                },
+                "reviewer": {
+                    "type": "string",
+                    "description": "Optional reviewer reference.",
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Optional review metadata.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": ["task_id", "summary", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_create_initiative": {
+        "name": "kanban_create_initiative",
+        "description": (
+            "Create a new kanban initiative."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "initiative_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the new initiative.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Human-readable initiative title.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Free-form initiative body or rationale.",
+                },
+                "approval_id": {
+                    "type": "string",
+                    "description": "Approval reference authorizing creation.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": [
+                "initiative_id",
+                "title",
+                "body",
+                "approval_id",
+                "idempotency_key",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_update_initiative": {
+        "name": "kanban_update_initiative",
+        "description": (
+            "Update an existing kanban initiative."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "initiative_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the initiative to update.",
+                },
+                "update_kind": {
+                    "type": "string",
+                    "description": "Kind of update to apply to the initiative.",
+                },
+                "update": {
+                    "type": "object",
+                    "description": "Update payload describing the change.",
+                },
+                "approval_id": {
+                    "type": "string",
+                    "description": "Approval reference authorizing the update.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": [
+                "initiative_id",
+                "update_kind",
+                "update",
+                "approval_id",
+                "idempotency_key",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_transition_initiative": {
+        "name": "kanban_transition_initiative",
+        "description": (
+            "Transition an existing kanban initiative to a new phase."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "initiative_id": {
+                    "type": "string",
+                    "description": (
+                        "Immutable identifier of the initiative to transition."
+                    ),
+                },
+                "to_phase": {
+                    "type": "string",
+                    "description": "Target phase for the initiative.",
+                },
+                "reconciliation_ref": {
+                    "type": "string",
+                    "description": (
+                        "Reconciliation reference backing the transition."
+                    ),
+                },
+                "approval_id": {
+                    "type": "string",
+                    "description": "Approval reference authorizing the transition.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": [
+                "initiative_id",
+                "to_phase",
+                "reconciliation_ref",
+                "approval_id",
+                "idempotency_key",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    "kanban_close_initiative": {
+        "name": "kanban_close_initiative",
+        "description": (
+            "Close an existing kanban initiative."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "initiative_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the initiative to close.",
+                },
+                "closure_result_ref": {
+                    "type": "string",
+                    "description": (
+                        "Reference describing the closure outcome."
+                    ),
+                },
+                "approval_id": {
+                    "type": "string",
+                    "description": "Approval reference authorizing closure.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Caller-supplied key guaranteeing safe replay."
+                    ),
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Optional caller attempt identifier.",
+                },
+                "board": {
+                    "type": "string",
+                    "description": "Optional board scope for the write.",
+                },
+            },
+            "required": [
+                "initiative_id",
+                "closure_result_ref",
+                "approval_id",
+                "idempotency_key",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
+
+TOOL_SCHEMAS = MappingProxyType(dict(TOOL_SCHEMAS))
+
+
+def register_public_tools(ctx: Any, boundary: Any) -> None:
+    """Register the 18 ratified public model-tools on the given toolset.
+
+    Each tool is bound to a distinct handler closure that delegates to the
+    injected boundary's ``submit`` for its fixed operation. The boundary is
+    captured only by construction-time closures; no module-global state is
+    stored.
+    """
+
+    def _make_handler(operation: str):
+        def _handler(args: dict[str, Any], **_runtime_fields: Any) -> str:
+            copied = dict(args)
+            result = boundary.submit(operation, **copied)
+            return json.dumps(result, sort_keys=True, separators=(",", ":"))
+
+        return _handler
+
+    for operation, schema in TOOL_SCHEMAS.items():
+        ctx.register_tool(
+            name=operation,
+            toolset="kanban",
+            schema=schema,
+            handler=_make_handler(operation),
+            description=schema["description"],
+            override=True,
+            is_async=False,
+        )
+
 _UNRECOGNIZED_OPERATION = "UNRECOGNIZED_OPERATION"
 _COMMAND_BOUNDARY_UNAVAILABLE = "COMMAND_BOUNDARY_UNAVAILABLE"
 _OPERATION_NOT_IMPLEMENTED = "OPERATION_NOT_IMPLEMENTED"
