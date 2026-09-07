@@ -9,6 +9,7 @@ import inspect
 import json
 import pickle
 import sqlite3
+import subprocess
 import sys
 import threading
 from dataclasses import FrozenInstanceError, replace
@@ -70,6 +71,7 @@ def provider_modules():
         "private_adapter": importlib.import_module(f"{name}.private_adapter"),
         "provider": importlib.import_module(f"{name}.provider"),
         "schema": importlib.import_module(f"{name}.schema"),
+        "workspace": importlib.import_module(f"{name}.workspace"),
     }
     yield modules
     for module_name in tuple(sys.modules):
@@ -1160,6 +1162,325 @@ def test_journal_module_has_no_side_effect_or_mutating_sql_surface(provider_modu
     assert ".rollback(" not in source
     assert "UPDATE external_operation_journal" not in source
     assert "DELETE FROM external_operation_journal" not in source
+
+
+def _git(cwd, *args):
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr or result.stdout)
+    return result.stdout.strip()
+
+
+def _disposable_repository(tmp_path):
+    repository = tmp_path / "repository"
+    remote = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    _git(repository, "config", "user.name", "S2 Test")
+    _git(repository, "config", "user.email", "s2@example.invalid")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "base")
+    _git(repository, "remote", "add", "origin", str(remote))
+    _git(repository, "push", "-u", "origin", "main")
+    return repository.resolve(), _git(repository, "rev-parse", "HEAD")
+
+
+def _workspace_plan(provider_modules, tmp_path):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository, base_sha = _disposable_repository(tmp_path)
+    conn.execute(
+        "UPDATE segment_workspace_members SET required_base_sha = ? "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (base_sha, "workspace-1", "repo-1"),
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                repository_identity="repo-1",
+                repository_root=str(repository),
+                controlled_worktree_root=str(repository / ".segment-worktrees"),
+            ),
+        )
+    )
+    controller = workspace_mod._SegmentWorkspaceController(conn, registry)
+    plan = controller.load(
+        workspace_id="workspace-1",
+        expected_initiative_id="initiative-1",
+        expected_segment_id="S1",
+        expected_controller_binding="controller-1",
+    )
+    return conn, repository, base_sha, plan
+
+
+def test_workspace_plan_uses_only_registry_root_and_stored_relative_member(
+    provider_modules, tmp_path
+):
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+
+    assert plan.workspace_id == "workspace-1"
+    assert plan.initiative_id == "initiative-1"
+    assert plan.segment_id == "S1"
+    assert len(plan.members) == 1
+    member = plan.members[0]
+    assert member.repository_root == str(repository)
+    assert member.target_path == str(
+        (repository / ".segment-worktrees" / "initiative-1/S1/repo-1").resolve()
+    )
+    assert member.required_base_sha == base_sha
+    conn.close()
+
+
+def test_workspace_plan_rejects_escape_missing_registry_and_binding_mismatch(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository, _ = _disposable_repository(tmp_path)
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1",
+                str(repository),
+                str(repository / ".segment-worktrees"),
+            ),
+        )
+    )
+    controller = workspace_mod._SegmentWorkspaceController(conn, registry)
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="controller"):
+        controller.load(
+            workspace_id="workspace-1",
+            expected_initiative_id="initiative-1",
+            expected_segment_id="S1",
+            expected_controller_binding="wrong-controller",
+        )
+
+    conn.execute(
+        "UPDATE segment_workspace_members SET relative_path = '../escape' "
+        "WHERE workspace_id = 'workspace-1' AND repository_identity = 'repo-1'"
+    )
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="relative path"):
+        controller.load(
+            workspace_id="workspace-1",
+            expected_initiative_id="initiative-1",
+            expected_segment_id="S1",
+            expected_controller_binding="controller-1",
+        )
+
+    empty_registry = workspace_mod._TrustedRepositoryRegistry(())
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="registry"):
+        workspace_mod._SegmentWorkspaceController(conn, empty_registry).load(
+            workspace_id="workspace-1",
+            expected_initiative_id="initiative-1",
+            expected_segment_id="S1",
+            expected_controller_binding="controller-1",
+        )
+    conn.close()
+
+
+def test_workspace_materialization_and_verification_use_exact_branch_and_base(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+
+    initial = executor.materialize(member)
+    assert initial.ready is True
+    assert initial.branch_matches is True
+    assert initial.base_contained is True
+    assert initial.observed_head == base_sha
+
+    target = Path(member.target_path)
+    (target / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(target, "add", "feature.txt")
+    _git(target, "commit", "-m", "feature")
+    advanced = executor.verify(member)
+    assert advanced.ready is True
+    assert advanced.observed_head != base_sha
+    assert advanced.base_contained is True
+
+    _git(target, "checkout", "-b", "wrong-branch")
+    wrong_branch = executor.verify(member)
+    assert wrong_branch.ready is False
+    assert wrong_branch.branch_matches is False
+    assert "branch_mismatch" in wrong_branch.failures
+    conn.close()
+
+
+def test_workspace_materialization_rejects_stale_origin_main(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = replace(plan.members[0], required_base_sha="d" * 40)
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="origin/main"):
+        workspace_mod._GitWorkspaceExecutor().materialize(member)
+    assert not Path(member.target_path).exists()
+    assert _git(repository, "status", "--porcelain") == ""
+    conn.close()
+
+
+def test_workspace_materialization_never_repairs_an_existing_invalid_target(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    target = Path(member.target_path)
+    _git(target, "checkout", "-b", "wrong-branch")
+    before = (
+        _git(target, "symbolic-ref", "--short", "HEAD"),
+        _git(target, "rev-parse", "HEAD"),
+        _git(target, "status", "--porcelain"),
+    )
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="existing target"):
+        executor.materialize(member)
+
+    assert (
+        _git(target, "symbolic-ref", "--short", "HEAD"),
+        _git(target, "rev-parse", "HEAD"),
+        _git(target, "status", "--porcelain"),
+    ) == before
+    conn.close()
+
+
+def test_workspace_verification_is_read_only(provider_modules, tmp_path):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    target = Path(member.target_path)
+    (target / "untracked.txt").write_text("unchanged\n", encoding="utf-8")
+    before = (
+        _git(repository, "status", "--porcelain"),
+        _git(repository, "rev-parse", "HEAD"),
+        _git(target, "status", "--porcelain"),
+        _git(target, "rev-parse", "HEAD"),
+        _git(target, "symbolic-ref", "--short", "HEAD"),
+    )
+
+    assert executor.verify(member).ready is True
+
+    assert (
+        _git(repository, "status", "--porcelain"),
+        _git(repository, "rev-parse", "HEAD"),
+        _git(target, "status", "--porcelain"),
+        _git(target, "rev-parse", "HEAD"),
+        _git(target, "symbolic-ref", "--short", "HEAD"),
+    ) == before
+    conn.close()
+
+
+def test_workspace_plan_rejects_symlink_escape(provider_modules, tmp_path):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository, _ = _disposable_repository(tmp_path)
+    controlled_root = repository / ".segment-worktrees"
+    controlled_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = controlled_root / "escape-link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    conn.execute(
+        "UPDATE segment_workspace_members SET relative_path = ? "
+        "WHERE workspace_id = 'workspace-1' AND repository_identity = 'repo-1'",
+        ("escape-link/member",),
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1", str(repository), str(controlled_root)
+            ),
+        )
+    )
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="relative path"):
+        workspace_mod._SegmentWorkspaceController(conn, registry).load(
+            workspace_id="workspace-1",
+            expected_initiative_id="initiative-1",
+            expected_segment_id="S1",
+            expected_controller_binding="controller-1",
+        )
+    conn.close()
+
+
+def test_workspace_plan_rejects_inactive_or_memberless_workspace(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository, _ = _disposable_repository(tmp_path)
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1",
+                str(repository),
+                str(repository / ".segment-worktrees"),
+            ),
+        )
+    )
+    controller = workspace_mod._SegmentWorkspaceController(conn, registry)
+    load_args = {
+        "workspace_id": "workspace-1",
+        "expected_initiative_id": "initiative-1",
+        "expected_segment_id": "S1",
+        "expected_controller_binding": "controller-1",
+    }
+    conn.execute("UPDATE segment_workspaces SET active = 0 WHERE workspace_id = ?", ("workspace-1",))
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="inactive"):
+        controller.load(**load_args)
+
+    conn.execute("UPDATE segment_workspaces SET active = 1 WHERE workspace_id = ?", ("workspace-1",))
+    conn.execute("DELETE FROM segment_workspace_members WHERE workspace_id = ?", ("workspace-1",))
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="at least one member"):
+        controller.load(**load_args)
+    conn.close()
+
+
+def test_workspace_materialization_fails_closed_when_worktree_add_fails(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    original_run = executor._run
+
+    def fail_worktree_add(argv, cwd):
+        if argv[:3] == ["git", "worktree", "add"]:
+            return subprocess.CompletedProcess(argv, 128, "", "forced failure")
+        return original_run(argv, cwd)
+
+    monkeypatch.setattr(executor, "_run", fail_worktree_add)
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="worktree add"):
+        executor.materialize(member)
+    assert not Path(member.target_path).exists()
+    conn.close()
 
 
 def test_h16_rejection_envelope_preserves_every_failure_and_remediation(
