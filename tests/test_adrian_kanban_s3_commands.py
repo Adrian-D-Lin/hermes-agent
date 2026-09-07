@@ -903,6 +903,14 @@ def test_all_retained_s2_mutations_use_the_active_boundary_transaction(
         return f"native:{operation}"
 
     monkeypatch.setattr(kb, native_name, native_spy)
+    if operation == "kanban_heartbeat":
+        def claim_spy(*args, **kwargs):
+            observed["claim_args"] = args
+            observed["claim_kwargs"] = kwargs
+            observed["claim_in_transaction"] = args[0].in_transaction
+            return True
+
+        monkeypatch.setattr(kb, "heartbeat_claim", claim_spy)
 
     arguments = {
         "kanban_complete": adapter_module._CompleteTaskArgs("task-retained"),
@@ -914,7 +922,7 @@ def test_all_retained_s2_mutations_use_the_active_boundary_transaction(
             "task-retained", "orchestrator", "evidence"
         ),
         "kanban_heartbeat": adapter_module._HeartbeatArgs(
-            "task-retained", note="alive"
+            "task-retained", claim_lock="host:claim", note="alive"
         ),
         "kanban_request_changes": adapter_module._RequestChangesArgs(
             "task-retained", "revise"
@@ -952,6 +960,12 @@ def test_all_retained_s2_mutations_use_the_active_boundary_transaction(
     assert result["result"] == "ACCEPTED"
     assert result["value"] == {"native_result": f"native:{operation}"}
     assert observed["in_transaction"] is True
+    if operation == "kanban_heartbeat":
+        assert observed["claim_in_transaction"] is True
+        assert observed["claim_kwargs"] == {
+            "claimer": "host:claim",
+            "_allow_nested": True,
+        }
     if operation == "kanban_comment":
         assert "_allow_nested" not in observed["kwargs"]
     else:
@@ -1022,6 +1036,7 @@ def test_active_transaction_operation_allowlist_matches_implemented_mutations(
             "_HeartbeatArgs",
             {
                 "task_id": "task-wrapper",
+                "claim_lock": "host:claim",
                 "note": "alive",
                 "expected_run_id": 4,
             },
@@ -1123,6 +1138,72 @@ def test_native_nested_transaction_switch_requires_an_exact_bool(operation):
     with sqlite3.connect(":memory:", isolation_level=None) as conn:
         with pytest.raises(TypeError, match="_allow_nested must be a bool"):
             calls[operation](conn)
+
+
+def test_native_claim_heartbeat_nested_switch_requires_an_exact_bool():
+    with sqlite3.connect(":memory:", isolation_level=None) as conn:
+        with pytest.raises(TypeError, match="_allow_nested must be a bool"):
+            kb.heartbeat_claim(
+                conn,
+                "task-exact-bool",
+                claimer="host:claim",
+                _allow_nested=1,
+            )
+
+
+def test_private_heartbeat_stops_when_exact_claim_cannot_be_extended(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    heartbeat_called = False
+
+    def claim_spy(*_args, **_kwargs):
+        return False
+
+    def heartbeat_spy(*_args, **_kwargs):
+        nonlocal heartbeat_called
+        heartbeat_called = True
+        return True
+
+    monkeypatch.setattr(kb, "heartbeat_claim", claim_spy)
+    monkeypatch.setattr(kb, "heartbeat_worker", heartbeat_spy)
+
+    def handler(context):
+        result = context.mutation_executor._heartbeat_in_active_transaction(
+            context.capability,
+            context.binding,
+            task_id="task-heartbeat-claim",
+            claim_lock="host:wrong-claim",
+        )
+        return {"heartbeat": result}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_heartbeat": handler},
+    )
+    result = boundary.submit(
+        "kanban_heartbeat",
+        attempt_id="attempt-heartbeat-claim",
+        idempotency_key="key-heartbeat-claim",
+        target="task-heartbeat-claim",
+        expected_version=0,
+        session_id="session-heartbeat-claim",
+        workspace_id=None,
+        execution_context="run-heartbeat-claim",
+        payload={"task_id": "task-heartbeat-claim"},
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {"heartbeat": False}
+    assert heartbeat_called is False
 
 
 def _insert_unified_card(
