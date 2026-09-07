@@ -3132,6 +3132,127 @@ _REQUIRED_PROVIDER_ATTRS = ("name", "is_healthy", "admit_operation")
 # provider registered for one board path is never visible to another.
 _PROVIDER_REGISTRY: "dict[str, object]" = {}
 
+_REQUIRED_CAPABILITY_PROVIDER_ATTRS = (
+    "validate_capability",
+    "consume_capability",
+)
+
+
+@dataclass
+class _AuthorityCapabilityEnvelope:
+    provider: object
+    capability: object
+    context: object
+    canonical_path: str
+    connection_identity: int
+    state: str = "fresh"
+    allow_multiple_writes: bool = False
+
+
+_ACTIVE_AUTHORITY_CAPABILITY: ContextVar[
+    Optional[_AuthorityCapabilityEnvelope]
+] = ContextVar("_ACTIVE_AUTHORITY_CAPABILITY", default=None)
+
+
+def _require_capability_provider(provider):
+    if not _provider_is_available(provider):
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    for attr in _REQUIRED_CAPABILITY_PROVIDER_ATTRS:
+        if not hasattr(provider, attr) or not callable(getattr(provider, attr)):
+            raise AuthorityAdmissionRejected(
+                "capability interface is unavailable; native mutation fails "
+                "closed/no fallback"
+            )
+    return provider
+
+
+@contextlib.contextmanager
+def _scoped_authority_capability(
+    conn,
+    capability,
+    context,
+    *,
+    db_path: Optional[str] = None,
+    allow_multiple_writes: bool = False,
+):
+    if type(allow_multiple_writes) is not bool:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    selected_authority = resolve_selected_authority()
+    if selected_authority != AUTHORITY_ADRIAN_KANBAN:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if _ACTIVE_AUTHORITY_CAPABILITY.get() is not None:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if getattr(conn, "in_transaction", False):
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+
+    resolved_path = resolve_authority_path(override=db_path)
+    main_path = _sqlite_main_connection_file(conn)
+    if main_path is None:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    canonical_path = _canonical_path(resolved_path)
+    if _canonical_path(main_path) != canonical_path:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+
+    provider = _require_admitted_provider(canonical_path)
+    _require_capability_provider(provider)
+
+    try:
+        result = provider.validate_capability(
+            capability,
+            context,
+            canonical_path,
+            allow_consumed=False,
+        )
+        if result is not True:
+            raise AuthorityAdmissionRejected(
+                "capability interface is unavailable; native mutation fails "
+                "closed/no fallback"
+            )
+    except AuthorityAdmissionRejected:
+        raise
+    except Exception as exc:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        ) from exc
+
+    envelope = _AuthorityCapabilityEnvelope(
+        provider=provider,
+        capability=capability,
+        context=context,
+        canonical_path=canonical_path,
+        connection_identity=id(conn),
+        state="fresh",
+        allow_multiple_writes=allow_multiple_writes,
+    )
+    token = _ACTIVE_AUTHORITY_CAPABILITY.set(envelope)
+    try:
+        yield conn
+    finally:
+        envelope.state = "finished"
+        _ACTIVE_AUTHORITY_CAPABILITY.reset(token)
+
 
 def _normalize_authority_path(value: Optional[str]) -> str:
     """Return the normalized absolute path for an explicit authority value.
@@ -3432,46 +3553,120 @@ def _canonical_path(value: str) -> str:
     return str(Path(value).expanduser().resolve())
 
 
-def _enforce_seam_on_write_txn(conn: sqlite3.Connection) -> None:
-    """Fail closed when a non-native authority is selected and no provider is ready.
+def _enforce_seam_on_write_txn(
+    conn: sqlite3.Connection, *, nested: bool
+) -> Optional[_AuthorityCapabilityEnvelope]:
+    selected_authority = resolve_selected_authority()
+    if selected_authority != AUTHORITY_ADRIAN_KANBAN:
+        return None
 
-    No-op under the default ``native`` authority. When ``adrian-kanban`` is
-    selected the seam:
-
-    1. resolves the configured authoritative database path (raising
-       :class:`AuthorityAdmissionRejected` when it is missing or relative),
-    2. derives the SQLite ``main`` connection file from ``PRAGMA database_list``
-       and rejects any mismatch against the resolved path (fail closed), then
-    3. requires the provider registered for that exact path.
-
-    The comparison is canonical: both the configured path and the SQLite-
-    reported file are normalized through :func:`_canonical_path` before being
-    compared, so segment/symlink differences that denote the same file do not
-    cause a false mismatch.
-
-    The seam is generic and core-owned: it never imports concrete plugin code.
-    """
-    if resolve_selected_authority() != AUTHORITY_ADRIAN_KANBAN:
-        return
-    # (1) Resolve the configured authoritative path. This also rejects a
-    # missing or relative configuration before we touch the connection.
-    authoritative = resolve_authority_path()
-    # (2) Derive the actual SQLite main connection file and reject a mismatch.
-    actual_file = _sqlite_main_connection_file(conn)
-    if actual_file is None:
+    resolved_path = resolve_authority_path()
+    main_path = _sqlite_main_connection_file(conn)
+    if main_path is None:
         raise AuthorityAdmissionRejected(
-            "adrian-kanban: could not read the SQLite main connection file "
-            "from PRAGMA database_list; native mutation fails closed "
-            "(no fallback)"
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
         )
-    if _canonical_path(authoritative) != _canonical_path(actual_file):
+    canonical_path = _canonical_path(resolved_path)
+    if _canonical_path(main_path) != canonical_path:
         raise AuthorityAdmissionRejected(
-            f"adrian-kanban: connection file {actual_file!r} does not match "
-            f"the configured authoritative database path {authoritative!r}; "
-            "native mutation fails closed (no fallback)"
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
         )
-    # (3) Require the provider registered for that exact path.
-    _require_admitted_provider(authoritative)
+
+    provider = _require_admitted_provider(canonical_path)
+    _require_capability_provider(provider)
+
+    envelope = _ACTIVE_AUTHORITY_CAPABILITY.get()
+    if envelope is None:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if envelope.provider is not provider:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if envelope.canonical_path != canonical_path:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+    if envelope.connection_identity != id(conn):
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
+
+    try:
+        if nested:
+            if envelope.state != "active":
+                raise AuthorityAdmissionRejected(
+                    "capability interface is unavailable; native mutation "
+                    "fails closed/no fallback"
+                )
+            result = provider.validate_capability(
+                envelope.capability,
+                envelope.context,
+                canonical_path,
+                allow_consumed=True,
+            )
+            if result is not True:
+                raise AuthorityAdmissionRejected(
+                    "capability interface is unavailable; native mutation "
+                    "fails closed/no fallback"
+                )
+        else:
+            if envelope.state == "fresh":
+                result = provider.validate_capability(
+                    envelope.capability,
+                    envelope.context,
+                    canonical_path,
+                    allow_consumed=False,
+                )
+                if result is not True:
+                    raise AuthorityAdmissionRejected(
+                        "capability interface is unavailable; native mutation "
+                        "fails closed/no fallback"
+                    )
+                consume_result = provider.consume_capability(
+                    envelope.capability,
+                    envelope.context,
+                    canonical_path,
+                )
+                if consume_result is not True:
+                    raise AuthorityAdmissionRejected(
+                        "capability interface is unavailable; native mutation "
+                        "fails closed/no fallback"
+                    )
+                envelope.state = "active"
+            elif envelope.state == "active" and envelope.allow_multiple_writes:
+                result = provider.validate_capability(
+                    envelope.capability,
+                    envelope.context,
+                    canonical_path,
+                    allow_consumed=True,
+                )
+                if result is not True:
+                    raise AuthorityAdmissionRejected(
+                        "capability interface is unavailable; native mutation "
+                        "fails closed/no fallback"
+                    )
+            else:
+                raise AuthorityAdmissionRejected(
+                    "capability interface is unavailable; native mutation "
+                    "fails closed/no fallback"
+                )
+    except AuthorityAdmissionRejected:
+        raise
+    except Exception as exc:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        ) from exc
+
+    return envelope
 
 
 def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
@@ -3487,83 +3682,66 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
-    """Context manager for an IMMEDIATE write transaction.
+    """Run an IMMEDIATE transaction with explicit nested savepoints.
 
-    Use for any multi-statement write (creating a task + link, claiming a
-    task + recording an event, etc.). A claim CAS inside this context is
-    atomic -- at most one concurrent writer can succeed.
-
-    Nesting is an explicit opt-in: a caller already inside a transaction
-    gets a loud ``RuntimeError`` unless it passes ``allow_nested=True``,
-    in which case a SQLite savepoint is used instead of a second
-    ``BEGIN IMMEDIATE``. Only composition primitives that graph builders
-    deliberately run under one outer commit (``create_task``,
-    ``add_comment``) opt in — helpers with post-commit side effects
-    (``complete_task`` & co.) must never run under an open outer
-    transaction, because their side effects (workspace cleanup, ready
-    recomputation, failure-counter clears) would fire while the outer
-    transaction can still roll back.
-
-    The explicit ROLLBACK on exception is wrapped in try/except so that
-    a SQLite auto-rollback (which leaves no active transaction) does not
-    shadow the original exception with a spurious rollback error.
+    Under non-native authority, the outer transaction irreversibly consumes
+    its scoped capability before ``BEGIN IMMEDIATE``. Nested savepoints
+    validate the same active envelope without consuming it again.
     """
     _assert_not_delegated_child_mutation()
-    # S1 generic authority seam: if ``adrian-kanban`` is selected, native
-    # mutation must fail closed unless the configured provider is present,
-    # compatible, healthy, and supplies the admitted-operation interface. This
-    # gate runs before BEGIN IMMEDIATE so no transaction begins on a rejected
-    # path. Native (default) selection is a no-op here.
-    _enforce_seam_on_write_txn(conn)
-    if getattr(conn, "in_transaction", False):
-        if not allow_nested:
-            raise RuntimeError(
-                "write_txn: already inside a transaction. Nested composition "
-                "must opt in explicitly with write_txn(conn, allow_nested=True) "
-                "(savepoint semantics; the inner RELEASE is not durable until "
-                "the outer transaction commits)."
-            )
-        savepoint = f"hermes_nested_{secrets.token_hex(8)}"
-        conn.execute(f"SAVEPOINT {savepoint}")
+    nested = bool(getattr(conn, "in_transaction", False))
+    if nested and not allow_nested:
+        raise RuntimeError(
+            "write_txn: already inside a transaction. Nested composition "
+            "must opt in explicitly with write_txn(conn, allow_nested=True) "
+            "(savepoint semantics; the inner RELEASE is not durable until "
+            "the outer transaction commits)."
+        )
+
+    envelope = _enforce_seam_on_write_txn(conn, nested=nested)
+
+    if nested:
+        name = f"hermes_nested_{secrets.token_hex(8)}"
+        conn.execute(f"SAVEPOINT {name}")
         try:
             yield conn
         except Exception:
             try:
-                conn.execute(f"ROLLBACK TO {savepoint}")
-                conn.execute(f"RELEASE {savepoint}")
+                conn.execute(f"ROLLBACK TO {name}")
+                conn.execute(f"RELEASE {name}")
             except sqlite3.OperationalError:
                 pass
             raise
         else:
-            conn.execute(f"RELEASE {savepoint}")
+            conn.execute(f"RELEASE {name}")
         return
 
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
-        yield conn
-    except Exception:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
-        raise
-    else:
-        try:
-            _execute_boundary_with_retry(conn, "COMMIT")
+            yield conn
         except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        else:
+            try:
+                _execute_boundary_with_retry(conn, "COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            else:
+                _check_file_length_invariant(conn)
+    finally:
+        if envelope is not None and not getattr(
+            envelope, "allow_multiple_writes", False
+        ):
+            envelope.state = "finished"
 
 
 # ---------------------------------------------------------------------------
@@ -5085,6 +5263,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -5140,18 +5319,23 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        cas_params = [lock, expires, now, task_id]
+        cas_where = "AND status = 'ready' AND claim_lock IS NULL"
+        if expected_assignee is not None and expected_assignee.strip():
+            cas_where += " AND assignee = ?"
+            cas_params.append(expected_assignee)
+
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
-               AND claim_lock IS NULL
+               {cas_where}
             """,
-            (lock, expires, now, task_id),
+            cas_params,
         )
         if cur.rowcount != 1:
             return None
@@ -10330,6 +10514,173 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         )
     except Exception:
         return "unknown"
+
+
+@dataclass(frozen=True)
+class _AdmittedTaskLaunchEvidence:
+    task_id: str
+    state: str
+    assignee: Optional[str]
+    workspace: Optional[str]
+    worker_session_id: Optional[str]
+    pid: Optional[int]
+    auto_blocked: bool
+
+
+def _launch_admitted_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_assignee: str,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    board: Optional[str] = None,
+) -> _AdmittedTaskLaunchEvidence:
+    board = _normalize_board_slug(board) or get_current_board()
+
+    claimed = claim_task(
+        conn,
+        task_id,
+        ttl_seconds=ttl_seconds,
+        expected_assignee=expected_assignee,
+    )
+    if claimed is None:
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="claim_lost",
+            assignee=expected_assignee,
+            workspace=None,
+            worker_session_id=None,
+            pid=None,
+            auto_blocked=False,
+        )
+
+    try:
+        resolved_branch_name = None
+        if claimed.workspace_kind == "worktree":
+            workspace, resolved_branch_name = _resolve_worktree_workspace(
+                claimed, board=board
+            )
+        else:
+            workspace = resolve_workspace(claimed, board=board)
+    except Exception as exc:
+        auto = _record_spawn_failure(
+            conn,
+            claimed.id,
+            f"workspace: {exc}",
+            failure_limit=failure_limit,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="failed",
+            assignee=claimed.assignee,
+            workspace=None,
+            worker_session_id=None,
+            pid=None,
+            auto_blocked=auto,
+        )
+
+    set_workspace_path(conn, claimed.id, str(workspace))
+    if claimed.workspace_kind == "worktree":
+        set_branch_name(
+            conn,
+            claimed.id,
+            resolved_branch_name
+            or (claimed.branch_name or "").strip()
+            or f"wt/{claimed.id}",
+        )
+    _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+
+    try:
+        worker_session_id = prepare_worker_launch(
+            conn,
+            claimed,
+            str(workspace),
+            board=board,
+            resolved_branch_name=resolved_branch_name,
+        )
+    except Exception as exc:
+        auto = _record_spawn_failure(
+            conn,
+            claimed.id,
+            f"writegate pre-spawn binding: {exc}",
+            failure_limit=failure_limit,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="failed",
+            assignee=claimed.assignee,
+            workspace=str(workspace),
+            worker_session_id=None,
+            pid=None,
+            auto_blocked=auto,
+        )
+
+    _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    try:
+        import inspect
+
+        try:
+            sig = inspect.signature(_spawn)
+            params = sig.parameters
+            if "board" in params and "worker_session_id" in params:
+                pid = _spawn(
+                    claimed,
+                    str(workspace),
+                    board=board,
+                    worker_session_id=worker_session_id,
+                )
+            elif "board" in params:
+                pid = _spawn(claimed, str(workspace), board=board)
+            elif "worker_session_id" in params:
+                pid = _spawn(
+                    claimed,
+                    str(workspace),
+                    worker_session_id=worker_session_id,
+                )
+            else:
+                pid = _spawn(claimed, str(workspace))
+        except (TypeError, ValueError):
+            pid = _spawn(claimed, str(workspace))
+
+        if pid:
+            _set_worker_pid(
+                conn,
+                claimed.id,
+                int(pid),
+                worker_session_id=worker_session_id,
+            )
+
+        _fire_worker_spawned_hook(
+            conn, claimed, str(workspace), pid, board=board
+        )
+
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="launched",
+            assignee=claimed.assignee,
+            workspace=str(workspace),
+            worker_session_id=worker_session_id,
+            pid=int(pid) if pid else None,
+            auto_blocked=False,
+        )
+    except Exception as exc:
+        auto = _record_spawn_failure(
+            conn,
+            claimed.id,
+            str(exc),
+            failure_limit=failure_limit,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="failed",
+            assignee=claimed.assignee,
+            workspace=str(workspace),
+            worker_session_id=worker_session_id,
+            pid=None,
+            auto_blocked=auto,
+        )
 
 
 def dispatch_once(

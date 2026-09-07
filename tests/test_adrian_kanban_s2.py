@@ -1,0 +1,3955 @@
+"""Independent S2 tests derived from the ratified v0.28 design oracle."""
+
+from __future__ import annotations
+
+import copy
+import importlib
+import importlib.util
+import inspect
+import json
+import pickle
+import sqlite3
+import subprocess
+import sys
+import threading
+from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from gateway import trusted_authorizer_evidence as trusted
+from writegate.kanban_approvals import (
+    APPROVAL_TYPE,
+    KanbanApprovalRejected,
+    KanbanInitiativeApprovalConsumption,
+    KanbanInitiativeApprovalHost,
+    KanbanInitiativeApprovalPreparation,
+    consume_approved,
+    create_kanban_approval_schema,
+)
+
+
+@pytest.fixture(scope="module")
+def capability_module():
+    path = (
+        Path(__file__).parents[1]
+        / "plugins"
+        / "adrian-kanban"
+        / "capability.py"
+    )
+    spec = importlib.util.spec_from_file_location("s2_capability", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    yield module
+    sys.modules.pop(spec.name, None)
+
+
+@pytest.fixture(scope="module")
+def provider_modules():
+    root = Path(__file__).parents[1] / "plugins" / "adrian-kanban"
+    name = "s2_adrian_kanban"
+    spec = importlib.util.spec_from_file_location(
+        name,
+        root / "__init__.py",
+        submodule_search_locations=[str(root)],
+    )
+    assert spec is not None and spec.loader is not None
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[name] = package
+    spec.loader.exec_module(package)
+    modules = {
+        "actor": importlib.import_module(f"{name}.actor"),
+        "capability": importlib.import_module(f"{name}.capability"),
+        "contracts": importlib.import_module(f"{name}.contracts"),
+        "diagnostics": importlib.import_module(f"{name}.diagnostics"),
+        "dispatcher": importlib.import_module(f"{name}.dispatcher"),
+        "journal": importlib.import_module(f"{name}.journal"),
+        "lifecycle": importlib.import_module(f"{name}.lifecycle"),
+        "policy": importlib.import_module(f"{name}.policy"),
+        "private_adapter": importlib.import_module(f"{name}.private_adapter"),
+        "provider": importlib.import_module(f"{name}.provider"),
+        "schema": importlib.import_module(f"{name}.schema"),
+        "workspace": importlib.import_module(f"{name}.workspace"),
+    }
+    yield modules
+    for module_name in tuple(sys.modules):
+        if module_name == name or module_name.startswith(f"{name}."):
+            sys.modules.pop(module_name, None)
+
+
+def _binding(module, **changes):
+    values = {
+        "operation": "native_create_task",
+        "target": "task-1",
+        "expected_version": 3,
+        "canonical_digest": "sha256:task-payload",
+        "session_id": "session-1",
+        "workspace_id": "workspace-1",
+        "plugin_version": "0.2.0",
+        "protocol_version": "2",
+        "execution_context": "run-1",
+    }
+    values.update(changes)
+    return module.CapabilityBinding(**values)
+
+
+def _select_plugin_authority(tmp_path, monkeypatch, database_path: Path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  mutation_authority: adrian-kanban\n"
+        f"  database_path: {database_path.as_posix()}\n",
+        encoding="utf-8",
+    )
+
+
+def _connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    create_kanban_approval_schema(conn)
+    return conn
+
+
+def _trusted_evidence(*, request_id: str = "request-1"):
+    connection = trusted._record_authenticated_tailscale_connection(
+        "gateway/tailscale",
+        "connection-1",
+        "adrian@tailnet",
+        request_id,
+        1_000,
+    )
+    return trusted.TrustedAuthorizerEvidence._from_authenticated_connection(
+        connection,
+        issued_at=1_001,
+        ttl_seconds=120,
+    )
+
+
+def _preparation(**changes) -> KanbanInitiativeApprovalPreparation:
+    values = {
+        "approval_id": "approval-1",
+        "request_id": "request-1",
+        "operation": "kanban_update_initiative",
+        "initiative_id": "initiative-1",
+        "proposed_creation_id": None,
+        "expected_version": 4,
+        "canonical_digest": "sha256:payload",
+        "session_id": "session-1",
+        "expires_at": 1_200,
+    }
+    values.update(changes)
+    return KanbanInitiativeApprovalPreparation(**values)
+
+
+def _consumption(authorizer_evidence: str, **changes):
+    values = {
+        "approval_id": "approval-1",
+        "request_id": "request-1",
+        "operation": "kanban_update_initiative",
+        "initiative_id": "initiative-1",
+        "proposed_creation_id": None,
+        "expected_version": 4,
+        "canonical_digest": "sha256:payload",
+        "canonicalization_version": 1,
+        "authorizer_evidence": authorizer_evidence,
+        "session_id": "session-1",
+        "expires_at": 1_200,
+        "consumed_mutation_id": "mutation-1",
+        "consumed_idempotency_ref": "idempotency-1",
+    }
+    values.update(changes)
+    return KanbanInitiativeApprovalConsumption(**values)
+
+
+def _prepared_and_approved(conn: sqlite3.Connection):
+    evidence = _trusted_evidence()
+    host = KanbanInitiativeApprovalHost(evidence)
+    conn.execute("BEGIN IMMEDIATE")
+    host.prepare(conn, _preparation(), now=1_010)
+    host.approve(conn, "approval-1", "second-action-proof", now=1_020)
+    conn.commit()
+    return evidence, host
+
+
+def _approval_row(conn: sqlite3.Connection):
+    return conn.execute(
+        "SELECT * FROM write_gate_kanban_approvals WHERE approval_id = ?",
+        ("approval-1",),
+    ).fetchone()
+
+
+def test_h12_trusted_gateway_state_mints_redacted_durable_evidence():
+    evidence = _trusted_evidence()
+
+    canonical = json.loads(evidence._canonical_for_writegate())
+
+    assert canonical == {
+        "connection_id": "connection-1",
+        "expires_at": 1_121,
+        "issued_at": 1_001,
+        "peer_identity": "adrian@tailnet",
+        "request_id": "request-1",
+        "route": "gateway/tailscale",
+        "type": "trusted_authorizer",
+        "version": 1,
+    }
+    assert repr(evidence) == "<TrustedAuthorizerEvidence>"
+    assert "adrian" not in repr(evidence)
+
+
+@pytest.mark.parametrize("ttl", [False, 0, -1, 301, "60"])
+def test_f05_trusted_evidence_rejects_invalid_or_overlong_ttl(ttl):
+    connection = trusted._record_authenticated_tailscale_connection(
+        "gateway/tailscale", "connection-1", "adrian@tailnet", "request-1", 1_000
+    )
+
+    with pytest.raises(ValueError, match="ttl_seconds"):
+        trusted.TrustedAuthorizerEvidence._from_authenticated_connection(
+            connection, issued_at=1_001, ttl_seconds=ttl
+        )
+
+
+def test_u08_caller_material_cannot_forge_registered_authorizer_evidence():
+    with pytest.raises((TypeError, ValueError)):
+        trusted.TrustedAuthorizerEvidence(
+            object(),
+            route="gateway/tailscale",
+            connection_id="connection-1",
+            peer_identity="adrian@tailnet",
+            request_id="request-1",
+            issued_at=1_001,
+            expires_at=1_121,
+        )
+
+    forged = trusted.TrustedAuthorizerEvidence(
+        trusted._EVIDENCE_MINT,
+        route="gateway/tailscale",
+        connection_id="connection-1",
+        peer_identity="adrian@tailnet",
+        request_id="request-1",
+        issued_at=1_001,
+        expires_at=1_121,
+    )
+    with pytest.raises(ValueError, match="unregistered"):
+        forged._canonical_for_writegate()
+    with pytest.raises(KanbanApprovalRejected, match="invalid"):
+        KanbanInitiativeApprovalHost(forged)
+
+
+def test_u05_trusted_evidence_cannot_be_copied_or_pickled():
+    evidence = _trusted_evidence()
+
+    with pytest.raises(TypeError, match="pickling not supported"):
+        copy.copy(evidence)
+    with pytest.raises(TypeError, match="pickling not supported"):
+        pickle.dumps(evidence)
+
+
+def test_writegate_schema_uses_callers_transaction_without_committing():
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.execute("BEGIN IMMEDIATE")
+
+    create_kanban_approval_schema(conn)
+    conn.rollback()
+
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE name = 'write_gate_kanban_approvals'"
+    ).fetchone() is None
+
+
+def test_h02_exact_approval_consumes_in_the_callers_transaction():
+    conn = _connection()
+    evidence, _ = _prepared_and_approved(conn)
+    exact = _consumption(evidence._canonical_for_writegate())
+
+    conn.execute("BEGIN IMMEDIATE")
+    consume_approved(conn, exact, now=1_030)
+    assert _approval_row(conn)["state"] == "consumed"
+    conn.commit()
+
+    row = _approval_row(conn)
+    assert row["approval_type"] == APPROVAL_TYPE
+    assert row["consumed_mutation_id"] == "mutation-1"
+    assert row["consumed_idempotency_ref"] == "idempotency-1"
+
+
+def test_h02_proposed_creation_target_uses_same_exact_contract():
+    conn = _connection()
+    evidence = _trusted_evidence()
+    host = KanbanInitiativeApprovalHost(evidence)
+    preparation = _preparation(
+        initiative_id=None,
+        proposed_creation_id="proposed-1",
+        operation="kanban_create_initiative",
+        expected_version=0,
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    host.prepare(conn, preparation, now=1_010)
+    host.approve(conn, "approval-1", "second-action-proof", now=1_020)
+    consume_approved(
+        conn,
+        _consumption(
+            evidence._canonical_for_writegate(),
+            initiative_id=None,
+            proposed_creation_id="proposed-1",
+            operation="kanban_create_initiative",
+            expected_version=0,
+        ),
+        now=1_030,
+    )
+    conn.commit()
+
+    assert _approval_row(conn)["state"] == "consumed"
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("request_id", "wrong-request"),
+        ("operation", "kanban_archive_initiative"),
+        ("initiative_id", "wrong-initiative"),
+        ("expected_version", 5),
+        ("canonical_digest", "sha256:wrong"),
+        ("canonicalization_version", 2),
+        ("authorizer_evidence", "wrong-actor"),
+        ("session_id", "wrong-session"),
+        ("expires_at", 1_201),
+        ("consumed_mutation_id", ""),
+        ("consumed_idempotency_ref", ""),
+    ],
+)
+def test_u01_every_exact_approval_binding_rejects_independently(field, wrong_value):
+    conn = _connection()
+    evidence, _ = _prepared_and_approved(conn)
+    exact = _consumption(evidence._canonical_for_writegate())
+
+    with pytest.raises(KanbanApprovalRejected):
+        changed = replace(exact, **{field: wrong_value})
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            consume_approved(conn, changed, now=1_030)
+        finally:
+            conn.rollback()
+
+    assert _approval_row(conn)["state"] == "approved"
+
+
+@pytest.mark.parametrize("state", ["prepared", "cancelled", "expired", "consumed"])
+def test_u01_nonapproved_state_cannot_be_consumed(state):
+    conn = _connection()
+    evidence, _ = _prepared_and_approved(conn)
+    conn.execute(
+        "UPDATE write_gate_kanban_approvals SET state = ? WHERE approval_id = ?",
+        (state, "approval-1"),
+    )
+
+    with pytest.raises(KanbanApprovalRejected, match="exactly one"):
+        consume_approved(
+            conn, _consumption(evidence._canonical_for_writegate()), now=1_030
+        )
+
+    assert _approval_row(conn)["state"] == state
+
+
+def test_f05_approval_expiry_boundary_is_exclusive():
+    conn = _connection()
+    evidence, _ = _prepared_and_approved(conn)
+
+    with pytest.raises(KanbanApprovalRejected, match="exactly one"):
+        consume_approved(
+            conn, _consumption(evidence._canonical_for_writegate()), now=1_200
+        )
+
+    assert _approval_row(conn)["state"] == "approved"
+
+
+def test_f01_outer_rollback_restores_approval_after_consumption():
+    conn = _connection()
+    evidence, _ = _prepared_and_approved(conn)
+    exact = _consumption(evidence._canonical_for_writegate())
+
+    conn.execute("BEGIN IMMEDIATE")
+    consume_approved(conn, exact, now=1_030)
+    conn.execute("CREATE TABLE governed_mutation (id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO governed_mutation VALUES ('mutation-1')")
+    conn.rollback()
+
+    assert _approval_row(conn)["state"] == "approved"
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE name = 'governed_mutation'"
+    ).fetchone() is None
+
+
+@pytest.mark.parametrize("initial_state", ["prepared", "approved"])
+def test_approval_can_be_cancelled_only_from_open_states(initial_state):
+    conn = _connection()
+    evidence = _trusted_evidence()
+    host = KanbanInitiativeApprovalHost(evidence)
+    host.prepare(conn, _preparation(), now=1_010)
+    if initial_state == "approved":
+        host.approve(conn, "approval-1", "second-action-proof", now=1_020)
+
+    host.cancel(conn, "approval-1", "adrian-cancelled", now=1_030)
+
+    row = _approval_row(conn)
+    assert row["state"] == "cancelled"
+    assert row["cancellation_evidence"] == "adrian-cancelled"
+    with pytest.raises(KanbanApprovalRejected, match="exactly one"):
+        host.cancel(conn, "approval-1", "repeat", now=1_031)
+
+
+def test_preparation_requires_exactly_one_nonempty_target():
+    with pytest.raises(KanbanApprovalRejected, match="exactly one"):
+        _preparation(initiative_id=None, proposed_creation_id=None)
+    with pytest.raises(KanbanApprovalRejected, match="exactly one"):
+        _preparation(proposed_creation_id="proposed-1")
+    with pytest.raises(KanbanApprovalRejected, match="initiative_id"):
+        _preparation(initiative_id="   ")
+
+
+def test_u02_filesystem_approval_type_cannot_satisfy_initiative_consumer():
+    conn = _connection()
+    evidence, _ = _prepared_and_approved(conn)
+    conn.execute("PRAGMA ignore_check_constraints = ON")
+    conn.execute(
+        "UPDATE write_gate_kanban_approvals SET approval_type = 'filesystem_lease' "
+        "WHERE approval_id = 'approval-1'"
+    )
+
+    with pytest.raises(KanbanApprovalRejected, match="exactly one"):
+        consume_approved(
+            conn, _consumption(evidence._canonical_for_writegate()), now=1_030
+        )
+
+    assert _approval_row(conn)["state"] == "approved"
+
+
+def test_h03_capability_is_exact_registered_redacted_and_one_use(
+    capability_module,
+):
+    binding = _binding(capability_module)
+    registry = capability_module.CapabilityRegistry()
+    capability = registry._mint_after_admission(binding)
+
+    assert repr(capability) == "<AdrianKanbanCapability>"
+    assert "task-1" not in repr(capability)
+    assert registry.validate(capability, binding, allow_consumed=False) is True
+    assert registry.consume(capability, binding) is True
+    assert registry.is_consumed(capability) is True
+    assert registry.validate(capability, binding, allow_consumed=True) is True
+    with pytest.raises(capability_module.CapabilityRejected, match="consumed"):
+        registry.consume(capability, binding)
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("operation", "native_update_task"),
+        ("target", "task-2"),
+        ("expected_version", 4),
+        ("canonical_digest", "sha256:wrong"),
+        ("session_id", "session-2"),
+        ("workspace_id", "workspace-2"),
+        ("plugin_version", "0.2.1"),
+        ("protocol_version", "3"),
+        ("execution_context", "run-2"),
+    ],
+)
+def test_u06_capability_rejects_each_independent_binding_change(
+    capability_module, field, wrong_value
+):
+    binding = _binding(capability_module)
+    registry = capability_module.CapabilityRegistry()
+    capability = registry._mint_after_admission(binding)
+    changed = replace(binding, **{field: wrong_value})
+
+    with pytest.raises(capability_module.CapabilityRejected, match="mismatch"):
+        registry.validate(capability, changed, allow_consumed=False)
+
+    assert registry.is_consumed(capability) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("operation", "  "),
+        ("target", ""),
+        ("expected_version", True),
+        ("expected_version", -1),
+        ("canonical_digest", None),
+        ("workspace_id", " "),
+    ],
+)
+def test_capability_binding_rejects_malformed_context(
+    capability_module, field, wrong_value
+):
+    with pytest.raises(capability_module.CapabilityRejected):
+        _binding(capability_module, **{field: wrong_value})
+
+
+def test_u05_capability_rejects_forgery_copy_and_pickle(capability_module):
+    binding = _binding(capability_module)
+    registry = capability_module.CapabilityRegistry()
+    real = registry._mint_after_admission(binding)
+    forged = capability_module._AdmittedCapability(
+        capability_module._CAPABILITY_MINT,
+        binding,
+        "forged-nonce",
+    )
+
+    with pytest.raises(capability_module.CapabilityRejected, match="registered"):
+        registry.validate(forged, binding, allow_consumed=False)
+    with pytest.raises(TypeError, match="non-serializable"):
+        copy.copy(real)
+    with pytest.raises(TypeError, match="non-serializable"):
+        copy.deepcopy(real)
+    with pytest.raises(TypeError, match="non-serializable"):
+        pickle.dumps(real)
+
+
+def test_f03_concurrent_capability_consumers_have_one_winner(capability_module):
+    binding = _binding(capability_module)
+    registry = capability_module.CapabilityRegistry()
+    capability = registry._mint_after_admission(binding)
+    barrier = threading.Barrier(3)
+    outcomes = []
+
+    def consume():
+        barrier.wait()
+        try:
+            registry.consume(capability, binding)
+        except capability_module.CapabilityRejected:
+            outcomes.append("rejected")
+        else:
+            outcomes.append("consumed")
+
+    threads = [threading.Thread(target=consume) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert outcomes.count("consumed") == 1
+    assert outcomes.count("rejected") == 1
+
+
+def test_h03_scoped_capability_composes_outer_write_and_nested_savepoint(
+    provider_modules, tmp_path, monkeypatch
+):
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, value TEXT)")
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    binding = _binding(cap_mod)
+    capability = provider._mint_after_admission(binding)
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        with provider_mod._capability_scope(provider, conn, capability, binding):
+            with kb.write_txn(conn):
+                conn.execute("INSERT INTO probe VALUES (1, 'outer')")
+                with kb.write_txn(conn, allow_nested=True):
+                    conn.execute("INSERT INTO probe VALUES (2, 'nested')")
+
+        assert provider.is_consumed(capability) is True
+        assert conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 2
+        with pytest.raises(kb.AuthorityAdmissionRejected):
+            with provider_mod._capability_scope(
+                provider, conn, capability, binding
+            ):
+                pass
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u04_healthy_selected_provider_without_scope_still_fails_closed(
+    provider_modules, tmp_path, monkeypatch
+):
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        with pytest.raises(kb.AuthorityAdmissionRejected, match="fails closed"):
+            with kb.write_txn(conn):
+                conn.execute("INSERT INTO probe VALUES (1)")
+        assert conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 0
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_f01_rollback_keeps_capability_spent_and_fresh_admission_can_retry(
+    provider_modules, tmp_path, monkeypatch
+):
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    binding = _binding(cap_mod)
+    spent = provider._mint_after_admission(binding)
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        with pytest.raises(RuntimeError, match="injected failure"):
+            with provider_mod._capability_scope(provider, conn, spent, binding):
+                with kb.write_txn(conn):
+                    conn.execute("INSERT INTO probe VALUES (1)")
+                    raise RuntimeError("injected failure")
+
+        assert provider.is_consumed(spent) is True
+        assert conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 0
+
+        fresh = provider._mint_after_admission(binding)
+        with provider_mod._capability_scope(provider, conn, fresh, binding):
+            with kb.write_txn(conn):
+                conn.execute("INSERT INTO probe VALUES (1)")
+        assert provider.is_consumed(fresh) is True
+        assert conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 1
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u06_scope_rejects_different_connection_without_consuming_capability(
+    provider_modules, tmp_path, monkeypatch
+):
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    other_path = (tmp_path / "other" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    other_path.parent.mkdir()
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    other = sqlite3.connect(str(other_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    other.row_factory = sqlite3.Row
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    binding = _binding(cap_mod)
+    capability = provider._mint_after_admission(binding)
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        with pytest.raises(kb.AuthorityAdmissionRejected):
+            with provider_mod._capability_scope(provider, other, capability, binding):
+                pass
+        assert provider.is_consumed(capability) is False
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+        other.close()
+
+
+def test_h03_private_adapter_executes_one_typed_native_mutation(
+    provider_modules, tmp_path, monkeypatch
+):
+    adapter_mod = provider_modules["private_adapter"]
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+        ("task-1", "Adapter probe", "ready", 1_000),
+    )
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    binding = _binding(
+        cap_mod,
+        operation="kanban_comment",
+        target="task-1",
+        workspace_id=None,
+    )
+    capability = provider._mint_after_admission(binding)
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        adapter = adapter_mod._PrivateNativeAdapter(provider, conn)
+        result = adapter.execute(
+            capability,
+            binding,
+            adapter_mod._CommentArgs(
+                task_id="task-1", author="orchestrator", body="raw evidence"
+            ),
+        )
+
+        assert type(result) is int and result > 0
+        assert provider.is_consumed(capability) is True
+        row = conn.execute(
+            "SELECT task_id, author, body FROM task_comments WHERE id = ?",
+            (result,),
+        ).fetchone()
+        assert tuple(row) == ("task-1", "orchestrator", "raw evidence")
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u07_private_adapter_rejects_operation_and_target_mismatch_before_scope(
+    provider_modules, tmp_path, monkeypatch
+):
+    adapter_mod = provider_modules["private_adapter"]
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        adapter = adapter_mod._PrivateNativeAdapter(provider, conn)
+        wrong_operation = _binding(
+            cap_mod,
+            operation="kanban_complete",
+            target="task-1",
+            workspace_id=None,
+        )
+        operation_capability = provider._mint_after_admission(wrong_operation)
+        with pytest.raises(adapter_mod._PrivateAdapterRejected, match="arguments"):
+            adapter.execute(
+                operation_capability,
+                wrong_operation,
+                adapter_mod._CommentArgs("task-1", "orchestrator", "comment"),
+            )
+        assert provider.is_consumed(operation_capability) is False
+
+        wrong_target = _binding(
+            cap_mod,
+            operation="kanban_comment",
+            target="task-2",
+            workspace_id=None,
+        )
+        target_capability = provider._mint_after_admission(wrong_target)
+        with pytest.raises(adapter_mod._PrivateAdapterRejected, match="target"):
+            adapter.execute(
+                target_capability,
+                wrong_target,
+                adapter_mod._CommentArgs("task-1", "orchestrator", "comment"),
+            )
+        assert provider.is_consumed(target_capability) is False
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_private_adapter_failure_after_native_txn_consumes_without_retry(
+    provider_modules, tmp_path, monkeypatch
+):
+    adapter_mod = provider_modules["private_adapter"]
+    cap_mod = provider_modules["capability"]
+    provider_mod = provider_modules["provider"]
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
+    binding = _binding(
+        cap_mod,
+        operation="kanban_comment",
+        target="missing-task",
+        workspace_id=None,
+    )
+    capability = provider._mint_after_admission(binding)
+    kb.clear_authority_providers()
+    provider_mod.register_provider(provider)
+
+    try:
+        adapter = adapter_mod._PrivateNativeAdapter(provider, conn)
+        with pytest.raises(ValueError, match="unknown task"):
+            adapter.execute(
+                capability,
+                binding,
+                adapter_mod._CommentArgs(
+                    "missing-task", "orchestrator", "must not retry"
+                ),
+            )
+        assert provider.is_consumed(capability) is True
+        assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 0
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_private_adapter_is_closed_typed_and_not_publicly_imported(provider_modules):
+    adapter_mod = provider_modules["private_adapter"]
+    expected = {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_unblock",
+        "kanban_comment",
+        "kanban_heartbeat",
+        "kanban_request_changes",
+        "kanban_request_review",
+        "kanban_launch",
+    }
+    assert set(adapter_mod._OPERATION_ARGUMENT_TYPES) == expected
+    assert adapter_mod.__all__ == ()
+
+    args = adapter_mod._CommentArgs("task-1", "orchestrator", "comment")
+    with pytest.raises(FrozenInstanceError):
+        args.task_id = "task-2"
+    with pytest.raises(adapter_mod._PrivateAdapterRejected, match="nonblank"):
+        adapter_mod._CommentArgs(" ", "orchestrator", "comment")
+
+    package_root = Path(__file__).parents[1] / "plugins" / "adrian-kanban"
+    for public_name in ("__init__.py", "commands.py", "seam.py", "plugin.yaml"):
+        assert "private_adapter" not in (package_root / public_name).read_text(
+            encoding="utf-8"
+        )
+
+
+def _journal_connection(schema_module):
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    schema_module.create_schema(conn)
+    conn.execute(
+        "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES (?)",
+        ("initiative-1",),
+    )
+    card = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('initiative', 'initiative-1', NULL, 'Initiative', 1000)"
+    )
+    card_id = int(card.lastrowid)
+    conn.execute(
+        "INSERT INTO initiative_segment_projections "
+        "(projection_id, projection_version, initiative_card_id, initiative_id, "
+        "manifest_path, manifest_sha, content_digest, parsed_segment_definitions, "
+        "readiness_refs, validation_result, projected_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "projection-1",
+            1,
+            card_id,
+            "initiative-1",
+            "2-design/segments.json",
+            "a" * 40,
+            "sha256:manifest",
+            "{}",
+            "[]",
+            "valid",
+            1_001,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspaces "
+        "(workspace_id, initiative_card_id, initiative_id, segment_id, "
+        "projection_id, lifecycle_state, controller_binding_ref, active, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "workspace-1",
+            card_id,
+            "initiative-1",
+            "S1",
+            "projection-1",
+            "planned",
+            "controller-1",
+            1,
+            1_002,
+            1_002,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspace_members "
+        "(workspace_id, repository_identity, relative_path, branch, "
+        "required_base_sha, observed_head, member_state, observed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "workspace-1",
+            "repo-1",
+            "initiative-1/S1/repo-1",
+            "initiative-1/S1",
+            "b" * 40,
+            None,
+            "planned",
+            1_002,
+        ),
+    )
+    return conn
+
+
+def _journal_intent(journal_module, **changes):
+    values = {
+        "operation_id": "operation-1",
+        "idempotency_id": "idempotency-1",
+        "member_target": "repo-1",
+        "operation_kind": "workspace_materialize",
+        "workspace_id": "workspace-1",
+        "repository_identity": "repo-1",
+        "intended_git_evidence": "base=b" + ("b" * 39),
+        "intended_filesystem_evidence": "relative=initiative-1/S1/repo-1",
+        "actor_evidence": "system:workspace-controller",
+        "created_at": 1_010,
+    }
+    values.update(changes)
+    return journal_module.JournalIntent(**values)
+
+
+def test_f04_journal_prepares_then_verifies_without_blind_replay(provider_modules):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+
+    assert journal.recovery_action("operation-1", "repo-1") == "prepare"
+    conn.execute("BEGIN IMMEDIATE")
+    prepared = journal.append_prepared(_journal_intent(journal_mod))
+    conn.commit()
+
+    assert prepared.ordinal == 1
+    assert prepared.state == "prepared"
+    assert journal.recovery_action("operation-1", "repo-1") == "verify"
+
+    conn.execute("BEGIN IMMEDIATE")
+    verified = journal.append_verified(
+        operation_id="operation-1",
+        member_target="repo-1",
+        observed_git_evidence="head=c" + ("c" * 39),
+        observed_filesystem_evidence="exists=true",
+        actor_evidence="system:workspace-controller",
+        created_at=1_011,
+    )
+    conn.commit()
+
+    assert verified.ordinal == 2
+    assert verified.state == "verified"
+    assert journal.recovery_action("operation-1", "repo-1") == "consume_verified"
+    assert journal.verified_evidence("operation-1", "repo-1") == verified
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT ordinal, state FROM external_operation_journal "
+            "ORDER BY ordinal"
+        )
+    ] == [(1, "prepared"), (2, "verified")]
+    conn.close()
+
+
+def test_journal_exact_duplicate_prepare_is_idempotent(provider_modules):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+    intent = _journal_intent(journal_mod)
+
+    conn.execute("BEGIN IMMEDIATE")
+    first = journal.append_prepared(intent)
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    duplicate = journal.append_prepared(intent)
+    conn.commit()
+
+    assert duplicate == first
+    assert conn.execute(
+        "SELECT COUNT(*) FROM external_operation_journal"
+    ).fetchone()[0] == 1
+    with pytest.raises(journal_mod.JournalRejected, match="different intent"):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            journal.append_prepared(
+                replace(intent, intended_git_evidence="different-base")
+            )
+        finally:
+            conn.rollback()
+    conn.close()
+
+
+def test_journal_failed_recovery_requires_explicit_resume_disposition(
+    provider_modules,
+):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_prepared(_journal_intent(journal_mod))
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    failed = journal.append_failed(
+        operation_id="operation-1",
+        member_target="repo-1",
+        observed_git_evidence=None,
+        observed_filesystem_evidence="exists=false",
+        error_disposition="effect absent after verification",
+        recovery_disposition="resume",
+        actor_evidence="system:workspace-controller",
+        created_at=1_011,
+    )
+    conn.commit()
+
+    assert failed.state == "failed"
+    assert journal.recovery_action("operation-1", "repo-1") == "resume"
+    conn.execute("BEGIN IMMEDIATE")
+    resumed = journal.append_resume_prepared(
+        operation_id="operation-1",
+        member_target="repo-1",
+        actor_evidence="system:workspace-controller",
+        created_at=1_012,
+    )
+    conn.commit()
+    assert resumed.ordinal == 3
+    assert resumed.state == "prepared"
+    assert journal.recovery_action("operation-1", "repo-1") == "verify"
+
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_failed(
+        operation_id="operation-1",
+        member_target="repo-1",
+        observed_git_evidence=None,
+        observed_filesystem_evidence="exists=false",
+        error_disposition="unsafe repository state",
+        recovery_disposition="manual intervention required",
+        actor_evidence="system:workspace-controller",
+        created_at=1_013,
+    )
+    conn.commit()
+    assert journal.recovery_action("operation-1", "repo-1") == "halt"
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(journal_mod.JournalRejected, match="not resumable"):
+            journal.append_resume_prepared(
+                operation_id="operation-1",
+                member_target="repo-1",
+                actor_evidence="system:workspace-controller",
+                created_at=1_014,
+            )
+    finally:
+        conn.rollback()
+    conn.close()
+
+
+def test_journal_append_requires_caller_transaction_and_valid_sequence(
+    provider_modules,
+):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+    intent = _journal_intent(journal_mod)
+
+    with pytest.raises(journal_mod.JournalRejected, match="transaction"):
+        journal.append_prepared(intent)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(journal_mod.JournalRejected, match="prepared"):
+            journal.append_verified(
+                operation_id="operation-1",
+                member_target="repo-1",
+                observed_git_evidence="head=abc",
+                observed_filesystem_evidence=None,
+                actor_evidence="system:workspace-controller",
+                created_at=1_011,
+            )
+    finally:
+        conn.rollback()
+
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_prepared(intent)
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(journal_mod.JournalRejected, match="observed evidence"):
+            journal.append_verified(
+                operation_id="operation-1",
+                member_target="repo-1",
+                observed_git_evidence=None,
+                observed_filesystem_evidence=None,
+                actor_evidence="system:workspace-controller",
+                created_at=1_011,
+            )
+    finally:
+        conn.rollback()
+    conn.close()
+
+
+def test_journal_rollback_erases_prepare_and_recovery_starts_clean(provider_modules):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_prepared(_journal_intent(journal_mod))
+    conn.rollback()
+
+    assert journal.head("operation-1", "repo-1") is None
+    assert journal.recovery_action("operation-1", "repo-1") == "prepare"
+    conn.close()
+
+
+def test_journal_cold_read_rejects_corrupt_sequence(provider_modules):
+    journal_mod = provider_modules["journal"]
+    conn = _journal_connection(provider_modules["schema"])
+    journal = journal_mod.ExternalOperationJournal(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    journal.append_prepared(_journal_intent(journal_mod))
+    conn.commit()
+    conn.execute(
+        "INSERT INTO external_operation_journal ("
+        "operation_id, idempotency_id, member_target, ordinal, operation_kind, "
+        "workspace_id, repository_identity, state, intended_git_evidence, "
+        "intended_filesystem_evidence, actor_evidence, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "operation-1",
+            "changed-idempotency",
+            "repo-1",
+            2,
+            "workspace_materialize",
+            "workspace-1",
+            "repo-1",
+            "prepared",
+            "base=b" + ("b" * 39),
+            "relative=initiative-1/S1/repo-1",
+            "system:workspace-controller",
+            1_011,
+        ),
+    )
+
+    with pytest.raises(journal_mod.JournalRejected, match="stable intent"):
+        journal.head("operation-1", "repo-1")
+    conn.close()
+
+
+def test_journal_module_has_no_side_effect_or_mutating_sql_surface(provider_modules):
+    module_path = (
+        Path(__file__).parents[1]
+        / "plugins"
+        / "adrian-kanban"
+        / "journal.py"
+    )
+    source = module_path.read_text(encoding="utf-8")
+
+    for forbidden_import in ("subprocess", "pathlib", "requests", "httpx"):
+        assert forbidden_import not in source
+    assert ".commit(" not in source
+    assert ".rollback(" not in source
+    assert "UPDATE external_operation_journal" not in source
+    assert "DELETE FROM external_operation_journal" not in source
+
+
+def _git(cwd, *args):
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr or result.stdout)
+    return result.stdout.strip()
+
+
+def _disposable_repository(tmp_path):
+    repository = tmp_path / "repository"
+    remote = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    _git(repository, "config", "user.name", "S2 Test")
+    _git(repository, "config", "user.email", "s2@example.invalid")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "base")
+    _git(repository, "remote", "add", "origin", str(remote))
+    _git(repository, "push", "-u", "origin", "main")
+    return repository.resolve(), _git(repository, "rev-parse", "HEAD")
+
+
+def _workspace_plan(provider_modules, tmp_path):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository, base_sha = _disposable_repository(tmp_path)
+    conn.execute(
+        "UPDATE segment_workspace_members SET required_base_sha = ? "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (base_sha, "workspace-1", "repo-1"),
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                repository_identity="repo-1",
+                repository_root=str(repository),
+                controlled_worktree_root=str(repository / ".segment-worktrees"),
+            ),
+        )
+    )
+    controller = workspace_mod._SegmentWorkspaceController(conn, registry)
+    plan = controller.load(
+        workspace_id="workspace-1",
+        expected_initiative_id="initiative-1",
+        expected_segment_id="S1",
+        expected_controller_binding="controller-1",
+    )
+    return conn, repository, base_sha, plan
+
+
+def test_workspace_plan_uses_only_registry_root_and_stored_relative_member(
+    provider_modules, tmp_path
+):
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+
+    assert plan.workspace_id == "workspace-1"
+    assert plan.initiative_id == "initiative-1"
+    assert plan.segment_id == "S1"
+    assert len(plan.members) == 1
+    member = plan.members[0]
+    assert member.repository_root == str(repository)
+    assert member.target_path == str(
+        (repository / ".segment-worktrees" / "initiative-1/S1/repo-1").resolve()
+    )
+    assert member.required_base_sha == base_sha
+    conn.close()
+
+
+def test_workspace_plan_rejects_escape_missing_registry_and_binding_mismatch(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository, _ = _disposable_repository(tmp_path)
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1",
+                str(repository),
+                str(repository / ".segment-worktrees"),
+            ),
+        )
+    )
+    controller = workspace_mod._SegmentWorkspaceController(conn, registry)
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="controller"):
+        controller.load(
+            workspace_id="workspace-1",
+            expected_initiative_id="initiative-1",
+            expected_segment_id="S1",
+            expected_controller_binding="wrong-controller",
+        )
+
+    conn.execute(
+        "UPDATE segment_workspace_members SET relative_path = '../escape' "
+        "WHERE workspace_id = 'workspace-1' AND repository_identity = 'repo-1'"
+    )
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="relative path"):
+        controller.load(
+            workspace_id="workspace-1",
+            expected_initiative_id="initiative-1",
+            expected_segment_id="S1",
+            expected_controller_binding="controller-1",
+        )
+
+    empty_registry = workspace_mod._TrustedRepositoryRegistry(())
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="registry"):
+        workspace_mod._SegmentWorkspaceController(conn, empty_registry).load(
+            workspace_id="workspace-1",
+            expected_initiative_id="initiative-1",
+            expected_segment_id="S1",
+            expected_controller_binding="controller-1",
+        )
+    conn.close()
+
+
+def test_workspace_materialization_and_verification_use_exact_branch_and_base(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+
+    initial = executor.materialize(member)
+    assert initial.ready is True
+    assert initial.branch_matches is True
+    assert initial.base_contained is True
+    assert initial.observed_head == base_sha
+
+    target = Path(member.target_path)
+    (target / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(target, "add", "feature.txt")
+    _git(target, "commit", "-m", "feature")
+    advanced = executor.verify(member)
+    assert advanced.ready is True
+    assert advanced.observed_head != base_sha
+    assert advanced.base_contained is True
+
+    _git(target, "checkout", "-b", "wrong-branch")
+    wrong_branch = executor.verify(member)
+    assert wrong_branch.ready is False
+    assert wrong_branch.branch_matches is False
+    assert "branch_mismatch" in wrong_branch.failures
+    conn.close()
+
+
+def test_workspace_materialization_rejects_stale_origin_main(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = replace(plan.members[0], required_base_sha="d" * 40)
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="origin/main"):
+        workspace_mod._GitWorkspaceExecutor().materialize(member)
+    assert not Path(member.target_path).exists()
+    assert _git(repository, "status", "--porcelain") == ""
+    conn.close()
+
+
+def test_workspace_materialization_never_repairs_an_existing_invalid_target(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    target = Path(member.target_path)
+    _git(target, "checkout", "-b", "wrong-branch")
+    before = (
+        _git(target, "symbolic-ref", "--short", "HEAD"),
+        _git(target, "rev-parse", "HEAD"),
+        _git(target, "status", "--porcelain"),
+    )
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="existing target"):
+        executor.materialize(member)
+
+    assert (
+        _git(target, "symbolic-ref", "--short", "HEAD"),
+        _git(target, "rev-parse", "HEAD"),
+        _git(target, "status", "--porcelain"),
+    ) == before
+    conn.close()
+
+
+def test_workspace_verification_is_read_only(provider_modules, tmp_path):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    target = Path(member.target_path)
+    (target / "untracked.txt").write_text("unchanged\n", encoding="utf-8")
+    before = (
+        _git(repository, "status", "--porcelain"),
+        _git(repository, "rev-parse", "HEAD"),
+        _git(target, "status", "--porcelain"),
+        _git(target, "rev-parse", "HEAD"),
+        _git(target, "symbolic-ref", "--short", "HEAD"),
+    )
+
+    assert executor.verify(member).ready is True
+
+    assert (
+        _git(repository, "status", "--porcelain"),
+        _git(repository, "rev-parse", "HEAD"),
+        _git(target, "status", "--porcelain"),
+        _git(target, "rev-parse", "HEAD"),
+        _git(target, "symbolic-ref", "--short", "HEAD"),
+    ) == before
+    conn.close()
+
+
+def test_workspace_plan_rejects_symlink_escape(provider_modules, tmp_path):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository, _ = _disposable_repository(tmp_path)
+    controlled_root = repository / ".segment-worktrees"
+    controlled_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = controlled_root / "escape-link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    conn.execute(
+        "UPDATE segment_workspace_members SET relative_path = ? "
+        "WHERE workspace_id = 'workspace-1' AND repository_identity = 'repo-1'",
+        ("escape-link/member",),
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1", str(repository), str(controlled_root)
+            ),
+        )
+    )
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="relative path"):
+        workspace_mod._SegmentWorkspaceController(conn, registry).load(
+            workspace_id="workspace-1",
+            expected_initiative_id="initiative-1",
+            expected_segment_id="S1",
+            expected_controller_binding="controller-1",
+        )
+    conn.close()
+
+
+def test_workspace_plan_rejects_inactive_or_memberless_workspace(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository, _ = _disposable_repository(tmp_path)
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1",
+                str(repository),
+                str(repository / ".segment-worktrees"),
+            ),
+        )
+    )
+    controller = workspace_mod._SegmentWorkspaceController(conn, registry)
+    load_args = {
+        "workspace_id": "workspace-1",
+        "expected_initiative_id": "initiative-1",
+        "expected_segment_id": "S1",
+        "expected_controller_binding": "controller-1",
+    }
+    conn.execute("UPDATE segment_workspaces SET active = 0 WHERE workspace_id = ?", ("workspace-1",))
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="inactive"):
+        controller.load(**load_args)
+
+    conn.execute("UPDATE segment_workspaces SET active = 1 WHERE workspace_id = ?", ("workspace-1",))
+    conn.execute("DELETE FROM segment_workspace_members WHERE workspace_id = ?", ("workspace-1",))
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="at least one member"):
+        controller.load(**load_args)
+    conn.close()
+
+
+def test_workspace_materialization_fails_closed_when_worktree_add_fails(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    original_run = executor._run
+
+    def fail_worktree_add(argv, cwd):
+        if argv[:3] == ["git", "worktree", "add"]:
+            return subprocess.CompletedProcess(argv, 128, "", "forced failure")
+        return original_run(argv, cwd)
+
+    monkeypatch.setattr(executor, "_run", fail_worktree_add)
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="worktree add"):
+        executor.materialize(member)
+    assert not Path(member.target_path).exists()
+    conn.close()
+
+
+def _workspace_materialize_intent(journal_mod, member, **changes):
+    values = {
+        "operation_id": "materialize-1",
+        "idempotency_id": "materialize-idempotency-1",
+        "member_target": member.repository_identity,
+        "operation_kind": "workspace_materialize",
+        "workspace_id": member.workspace_id,
+        "repository_identity": member.repository_identity,
+        "intended_git_evidence": (
+            f"base={member.required_base_sha};branch={member.branch}"
+        ),
+        "intended_filesystem_evidence": f"target={member.target_path}",
+        "actor_evidence": "system:workspace-controller",
+        "created_at": 2_000,
+    }
+    values.update(changes)
+    return journal_mod.JournalIntent(**values)
+
+
+def test_journaled_materialization_commits_prepare_before_effect_and_consumes_later(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    intent = _workspace_materialize_intent(journal_mod, member)
+    original_materialize = executor.materialize
+
+    def observe_committed_prepare(materialize_member):
+        assert conn.in_transaction is False
+        assert journal.head(intent.operation_id, intent.member_target).state == "prepared"
+        return original_materialize(materialize_member)
+
+    monkeypatch.setattr(executor, "materialize", observe_committed_prepare)
+    prepared = operations.prepare_materialize(intent, member)
+    assert prepared.state == "prepared"
+    assert conn.in_transaction is False
+
+    verified = operations.run_materialize(intent, member, outcome_at=2_001)
+    assert verified.state == "verified"
+    assert conn.execute(
+        "SELECT member_state FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()[0] == "planned"
+
+    consumed = operations.consume_materialization(intent, member, consumed_at=2_002)
+    assert consumed.observed_head == member.required_base_sha
+    row = conn.execute(
+        "SELECT observed_head, member_state, observed_at "
+        "FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()
+    assert tuple(row) == (member.required_base_sha, "materialized", 2_002)
+    assert conn.in_transaction is False
+    conn.close()
+
+
+def test_journaled_materialization_recovers_after_effect_without_replay(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    executor.materialize(member)
+
+    def blind_replay(_member):
+        raise AssertionError("materialize must not replay an already-observed effect")
+
+    monkeypatch.setattr(executor, "materialize", blind_replay)
+    verified = operations.run_materialize(intent, member, outcome_at=2_001)
+    assert verified.state == "verified"
+    assert [
+        row[0]
+        for row in conn.execute(
+            "SELECT state FROM external_operation_journal ORDER BY ordinal"
+        )
+    ] == ["prepared", "verified"]
+
+    monkeypatch.setattr(
+        executor,
+        "verify",
+        lambda _member: (_ for _ in ()).throw(
+            AssertionError("verified retry must not inspect or replay the effect")
+        ),
+    )
+    assert operations.run_materialize(intent, member, outcome_at=2_002) == verified
+    assert conn.execute(
+        "SELECT COUNT(*) FROM external_operation_journal"
+    ).fetchone()[0] == 2
+    conn.close()
+
+
+def test_journaled_materialization_resumes_only_after_verified_absence(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    original_materialize = executor.materialize
+    monkeypatch.setattr(
+        executor,
+        "materialize",
+        lambda _member: (_ for _ in ()).throw(
+            workspace_mod._WorkspaceRejected("injected pre-effect failure")
+        ),
+    )
+
+    failed = operations.run_materialize(intent, member, outcome_at=2_001)
+    assert failed.state == "failed"
+    assert failed.recovery_disposition == "resume"
+    assert not Path(member.target_path).exists()
+
+    monkeypatch.setattr(executor, "materialize", original_materialize)
+    verified = operations.run_materialize(intent, member, outcome_at=2_002)
+    assert verified.state == "verified"
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT ordinal, state FROM external_operation_journal ORDER BY ordinal"
+        )
+    ] == [
+        (1, "prepared"),
+        (2, "failed"),
+        (3, "prepared"),
+        (4, "verified"),
+    ]
+    conn.close()
+
+
+def test_journaled_materialization_halts_on_unsafe_existing_target(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn, journal, workspace_mod._GitWorkspaceExecutor()
+    )
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    target = Path(member.target_path)
+    target.mkdir(parents=True)
+    (target / "preserve.txt").write_text("do not alter\n", encoding="utf-8")
+
+    failed = operations.run_materialize(intent, member, outcome_at=2_001)
+    assert failed.state == "failed"
+    assert failed.recovery_disposition == "manual intervention required"
+    assert (target / "preserve.txt").read_text(encoding="utf-8") == "do not alter\n"
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="halted"):
+        operations.run_materialize(intent, member, outcome_at=2_002)
+    conn.close()
+
+
+def test_materialization_consumption_requires_exact_verified_evidence(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn, journal, workspace_mod._GitWorkspaceExecutor()
+    )
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="verified"):
+        operations.consume_materialization(intent, member, consumed_at=2_001)
+    wrong_intent = replace(intent, intended_git_evidence="base=wrong;branch=wrong")
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="intent"):
+        operations.run_materialize(wrong_intent, member, outcome_at=2_001)
+    assert conn.execute(
+        "SELECT member_state FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()[0] == "planned"
+    conn.close()
+
+
+def _commit_workspace_feature(member):
+    target = Path(member.target_path)
+    (target / "feature.txt").write_text("segment feature\n", encoding="utf-8")
+    _git(target, "add", "feature.txt")
+    _git(target, "commit", "-m", "segment feature")
+    return _git(target, "rev-parse", "HEAD")
+
+
+def test_workspace_merge_creates_merge_commit_and_proves_remote_containment(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+
+    absent = executor.verify_merge(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+    assert absent.ready is False
+    assert absent.failures == ("merge_absent",)
+
+    merged = executor.merge_to_origin_main(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+    assert merged.ready is True
+    assert merged.merge_commit is True
+    assert merged.source_contained is True
+    assert merged.remote_contained is True
+    assert merged.merge_head not in (base_sha, source_head)
+    assert len(_git(repository, "rev-list", "--parents", "-n", "1", merged.merge_head).split()) == 3
+    remote = Path(_git(repository, "remote", "get-url", "origin"))
+    assert _git(remote, "rev-parse", "refs/heads/main") == merged.remote_main_head
+    assert merged.merge_head == merged.remote_main_head
+    conn.close()
+
+
+def test_workspace_merge_recovers_publish_pending_without_second_merge_commit(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    original_run = executor._run
+
+    def fail_first_push(argv, cwd):
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 1, "", "injected push failure")
+        return original_run(argv, cwd)
+
+    monkeypatch.setattr(executor, "_run", fail_first_push)
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="push"):
+        executor.merge_to_origin_main(
+            member,
+            expected_main_sha=base_sha,
+            expected_source_head=source_head,
+        )
+    pending = executor.verify_merge(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+    assert pending.ready is False
+    assert pending.merge_commit is True
+    assert pending.failures == ("publish_pending",)
+    first_merge_head = pending.merge_head
+
+    monkeypatch.setattr(executor, "_run", original_run)
+    recovered = executor.merge_to_origin_main(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+    assert recovered.ready is True
+    assert recovered.merge_head == first_merge_head
+    assert _git(repository, "rev-list", "--count", f"{base_sha}..main") == "2"
+    conn.close()
+
+
+def test_workspace_merge_rejects_remote_divergence_before_local_effect(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    remote = Path(_git(repository, "remote", "get-url", "origin"))
+    other = tmp_path / "remote-writer"
+    subprocess.run(["git", "clone", str(remote), str(other)], check=True, capture_output=True)
+    _git(other, "config", "user.name", "Remote Writer")
+    _git(other, "config", "user.email", "remote@example.invalid")
+    _git(other, "checkout", "main")
+    (other / "remote.txt").write_text("remote advance\n", encoding="utf-8")
+    _git(other, "add", "remote.txt")
+    _git(other, "commit", "-m", "remote advance")
+    _git(other, "push", "origin", "main")
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="origin/main"):
+        executor.merge_to_origin_main(
+            member,
+            expected_main_sha=base_sha,
+            expected_source_head=source_head,
+        )
+    assert _git(repository, "rev-parse", "main") == base_sha
+    conn.close()
+
+
+def _workspace_merge_intent(journal_mod, member, base_sha, source_head, **changes):
+    values = {
+        "operation_id": "merge-1",
+        "idempotency_id": "merge-idempotency-1",
+        "member_target": member.repository_identity,
+        "operation_kind": "workspace_merge",
+        "workspace_id": member.workspace_id,
+        "repository_identity": member.repository_identity,
+        "intended_git_evidence": (
+            f"base={base_sha};source={source_head};branch={member.branch}"
+        ),
+        "intended_filesystem_evidence": f"target={member.target_path};retain=true",
+        "actor_evidence": "system:workspace-controller",
+        "created_at": 3_000,
+    }
+    values.update(changes)
+    return journal_mod.JournalIntent(**values)
+
+
+def test_journaled_merge_commits_prepare_before_git_and_consumes_verified_result(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    conn.execute(
+        "UPDATE segment_workspace_members SET observed_head = ?, member_state = 'materialized' "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (source_head, member.workspace_id, member.repository_identity),
+    )
+    intent = _workspace_merge_intent(
+        journal_mod, member, base_sha, source_head
+    )
+    original_merge = executor.merge_to_origin_main
+
+    def observe_committed_prepare(merge_member, **kwargs):
+        assert conn.in_transaction is False
+        assert journal.head(intent.operation_id, intent.member_target).state == "prepared"
+        return original_merge(merge_member, **kwargs)
+
+    monkeypatch.setattr(executor, "merge_to_origin_main", observe_committed_prepare)
+    operations.prepare_merge(intent, member, base_sha, source_head)
+    verified = operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_001
+    )
+    assert verified.state == "verified"
+    assert conn.execute(
+        "SELECT member_state FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()[0] == "materialized"
+
+    consumed = operations.consume_merge(
+        intent, member, base_sha, source_head, consumed_at=3_002
+    )
+    assert consumed.ready is True
+    assert conn.execute(
+        "SELECT observed_head, member_state, observed_at "
+        "FROM segment_workspace_members WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()[:] == (source_head, "merged", 3_002)
+    assert Path(member.target_path).exists()
+    conn.close()
+
+
+def test_journaled_merge_recovers_completed_effect_without_replay(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    intent = _workspace_merge_intent(journal_mod, member, base_sha, source_head)
+    operations.prepare_merge(intent, member, base_sha, source_head)
+    completed = executor.merge_to_origin_main(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+
+    monkeypatch.setattr(
+        executor,
+        "merge_to_origin_main",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("verified merge effect must not replay")
+        ),
+    )
+    verified = operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_001
+    )
+    assert verified.state == "verified"
+    assert verified.observed_git_evidence is not None
+    assert f"merge={completed.merge_head}" in verified.observed_git_evidence
+    assert operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_002
+    ) == verified
+    assert conn.execute(
+        "SELECT COUNT(*) FROM external_operation_journal"
+    ).fetchone()[0] == 2
+    conn.close()
+
+
+def test_journaled_merge_marks_safe_absence_resumable_after_effect_failure(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    intent = _workspace_merge_intent(journal_mod, member, base_sha, source_head)
+    operations.prepare_merge(intent, member, base_sha, source_head)
+    original_merge = executor.merge_to_origin_main
+    monkeypatch.setattr(
+        executor,
+        "merge_to_origin_main",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            workspace_mod._WorkspaceRejected("injected pre-effect failure")
+        ),
+    )
+
+    failed = operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_001
+    )
+    assert failed.state == "failed"
+    assert failed.recovery_disposition == "resume"
+    assert executor.verify_merge(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    ).failures == ("merge_absent",)
+
+    monkeypatch.setattr(executor, "merge_to_origin_main", original_merge)
+    assert operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_002
+    ).state == "verified"
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT ordinal, state FROM external_operation_journal ORDER BY ordinal"
+        )
+    ] == [
+        (1, "prepared"),
+        (2, "failed"),
+        (3, "prepared"),
+        (4, "verified"),
+    ]
+    conn.close()
+
+
+def _mark_workspace_member_materialized(conn, member, source_head):
+    conn.execute(
+        "UPDATE segment_workspace_members SET observed_head = ?, member_state = 'materialized' "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (source_head, member.workspace_id, member.repository_identity),
+    )
+
+
+def _complete_journaled_member_merge(
+    operations,
+    journal_mod,
+    member,
+    base_sha,
+    source_head,
+    *,
+    operation_id,
+    at,
+):
+    intent = _workspace_merge_intent(
+        journal_mod,
+        member,
+        base_sha,
+        source_head,
+        operation_id=operation_id,
+        idempotency_id=f"{operation_id}-idempotency",
+        created_at=at,
+    )
+    operations.prepare_merge(intent, member, base_sha, source_head)
+    assert operations.run_merge(
+        intent,
+        member,
+        base_sha,
+        source_head,
+        outcome_at=at + 1,
+    ).state == "verified"
+    operations.consume_merge(
+        intent,
+        member,
+        base_sha,
+        source_head,
+        consumed_at=at + 2,
+    )
+    return intent
+
+
+def test_workspace_retirement_releases_authority_but_retains_clean_evidence(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    _mark_workspace_member_materialized(conn, member, source_head)
+    conn.execute(
+        "UPDATE segment_workspaces SET lifecycle_state = 'active' WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    )
+    _complete_journaled_member_merge(
+        operations,
+        journal_mod,
+        member,
+        base_sha,
+        source_head,
+        operation_id="merge-retire-1",
+        at=4_000,
+    )
+
+    assert operations.retire_workspace(plan, retired_at=4_003) == ("repo-1",)
+    assert conn.execute(
+        "SELECT lifecycle_state, active, updated_at FROM segment_workspaces "
+        "WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[:] == ("retired", 0, 4_003)
+    assert conn.execute(
+        "SELECT observed_head, member_state, observed_at FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (plan.workspace_id, member.repository_identity),
+    ).fetchone()[:] == (source_head, "retired", 4_003)
+    assert Path(member.target_path).exists()
+    assert _git(member.target_path, "status", "--porcelain") == ""
+    assert _git(member.target_path, "rev-parse", "HEAD") == source_head
+    assert operations.retire_workspace(plan, retired_at=4_003) == ("repo-1",)
+    conn.close()
+
+
+def test_workspace_retirement_rejects_dirty_retained_evidence_without_db_change(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn, journal_mod.ExternalOperationJournal(conn), executor
+    )
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    _mark_workspace_member_materialized(conn, member, source_head)
+    conn.execute(
+        "UPDATE segment_workspaces SET lifecycle_state = 'active' WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    )
+    _complete_journaled_member_merge(
+        operations,
+        journal_mod,
+        member,
+        base_sha,
+        source_head,
+        operation_id="merge-dirty-1",
+        at=4_100,
+    )
+    (Path(member.target_path) / "untracked.txt").write_text(
+        "must be reconciled\n", encoding="utf-8"
+    )
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="clean"):
+        operations.retire_workspace(plan, retired_at=4_103)
+
+    assert conn.execute(
+        "SELECT lifecycle_state, active FROM segment_workspaces WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[:] == ("active", 1)
+    assert conn.execute(
+        "SELECT member_state FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (plan.workspace_id, member.repository_identity),
+    ).fetchone()[0] == "merged"
+    assert Path(member.target_path).exists()
+    conn.close()
+
+
+def _two_repository_workspace_plan(provider_modules, tmp_path):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository_one, base_one = _disposable_repository(tmp_path / "one")
+    repository_two, base_two = _disposable_repository(tmp_path / "two")
+    conn.execute(
+        "UPDATE segment_workspace_members SET required_base_sha = ? "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (base_one, "workspace-1", "repo-1"),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspace_members "
+        "(workspace_id, repository_identity, relative_path, branch, required_base_sha, "
+        "observed_head, member_state, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "workspace-1",
+            "repo-2",
+            "initiative-1/S1/repo-2",
+            "initiative-1/S1",
+            base_two,
+            None,
+            "planned",
+            1_002,
+        ),
+    )
+    conn.execute(
+        "UPDATE segment_workspaces SET lifecycle_state = 'active' WHERE workspace_id = ?",
+        ("workspace-1",),
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1",
+                str(repository_one),
+                str(repository_one / ".segment-worktrees"),
+            ),
+            workspace_mod._RepositoryRegistration(
+                "repo-2",
+                str(repository_two),
+                str(repository_two / ".segment-worktrees"),
+            ),
+        )
+    )
+    plan = workspace_mod._SegmentWorkspaceController(conn, registry).load(
+        workspace_id="workspace-1",
+        expected_initiative_id="initiative-1",
+        expected_segment_id="S1",
+        expected_controller_binding="controller-1",
+    )
+    return conn, (base_one, base_two), plan
+
+
+def test_multi_repository_partial_merge_stays_active_with_truthful_member_journals(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, bases, plan = _two_repository_workspace_plan(provider_modules, tmp_path)
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    first, second = plan.members
+    executor.materialize(first)
+    executor.materialize(second)
+    first_head = _commit_workspace_feature(first)
+    second_head = _commit_workspace_feature(second)
+    _mark_workspace_member_materialized(conn, first, first_head)
+    _mark_workspace_member_materialized(conn, second, second_head)
+    _complete_journaled_member_merge(
+        operations,
+        journal_mod,
+        first,
+        bases[0],
+        first_head,
+        operation_id="merge-partial-1",
+        at=4_200,
+    )
+
+    second_intent = _workspace_merge_intent(
+        journal_mod,
+        second,
+        bases[1],
+        second_head,
+        operation_id="merge-partial-2",
+        idempotency_id="merge-partial-2-idempotency",
+        created_at=4_203,
+    )
+    operations.prepare_merge(second_intent, second, bases[1], second_head)
+    monkeypatch.setattr(
+        executor,
+        "merge_to_origin_main",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            workspace_mod._WorkspaceRejected("injected second repository failure")
+        ),
+    )
+    second_failed = operations.run_merge(
+        second_intent,
+        second,
+        bases[1],
+        second_head,
+        outcome_at=4_204,
+    )
+    assert second_failed.state == "failed"
+    assert second_failed.recovery_disposition == "resume"
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="all members"):
+        operations.retire_workspace(plan, retired_at=4_205)
+
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT repository_identity, observed_head, member_state "
+            "FROM segment_workspace_members WHERE workspace_id = ? "
+            "ORDER BY repository_identity",
+            (plan.workspace_id,),
+        )
+    ] == [
+        ("repo-1", first_head, "merged"),
+        ("repo-2", second_head, "materialized"),
+    ]
+    assert conn.execute(
+        "SELECT lifecycle_state, active FROM segment_workspaces WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[:] == ("active", 1)
+    assert journal.head("merge-partial-1", "repo-1").state == "verified"
+    assert journal.head("merge-partial-2", "repo-2").state == "failed"
+    assert Path(first.target_path).exists()
+    assert Path(second.target_path).exists()
+    conn.close()
+
+
+def test_h16_rejection_envelope_preserves_every_failure_and_remediation(
+    provider_modules,
+):
+    diagnostic = provider_modules["diagnostics"]
+    collector = diagnostic.DiagnosticCollector(
+        "attempt-1",
+        "kanban_transition_initiative",
+        diagnostic.Boundary("DEV3/S1", "DEV4/S1"),
+    )
+    collector.failure(
+        diagnostic.FailedCheck(
+            "MISSING_HANDOFF",
+            "task:t-1",
+            "accepted DEV3 handoff",
+            "no accepted handoff",
+            "accepted task handoff record ID",
+            "complete review on the same task card",
+            "reviewer",
+            "return_route",
+        )
+    )
+    collector.failure(
+        diagnostic.FailedCheck(
+            "STALE_BASE",
+            "workspace:w-1",
+            "expected origin/main base",
+            "workspace base differs",
+            "full Git commit SHA",
+            "reconcile the workspace through the DEV3 return route",
+            "orchestrator",
+            "return_route",
+        )
+    )
+    collector.not_evaluated(
+        diagnostic.NotEvaluatedCheck(
+            "MERGE_CONTAINMENT",
+            ("MISSING_HANDOFF", "STALE_BASE"),
+        )
+    )
+
+    rejection = collector.rejection()
+    payload = rejection.as_dict()
+
+    assert payload["result"] == "REJECTED"
+    assert payload["state_changed"] is False
+    assert [item["code"] for item in payload["failed_checks"]] == [
+        "MISSING_HANDOFF",
+        "STALE_BASE",
+    ]
+    assert payload["not_evaluated_checks"] == [
+        {
+            "code": "MERGE_CONTAINMENT",
+            "requires": ["MISSING_HANDOFF", "STALE_BASE"],
+        }
+    ]
+    rendered = rejection.render()
+    assert rendered.startswith("REJECTED — no Kanban state changed")
+    assert "complete review on the same task card" in rendered
+    assert "reconcile the workspace" in rendered
+
+
+def test_f14_diagnostic_codes_are_unique_across_all_result_lists(provider_modules):
+    diagnostic = provider_modules["diagnostics"]
+    collector = diagnostic.DiagnosticCollector(
+        "attempt-1", "operation", diagnostic.Boundary("from", "to")
+    )
+    failure = diagnostic.FailedCheck(
+        "DUPLICATE",
+        "target",
+        "expected",
+        "observed",
+        "format",
+        "safe correction",
+        "session_agent",
+        "same_operation",
+    )
+    collector.failure(failure)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        collector.failure(failure)
+    with pytest.raises(ValueError, match="duplicate"):
+        collector.not_evaluated(
+            diagnostic.NotEvaluatedCheck("DUPLICATE", ("PREREQUISITE",))
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        diagnostic.RejectionEnvelope(
+            "attempt-1",
+            "operation",
+            diagnostic.Boundary("from", "to"),
+            (failure,),
+            (diagnostic.NotEvaluatedCheck("DUPLICATE", ("X",)),),
+        )
+
+
+@pytest.mark.parametrize("actor", ["root", "model", "admin", ""])
+def test_diagnostic_rejects_unknown_authority_labels(provider_modules, actor):
+    diagnostic = provider_modules["diagnostics"]
+    with pytest.raises(ValueError):
+        diagnostic.FailedCheck(
+            "ACTOR",
+            "actor",
+            "ratified actor enum",
+            "unknown",
+            "session_agent | orchestrator | reviewer | adrian | system_operator",
+            "use runtime-derived actor evidence",
+            actor,
+            "not_retryable",
+        )
+
+
+_EXPECTED_CONTRACT_TEMPLATES = {
+    "D2": (
+        "design-lifecycle.d2",
+        "D2",
+        "independent-reviewer",
+        ("baseline_refs", "governing_source_refs"),
+        ("eight_angle_review", "accumulated_record_on_reentry"),
+        "d2_review_v1",
+        None,
+    ),
+    "D4.1": (
+        "design-lifecycle.d4",
+        "D4",
+        "independent-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("exact_per_document_edit_set",),
+        "d4_1_edit_set_v1",
+        ("d4", 1, None, "accepted_completion"),
+    ),
+    "D4.2": (
+        "design-lifecycle.d4",
+        "D4",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("d4_1_accepted",),
+        "d4_2_verification_v1",
+        ("d4", 2, "D4.1", "accepted_completion"),
+    ),
+    "D4.5": (
+        "design-lifecycle.d4",
+        "D4",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("d4_3_approval_checkpoint", "d4_4_execution_checkpoint"),
+        "d4_5_post_write_v1",
+        ("d4", 5, "D4.4", "initiative_checkpoint"),
+    ),
+    "DEV1.1a": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 1, None, "accepted_completion"),
+    ),
+    "DEV1.1b": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 2, "DEV1.1a", "accepted_completion"),
+    ),
+    "DEV1.1c": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 3, "DEV1.1b", "accepted_completion"),
+    ),
+    "DEV1.1d": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 4, "DEV1.1c", "accepted_completion"),
+    ),
+    "DEV1.1e": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("baseline_refs",),
+        ("angle_isolation", "no_prior_angle_handoffs"),
+        "dev1_angle_v1",
+        ("dev1_angles", 5, "DEV1.1d", "accepted_completion"),
+    ),
+    "DEV1.4": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "test-authority-reviewer",
+        ("baseline_refs", "prior_record_refs"),
+        ("dry_cumulative_reconnaissance",),
+        "dev1_4_design_to_scope_v1",
+        None,
+    ),
+    "DEV1.5": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "independent-reviewer",
+        ("prior_record_refs",),
+        ("ratified_scope",),
+        "dev1_5_segmentation_v1",
+        None,
+    ),
+    "DEV1.6": (
+        "design-lifecycle.dev1",
+        "DEV1",
+        "test-authority-reviewer",
+        ("prior_record_refs",),
+        ("ratified_scope", "proposed_segment_list"),
+        "dev1_6_segment_review_v1",
+        None,
+    ),
+}
+
+
+@pytest.mark.parametrize("step", tuple(_EXPECTED_CONTRACT_TEMPLATES))
+def test_h07_registry_contains_only_the_fixed_v028_task_templates(
+    provider_modules, step
+):
+    contracts = provider_modules["contracts"]
+    template = contracts.template_for(step)
+    expected = _EXPECTED_CONTRACT_TEMPLATES[step]
+    sequence = template.sequence
+    sequence_tuple = None
+    if sequence is not None:
+        sequence_tuple = (
+            sequence.family,
+            sequence.ordinal,
+            sequence.predecessor_step,
+            sequence.release_condition,
+        )
+
+    assert (
+        template.contract_id,
+        template.phase,
+        template.execution_profile,
+        template.required_reference_groups,
+        template.constraints,
+        template.output_validator,
+        sequence_tuple,
+    ) == expected
+    assert template.contract_version == 1
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ("D1", "D3", "D4.3", "D4.4", "DEV1.2", "DEV1.3", "DEV1.7"),
+)
+def test_h07_initiative_checkpoints_are_not_task_contract_templates(
+    provider_modules, checkpoint
+):
+    contracts = provider_modules["contracts"]
+    with pytest.raises(contracts.ContractRejected, match="unknown step"):
+        contracts.template_for(checkpoint)
+
+
+def test_h07_contract_expansion_has_no_caller_control_over_derived_policy(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    parameters = inspect.signature(contracts.expand_contract).parameters
+
+    assert "execution_profile" not in parameters
+    assert "constraints" not in parameters
+    assert "output_validator" not in parameters
+
+    snapshot = contracts.expand_contract(
+        step="D2",
+        initiative_id=" initiative-1 ",
+        baseline_refs=(" baseline:a ",),
+        governing_source_refs=("canon:b",),
+    )
+    assert snapshot.initiative_id == "initiative-1"
+    assert snapshot.baseline_refs == ("baseline:a",)
+    assert snapshot.execution_profile == "independent-reviewer"
+    assert snapshot.constraints == (
+        "eight_angle_review",
+        "accumulated_record_on_reentry",
+    )
+    assert snapshot.output_validator == "d2_review_v1"
+    assert contracts.validate_snapshot(snapshot) is True
+
+
+def test_h07_registry_hash_and_snapshot_payload_are_deterministic(provider_modules):
+    contracts = provider_modules["contracts"]
+    first_hash = contracts.registry_hash()
+    second_hash = contracts.registry_hash()
+    snapshot = contracts.expand_contract(
+        step="DEV1.6",
+        initiative_id="initiative-1",
+        prior_record_refs=("record:1",),
+    )
+
+    assert first_hash == second_hash == snapshot.registry_hash
+    assert len(first_hash) == 64
+    assert snapshot.canonical_payload() == json.dumps(
+        snapshot.canonical_dict(), sort_keys=True, separators=(",", ":")
+    )
+
+
+@pytest.mark.parametrize(
+    ("step", "kwargs", "expected_group", "expected_ordinal"),
+    (
+        (
+            "D4.1",
+            {"baseline_refs": ("b",), "prior_record_refs": ("p",)},
+            "initiative-1:d4",
+            1,
+        ),
+        (
+            "D4.2",
+            {
+                "baseline_refs": ("b",),
+                "prior_record_refs": ("p",),
+                "predecessor_ref": "result:D4.1",
+            },
+            "initiative-1:d4",
+            2,
+        ),
+        (
+            "DEV1.1a",
+            {"baseline_refs": ("b",)},
+            "initiative-1:dev1_angles",
+            1,
+        ),
+        (
+            "DEV1.1e",
+            {"baseline_refs": ("b",), "predecessor_ref": "result:DEV1.1d"},
+            "initiative-1:dev1_angles",
+            5,
+        ),
+    ),
+)
+def test_h18_sequence_expansion_enforces_first_and_later_step_shape(
+    provider_modules, step, kwargs, expected_group, expected_ordinal
+):
+    contracts = provider_modules["contracts"]
+    snapshot = contracts.expand_contract(
+        step=step, initiative_id="initiative-1", **kwargs
+    )
+
+    assert snapshot.sequence_group_id == expected_group
+    assert snapshot.sequence_ordinal == expected_ordinal
+    if expected_ordinal == 1:
+        assert snapshot.predecessor_ref is None
+    else:
+        assert snapshot.predecessor_ref == kwargs["predecessor_ref"]
+    assert contracts.validate_snapshot(snapshot) is True
+
+
+def test_h18_sequence_expansion_rejects_missing_or_unexpected_predecessor(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    with pytest.raises(contracts.ContractRejected, match="no predecessor"):
+        contracts.expand_contract(
+            step="D4.1",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            prior_record_refs=("p",),
+            predecessor_ref="unexpected",
+        )
+    with pytest.raises(contracts.ContractRejected, match="required"):
+        contracts.expand_contract(
+            step="D4.2",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            prior_record_refs=("p",),
+        )
+
+
+def test_u10_expansion_rejects_missing_duplicate_and_segment_inputs(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    with pytest.raises(contracts.ContractRejected, match="governing_source_refs"):
+        contracts.expand_contract(
+            step="D2", initiative_id="initiative-1", baseline_refs=("b",)
+        )
+    with pytest.raises(contracts.ContractRejected, match="unique"):
+        contracts.expand_contract(
+            step="D2",
+            initiative_id="initiative-1",
+            baseline_refs=("b", " b "),
+            governing_source_refs=("g",),
+        )
+    with pytest.raises(contracts.ContractRejected, match="both be set"):
+        contracts.expand_contract(
+            step="D2",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            governing_source_refs=("g",),
+            segment_id="S1",
+        )
+    with pytest.raises(contracts.ContractRejected, match="initial templates"):
+        contracts.expand_contract(
+            step="D2",
+            initiative_id="initiative-1",
+            baseline_refs=("b",),
+            governing_source_refs=("g",),
+            segment_id="S1",
+            segment_workspace_id="workspace-1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reported"),
+    (
+        ("version", 2, "version"),
+        ("contract_id", "secret-contract", "contract_id"),
+        ("contract_version", 2, "contract_version"),
+        ("phase", "secret-phase", "phase"),
+        ("execution_profile", "secret-profile", "execution_profile"),
+        ("constraints", ("secret-constraint",), "constraints"),
+        ("output_validator", "secret-validator", "output_validator"),
+        ("registry_hash", "secret-hash", "registry_hash"),
+        ("sequence_group_id", "secret-group", "sequence_group_id"),
+        ("sequence_ordinal", 3, "sequence_ordinal"),
+        ("release_condition", "initiative_checkpoint", "release_condition"),
+        ("baseline_refs", (), "required_reference_groups"),
+    ),
+)
+def test_f15_cold_snapshot_validation_detects_each_derived_field_drift(
+    provider_modules, field, value, reported
+):
+    contracts = provider_modules["contracts"]
+    snapshot = contracts.expand_contract(
+        step="D4.2",
+        initiative_id="initiative-1",
+        baseline_refs=("b",),
+        prior_record_refs=("p",),
+        predecessor_ref="result:D4.1",
+    )
+    altered = replace(snapshot, **{field: value})
+
+    with pytest.raises(contracts.ContractRejected) as rejected:
+        contracts.validate_snapshot(altered)
+
+    assert reported in str(rejected.value)
+    assert "secret-" not in str(rejected.value)
+
+
+def test_f15_cold_snapshot_rejects_scope_never_issued_by_initial_registry(
+    provider_modules,
+):
+    contracts = provider_modules["contracts"]
+    snapshot = contracts.expand_contract(
+        step="D2",
+        initiative_id="initiative-1",
+        baseline_refs=("b",),
+        governing_source_refs=("g",),
+    )
+    altered = replace(
+        snapshot, segment_id="S1", segment_workspace_id="workspace-1"
+    )
+
+    with pytest.raises(contracts.ContractRejected) as rejected:
+        contracts.validate_snapshot(altered)
+
+    assert "segment_id" in str(rejected.value)
+    assert "segment_workspace_id" in str(rejected.value)
+
+
+def _fresh_s2_schema(provider_modules):
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    provider_modules["schema"].create_schema(conn)
+    conn.execute(
+        "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES ('I1')"
+    )
+    conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('initiative', 'I1', NULL, 'Initiative', 1)"
+    )
+    initiative_card_id = conn.execute(
+        "SELECT id FROM adrian_kanban_cards WHERE task_id IS NULL"
+    ).fetchone()[0]
+    return conn, initiative_card_id
+
+
+def _insert_task_card(conn, task_id):
+    cursor = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('task', 'I1', ?, ?, 1)",
+        (task_id, task_id),
+    )
+    return cursor.lastrowid
+
+
+def _insert_contract(conn, initiative_card_id, task_card_id, task_id, contract_id):
+    conn.execute(
+        "INSERT INTO task_lifecycle_contracts "
+        "(contract_id, contract_version, step, task_card_id, task_id, "
+        "initiative_card_id, initiative_id, segment_id, workspace_id, "
+        "execution_profile, canonical_contract_payload, registry_hash, "
+        "skill_id, skill_version, skill_hash, created_at) "
+        "VALUES (?, '1', 'D2', ?, ?, ?, 'I1', NULL, NULL, "
+        "'independent-reviewer', '{}', 'registry-hash', "
+        "'skill:d2', '1', 'skill-hash', 1)",
+        (contract_id, task_card_id, task_id, initiative_card_id),
+    )
+
+
+def test_h01_contract_family_is_reusable_but_each_task_has_at_most_one_contract(
+    provider_modules,
+):
+    conn, initiative_card_id = _fresh_s2_schema(provider_modules)
+    task_one = _insert_task_card(conn, "T1")
+    task_two = _insert_task_card(conn, "T2")
+
+    _insert_contract(
+        conn, initiative_card_id, task_one, "T1", "design-lifecycle.d2"
+    )
+    _insert_contract(
+        conn, initiative_card_id, task_two, "T2", "design-lifecycle.d2"
+    )
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_lifecycle_contracts "
+        "WHERE contract_id = 'design-lifecycle.d2'"
+    ).fetchone()[0] == 2
+    columns = {
+        row["name"]: row["pk"]
+        for row in conn.execute("PRAGMA table_info(task_lifecycle_contracts)")
+    }
+    assert columns["task_card_id"] == 1
+    assert columns["contract_id"] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_contract(
+            conn,
+            initiative_card_id,
+            task_one,
+            "T1",
+            "design-lifecycle.other",
+        )
+    conn.close()
+
+
+def _insert_phase_result(conn, initiative_card_id, result_id, segment_id, accepted):
+    conn.execute(
+        "INSERT INTO initiative_phase_results "
+        "(result_id, initiative_card_id, initiative_id, phase, segment_id, "
+        "iteration, result_kind, contract_id, contract_version, "
+        "canonical_payload, accepted_task_refs, accepted_checkpoint_refs, "
+        "actor_evidence, idempotency_key, accepted, created_at) "
+        "VALUES (?, ?, 'I1', 'D3', ?, 1, 'close', NULL, NULL, '{}', "
+        "NULL, NULL, 'actor', ?, ?, 1)",
+        (result_id, initiative_card_id, segment_id, f"key:{result_id}", accepted),
+    )
+
+
+@pytest.mark.parametrize("segment_id", [None, "S1"])
+def test_f08_duplicate_accepted_phase_result_key_rejects_even_with_null_segment(
+    provider_modules, segment_id
+):
+    conn, initiative_card_id = _fresh_s2_schema(provider_modules)
+    _insert_phase_result(conn, initiative_card_id, "R1", segment_id, 1)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_phase_result(conn, initiative_card_id, "R2", segment_id, 1)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM initiative_phase_results WHERE accepted = 1"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_f08_unaccepted_phase_results_may_repeat_and_blank_segment_is_rejected(
+    provider_modules,
+):
+    conn, initiative_card_id = _fresh_s2_schema(provider_modules)
+    _insert_phase_result(conn, initiative_card_id, "R1", None, 0)
+    _insert_phase_result(conn, initiative_card_id, "R2", None, 0)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM initiative_phase_results WHERE accepted = 0"
+    ).fetchone()[0] == 2
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_phase_result(conn, initiative_card_id, "R3", "   ", 1)
+    conn.close()
+
+
+def _d2_snapshot(provider_modules, initiative_id="I1"):
+    return provider_modules["contracts"].expand_contract(
+        step="D2",
+        initiative_id=initiative_id,
+        baseline_refs=("git:path@full-sha",),
+        governing_source_refs=("canon:path@full-sha",),
+    )
+
+
+def _skill_binding(provider_modules):
+    return provider_modules["lifecycle"].SkillBinding(
+        skill_id="adrian-kanban.lifecycle.d2",
+        skill_version="1",
+        skill_hash="sha256:skill",
+    )
+
+
+def test_h05_contract_attach_and_cold_hydration_are_exact_and_atomic(
+    provider_modules,
+):
+    conn, _ = _fresh_s2_schema(provider_modules)
+    task_card_id = _insert_task_card(conn, "T1")
+    repository = provider_modules["lifecycle"].LifecycleContractRepository(conn)
+    snapshot = _d2_snapshot(provider_modules)
+    skill = _skill_binding(provider_modules)
+
+    conn.execute("BEGIN IMMEDIATE")
+    record = repository.attach(
+        task_id="T1", snapshot=snapshot, skill=skill, created_at=10
+    )
+    assert conn.in_transaction is True
+    conn.commit()
+
+    assert record.task_card_id == task_card_id
+    assert record.snapshot is snapshot
+    assert repository.load("T1") == record
+    stored = conn.execute(
+        "SELECT canonical_contract_payload FROM task_lifecycle_contracts "
+        "WHERE task_card_id = ?",
+        (task_card_id,),
+    ).fetchone()[0]
+    assert stored == snapshot.canonical_payload()
+    assert json.loads(stored) == snapshot.canonical_dict()
+    conn.close()
+
+
+def test_f07_historical_task_without_contract_remains_legacy(provider_modules):
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "legacy-task")
+    repository = provider_modules["lifecycle"].LifecycleContractRepository(conn)
+
+    assert repository.load("legacy-task") is None
+    assert repository.load("missing-task") is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_lifecycle_contracts"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_f01_contract_attach_obeys_caller_rollback(provider_modules):
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = provider_modules["lifecycle"].LifecycleContractRepository(conn)
+
+    conn.execute("BEGIN IMMEDIATE")
+    repository.attach(
+        task_id="T1",
+        snapshot=_d2_snapshot(provider_modules),
+        skill=_skill_binding(provider_modules),
+        created_at=10,
+    )
+    conn.rollback()
+
+    assert repository.load("T1") is None
+    conn.close()
+
+
+def test_u03_contract_attach_requires_caller_transaction_and_exact_initiative(
+    provider_modules,
+):
+    lifecycle = provider_modules["lifecycle"]
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = lifecycle.LifecycleContractRepository(conn)
+
+    with pytest.raises(lifecycle.LifecycleRecordRejected, match="transaction"):
+        repository.attach(
+            task_id="T1",
+            snapshot=_d2_snapshot(provider_modules),
+            skill=_skill_binding(provider_modules),
+            created_at=10,
+        )
+
+    conn.execute("BEGIN IMMEDIATE")
+    with pytest.raises(lifecycle.LifecycleRecordRejected, match="initiative"):
+        repository.attach(
+            task_id="T1",
+            snapshot=_d2_snapshot(provider_modules, "other-initiative"),
+            skill=_skill_binding(provider_modules),
+            created_at=10,
+        )
+    conn.rollback()
+    conn.close()
+
+
+def test_u03_contract_and_skill_records_are_frozen(provider_modules):
+    lifecycle = provider_modules["lifecycle"]
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = lifecycle.LifecycleContractRepository(conn)
+    skill = _skill_binding(provider_modules)
+
+    conn.execute("BEGIN IMMEDIATE")
+    record = repository.attach(
+        task_id="T1",
+        snapshot=_d2_snapshot(provider_modules),
+        skill=skill,
+        created_at=10,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        skill.skill_hash = "changed"
+    with pytest.raises(FrozenInstanceError):
+        record.task_id = "changed"
+    conn.rollback()
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "reported"),
+    (
+        ("contract_id", "corrupt", "contract_id"),
+        ("contract_version", "2", "contract_version"),
+        ("step", "D4.1", "step"),
+        ("initiative_id", "corrupt", "initiative_id"),
+        ("execution_profile", "corrupt", "execution_profile"),
+        ("registry_hash", "corrupt", "registry_hash"),
+    ),
+)
+def test_h05_cold_hydration_rejects_duplicated_column_drift(
+    provider_modules, column, value, reported
+):
+    lifecycle = provider_modules["lifecycle"]
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = lifecycle.LifecycleContractRepository(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    repository.attach(
+        task_id="T1",
+        snapshot=_d2_snapshot(provider_modules),
+        skill=_skill_binding(provider_modules),
+        created_at=10,
+    )
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute(
+        f"UPDATE task_lifecycle_contracts SET {column} = ? WHERE task_id = 'T1'",
+        (value,),
+    )
+
+    with pytest.raises(lifecycle.LifecycleRecordRejected) as rejected:
+        repository.load("T1")
+
+    assert reported in str(rejected.value)
+    assert value not in str(rejected.value)
+    conn.close()
+
+
+def test_h05_cold_hydration_rejects_noncanonical_or_extra_payload(
+    provider_modules,
+):
+    lifecycle = provider_modules["lifecycle"]
+    conn, _ = _fresh_s2_schema(provider_modules)
+    _insert_task_card(conn, "T1")
+    repository = lifecycle.LifecycleContractRepository(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    repository.attach(
+        task_id="T1",
+        snapshot=_d2_snapshot(provider_modules),
+        skill=_skill_binding(provider_modules),
+        created_at=10,
+    )
+    conn.commit()
+    payload = _d2_snapshot(provider_modules).canonical_dict()
+    payload["unexpected"] = "secret-value"
+    conn.execute(
+        "UPDATE task_lifecycle_contracts SET canonical_contract_payload = ? "
+        "WHERE task_id = 'T1'",
+        (json.dumps(payload),),
+    )
+
+    with pytest.raises(lifecycle.LifecycleRecordRejected, match="payload keys"):
+        repository.load("T1")
+    conn.close()
+
+
+def _policy_snapshot(provider_modules, step="D2", initiative_id="I1"):
+    contracts = provider_modules["contracts"]
+    if step == "D2":
+        return contracts.expand_contract(
+            step=step,
+            initiative_id=initiative_id,
+            baseline_refs=("baseline",),
+            governing_source_refs=("canon",),
+        )
+    if step == "D4.1":
+        return contracts.expand_contract(
+            step=step,
+            initiative_id=initiative_id,
+            baseline_refs=("baseline",),
+            prior_record_refs=("record",),
+        )
+    return contracts.expand_contract(
+        step=step,
+        initiative_id=initiative_id,
+        baseline_refs=("baseline",),
+        prior_record_refs=("record",),
+        predecessor_ref="handoff:D4.1",
+    )
+
+
+def _policy_record(provider_modules, step="D2"):
+    lifecycle = provider_modules["lifecycle"]
+    snapshot = _policy_snapshot(provider_modules, step)
+    skill = lifecycle.SkillBinding(
+        skill_id=f"skill:{step}", skill_version="1", skill_hash="skill-hash"
+    )
+    return lifecycle.LifecycleContractRecord(
+        task_card_id=2,
+        task_id=f"task:{step}",
+        initiative_card_id=1,
+        snapshot=snapshot,
+        skill=skill,
+        created_at=10,
+    )
+
+
+def _compatibility(provider_modules, record):
+    policy = provider_modules["policy"]
+    snapshot = record.snapshot
+    return policy.ResolvedCompatibility(
+        phase=snapshot.phase,
+        contract_id=snapshot.contract_id,
+        contract_version=snapshot.contract_version,
+        step=snapshot.step,
+        execution_profile=snapshot.execution_profile,
+        output_validator=snapshot.output_validator,
+        registry_hash=snapshot.registry_hash,
+        skill=record.skill,
+    )
+
+
+def _launch_facts(provider_modules, record, **changes):
+    policy = provider_modules["policy"]
+    values = {
+        "attempt_id": "attempt-1",
+        "task_id": record.task_id,
+        "status": "ready",
+        "assignee": record.snapshot.execution_profile,
+        "current_phase": record.snapshot.phase,
+        "current_initiative_id": record.snapshot.initiative_id,
+        "current_segment_id": record.snapshot.segment_id,
+        "current_workspace_id": record.snapshot.segment_workspace_id,
+        "compatibility": _compatibility(provider_modules, record),
+        "predecessor": None,
+        "blocking_task_ids": (),
+        "active_profile_task_ids": (),
+        "workspace": None,
+    }
+    values.update(changes)
+    return policy.ExecutionLaunchFacts(**values)
+
+
+def _diagnostic_codes(decision):
+    rejection = decision.rejection
+    return (
+        [check.code for check in rejection.failed_checks],
+        [check.code for check in rejection.not_evaluated_checks],
+    )
+
+
+def test_h06_policy_alone_explicitly_admits_valid_execution_launch(
+    provider_modules,
+):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+    facts = _launch_facts(provider_modules, record)
+
+    decision = policy.evaluate_execution_launch(record, facts)
+
+    assert decision.admitted is True
+    assert decision.task_id == record.task_id
+    assert decision.execution_profile == record.snapshot.execution_profile
+    assert decision.rejection is None
+
+
+def test_f14_policy_collects_all_independent_launch_failures_without_values(
+    provider_modules,
+):
+    policy = provider_modules["policy"]
+    lifecycle = provider_modules["lifecycle"]
+    record = _policy_record(provider_modules)
+    incompatible_skill = lifecycle.SkillBinding(
+        "secret-skill", "secret-version", "secret-skill-hash"
+    )
+    incompatible = policy.ResolvedCompatibility(
+        phase="secret-compat-phase",
+        contract_id="secret-contract",
+        contract_version=2,
+        step="secret-step",
+        execution_profile="secret-compat-profile",
+        output_validator="secret-validator",
+        registry_hash="secret-registry-hash",
+        skill=incompatible_skill,
+    )
+    facts = _launch_facts(
+        provider_modules,
+        record,
+        task_id="other-task",
+        status="blocked",
+        assignee="secret-assignee",
+        current_phase="other-phase",
+        current_initiative_id="other-initiative",
+        current_segment_id="S9",
+        current_workspace_id="W9",
+        compatibility=incompatible,
+        predecessor=policy.PredecessorEvidence(
+            "unexpected-ref", "accepted_handoff", "I1", True
+        ),
+        blocking_task_ids=("dependency-task",),
+        active_profile_task_ids=("running-task",),
+        workspace=policy.WorkspaceFacts("S9", "W9", True, True, False),
+    )
+
+    decision = policy.evaluate_execution_launch(record, facts)
+    failed, not_evaluated = _diagnostic_codes(decision)
+
+    assert decision.admitted is False
+    assert failed == [
+        "TASK_ID_MISMATCH",
+        "TASK_STATUS_NOT_READY",
+        "ASSIGNEE_PROFILE_MISMATCH",
+        "INITIATIVE_ID_MISMATCH",
+        "INITIATIVE_PHASE_MISMATCH",
+        "INITIATIVE_SEGMENT_MISMATCH",
+        "CURRENT_WORKSPACE_MISMATCH",
+        "COMPATIBILITY_PHASE_MISMATCH",
+        "COMPATIBILITY_CONTRACT_ID_MISMATCH",
+        "COMPATIBILITY_CONTRACT_VERSION_MISMATCH",
+        "COMPATIBILITY_STEP_MISMATCH",
+        "COMPATIBILITY_EXECUTION_PROFILE_MISMATCH",
+        "COMPATIBILITY_OUTPUT_VALIDATOR_MISMATCH",
+        "COMPATIBILITY_REGISTRY_HASH_MISMATCH",
+        "COMPATIBILITY_SKILL_ID_MISMATCH",
+        "COMPATIBILITY_SKILL_VERSION_MISMATCH",
+        "COMPATIBILITY_SKILL_HASH_MISMATCH",
+        "UNEXPECTED_PREDECESSOR_EVIDENCE",
+        "EXPLICIT_DEPENDENCY_BLOCKED",
+        "UNEXPECTED_WORKSPACE_FACTS",
+        "PROFILE_LANE_OCCUPIED",
+    ]
+    assert not_evaluated == []
+    assert decision.rejection.state_changed is False
+    rendered = decision.rejection.render()
+    for secret in (
+        "secret-assignee",
+        "secret-contract",
+        "secret-registry-hash",
+        "secret-skill-hash",
+        "unexpected-ref",
+    ):
+        assert secret not in rendered
+
+
+def test_h06_exact_accepted_predecessor_releases_sequenced_step(provider_modules):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules, "D4.2")
+    predecessor = policy.PredecessorEvidence(
+        reference="handoff:D4.1",
+        evidence_kind="accepted_handoff",
+        initiative_id="I1",
+        accepted=True,
+    )
+
+    decision = policy.evaluate_execution_launch(
+        record, _launch_facts(provider_modules, record, predecessor=predecessor)
+    )
+
+    assert decision.admitted is True
+
+
+@pytest.mark.parametrize(
+    ("predecessor", "failed_codes", "not_evaluated_codes"),
+    (
+        (
+            None,
+            ["PREDECESSOR_EVIDENCE_MISSING"],
+            [
+                "PREDECESSOR_KIND_NOT_EVALUATED",
+                "PREDECESSOR_ACCEPTANCE_NOT_EVALUATED",
+            ],
+        ),
+        (
+            ("wrong-ref", "accepted_handoff", "I1", True),
+            ["PREDECESSOR_EVIDENCE_MISMATCH"],
+            [
+                "PREDECESSOR_KIND_NOT_EVALUATED",
+                "PREDECESSOR_ACCEPTANCE_NOT_EVALUATED",
+            ],
+        ),
+        (
+            ("handoff:D4.1", "initiative_checkpoint", "I1", False),
+            ["PREDECESSOR_KIND_MISMATCH", "PREDECESSOR_NOT_ACCEPTED"],
+            [],
+        ),
+    ),
+)
+def test_u09_sequence_evidence_rejects_missing_mismatched_or_unaccepted(
+    provider_modules, predecessor, failed_codes, not_evaluated_codes
+):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules, "D4.2")
+    evidence = None
+    if predecessor is not None:
+        evidence = policy.PredecessorEvidence(*predecessor)
+
+    decision = policy.evaluate_execution_launch(
+        record, _launch_facts(provider_modules, record, predecessor=evidence)
+    )
+    failed, not_evaluated = _diagnostic_codes(decision)
+
+    assert failed == failed_codes
+    assert not_evaluated == not_evaluated_codes
+
+
+def test_f04_profile_lane_counts_only_supplied_lifecycle_tasks(provider_modules):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+
+    available = policy.evaluate_execution_launch(
+        record, _launch_facts(provider_modules, record)
+    )
+    occupied = policy.evaluate_execution_launch(
+        record,
+        _launch_facts(
+            provider_modules,
+            record,
+            active_profile_task_ids=("same-profile-lifecycle-task",),
+        ),
+    )
+
+    assert available.admitted is True
+    assert _diagnostic_codes(occupied)[0] == ["PROFILE_LANE_OCCUPIED"]
+    assert "model_sessions" not in policy.ExecutionLaunchFacts.__annotations__
+
+
+def test_f15_invalid_snapshot_marks_dependent_policy_groups_not_evaluated(
+    provider_modules,
+):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+    corrupt_snapshot = replace(record.snapshot, execution_profile="wrong-profile")
+    corrupt_record = replace(record, snapshot=corrupt_snapshot)
+
+    decision = policy.evaluate_execution_launch(
+        corrupt_record,
+        _launch_facts(
+            provider_modules,
+            corrupt_record,
+            task_id="other-task",
+            status="blocked",
+        ),
+    )
+    failed, not_evaluated = _diagnostic_codes(decision)
+
+    assert failed == [
+        "TASK_ID_MISMATCH",
+        "TASK_STATUS_NOT_READY",
+        "CONTRACT_SNAPSHOT_INVALID",
+    ]
+    assert not_evaluated == [
+        "CONTRACT_COMPATIBILITY_NOT_EVALUATED",
+        "SEQUENCE_NOT_EVALUATED",
+        "WORKSPACE_NOT_EVALUATED",
+        "PROFILE_LANE_NOT_EVALUATED",
+    ]
+
+
+def test_u09_workspace_alignment_controller_and_writer_are_separate_checks(
+    provider_modules, monkeypatch
+):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+    scoped_snapshot = replace(
+        record.snapshot,
+        segment_id="S1",
+        segment_workspace_id="workspace-1",
+    )
+    scoped_record = replace(record, snapshot=scoped_snapshot)
+    compatibility = _compatibility(provider_modules, scoped_record)
+    monkeypatch.setattr(policy, "validate_snapshot", lambda snapshot: True)
+
+    missing = policy.evaluate_execution_launch(
+        scoped_record,
+        _launch_facts(
+            provider_modules,
+            scoped_record,
+            compatibility=compatibility,
+        ),
+    )
+    failed, not_evaluated = _diagnostic_codes(missing)
+    assert failed == ["WORKSPACE_ALIGNMENT_MISMATCH"]
+    assert not_evaluated == [
+        "WORKSPACE_CONTROLLER_NOT_EVALUATED",
+        "WORKSPACE_WRITER_NOT_EVALUATED",
+    ]
+
+    matched_but_unsafe = policy.WorkspaceFacts(
+        "S1", "workspace-1", False, False, True
+    )
+    unsafe = policy.evaluate_execution_launch(
+        scoped_record,
+        _launch_facts(
+            provider_modules,
+            scoped_record,
+            compatibility=compatibility,
+            workspace=matched_but_unsafe,
+        ),
+    )
+    assert _diagnostic_codes(unsafe)[0] == [
+        "WORKSPACE_CONTROLLER_NOT_READY",
+        "WORKSPACE_WRITER_CONTESTED",
+    ]
+
+
+def test_policy_fact_types_are_frozen_strict_and_model_agnostic(provider_modules):
+    policy = provider_modules["policy"]
+    record = _policy_record(provider_modules)
+    facts = _launch_facts(provider_modules, record)
+
+    with pytest.raises(FrozenInstanceError):
+        facts.assignee = "changed"
+    with pytest.raises(policy.PolicyInputRejected):
+        replace(facts, active_profile_task_ids=("same", "same"))
+    with pytest.raises(policy.PolicyInputRejected):
+        policy.ExecutionLaunchDecision(True, record.task_id, "profile", object())
+    assert "model_name" not in policy.ExecutionLaunchFacts.__annotations__
+
+
+def _staged_dispatch_database(provider_modules, tmp_path, monkeypatch):
+    """Create one shared native/plugin database before selecting plugin authority."""
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(kb.SCHEMA_SQL)
+    provider_modules["schema"].create_schema(conn)
+    conn.execute(
+        "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES (?)",
+        ("I1",),
+    )
+    initiative_card_id = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('initiative', 'I1', NULL, 'Initiative', 1)"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO initiative_transitions "
+        "(initiative_card_id, initiative_id, transition_id, to_phase, "
+        "actor_evidence, created_at) VALUES (?, 'I1', 1, 'D2', 'test', 2)",
+        (initiative_card_id,),
+    )
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    provider = provider_modules["provider"].AdrianKanbanAuthorityProvider(
+        str(database_path)
+    )
+    kb.clear_authority_providers()
+    provider_modules["provider"].register_provider(provider)
+    return conn, provider
+
+
+def _insert_dispatch_task(
+    provider_modules,
+    conn,
+    tmp_path,
+    *,
+    task_id,
+    status="ready",
+    assignee="independent-reviewer",
+    priority=0,
+    attach_contract=True,
+    initiative_id="I1",
+    step="D2",
+):
+    workspace = tmp_path / task_id.replace(":", "-")
+    workspace.mkdir()
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, assignee, status, priority, created_at, workspace_kind, "
+        "workspace_path) VALUES (?, ?, ?, ?, ?, 10, 'dir', ?)",
+        (task_id, task_id, assignee, status, priority, str(workspace)),
+    )
+    if not attach_contract:
+        return None
+    conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('task', ?, ?, ?, 10)",
+        (initiative_id, task_id, task_id),
+    )
+    record = provider_modules["lifecycle"].LifecycleContractRepository(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    attached = record.attach(
+        task_id=task_id,
+        snapshot=_policy_snapshot(
+            provider_modules, step=step, initiative_id=initiative_id
+        ),
+        skill=_skill_binding(provider_modules),
+        created_at=11,
+    )
+    conn.commit()
+    return attached
+
+
+def _dispatch_attempt(
+    provider_modules,
+    record,
+    *,
+    attempt_id="dispatch-1",
+    predecessor=None,
+):
+    dispatcher = provider_modules["dispatcher"]
+    return dispatcher._DispatchAttempt(
+        attempt_id=attempt_id,
+        task_id=record.task_id,
+        dispatcher_session_id="dispatcher-session-1",
+        compatibility=_compatibility(provider_modules, record),
+        predecessor=predecessor,
+        workspace=None,
+        board="default",
+    )
+
+
+def test_h11_dispatcher_launches_only_policy_selected_task_and_preserves_native_lineage(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:D2", priority=1
+    )
+    _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="legacy-higher-priority",
+        priority=999,
+        attach_contract=False,
+    )
+    spawned = []
+
+    def spawn(task, workspace, *, board=None, worker_session_id=None):
+        spawned.append((task.id, workspace, board, worker_session_id, task.current_run_id))
+        return 4242
+
+    try:
+        outcome = dispatcher._LifecycleDispatcher(
+            provider, conn, spawn_fn=spawn
+        ).dispatch(_dispatch_attempt(provider_modules, record))
+
+        assert outcome.decision.admitted is True
+        assert outcome.native.state == "launched"
+        assert spawned[0][0] == "task:D2"
+        assert spawned[0][2] == "default"
+        assert spawned[0][3]
+        assert type(spawned[0][4]) is int
+        selected = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = 'task:D2'"
+        ).fetchone()
+        untouched = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks "
+            "WHERE id = 'legacy-higher-priority'"
+        ).fetchone()
+        run = conn.execute(
+            "SELECT task_id, profile, status, worker_pid, worker_session_id "
+            "FROM task_runs WHERE id = ?",
+            (selected["current_run_id"],),
+        ).fetchone()
+        assert tuple(selected) == ("running", 4242, selected["current_run_id"])
+        assert tuple(untouched) == ("ready", None, None)
+        assert tuple(run[:4]) == (
+            "task:D2",
+            "independent-reviewer",
+            "running",
+            4242,
+        )
+        assert run["worker_session_id"] == spawned[0][3]
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u09_dispatcher_rejection_makes_no_native_claim_or_launch_state(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:D2"
+    )
+    conn.execute(
+        "UPDATE initiative_transitions SET to_phase = 'D1' WHERE initiative_id = 'I1'"
+    )
+    spawned = []
+
+    try:
+        outcome = dispatcher._LifecycleDispatcher(
+            provider, conn, spawn_fn=lambda *a, **k: spawned.append(a)
+        ).dispatch(_dispatch_attempt(provider_modules, record))
+
+        assert outcome.decision.admitted is False
+        assert outcome.native is None
+        assert _diagnostic_codes(outcome.decision)[0] == [
+            "INITIATIVE_PHASE_MISMATCH"
+        ]
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = 'task:D2'"
+        ).fetchone()
+        assert tuple(row) == ("ready", None, None)
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        assert spawned == []
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_f04_dispatcher_profile_lane_counts_only_active_lifecycle_contracts(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    first = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:first"
+    )
+    second = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:second"
+    )
+    _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="legacy-running",
+        status="running",
+        attach_contract=False,
+    )
+
+    try:
+        engine = dispatcher._LifecycleDispatcher(
+            provider, conn, spawn_fn=lambda *a, **k: 5151
+        )
+        first_outcome = engine.dispatch(
+            _dispatch_attempt(provider_modules, first, attempt_id="dispatch-first")
+        )
+        second_outcome = engine.dispatch(
+            _dispatch_attempt(provider_modules, second, attempt_id="dispatch-second")
+        )
+
+        assert first_outcome.decision.admitted is True
+        assert second_outcome.decision.admitted is False
+        assert _diagnostic_codes(second_outcome.decision)[0] == [
+            "PROFILE_LANE_OCCUPIED"
+        ]
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id = 'task:second'"
+        ).fetchone()[0] == "ready"
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_f04_concurrent_same_profile_dispatch_has_one_winner(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    first = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:race-first"
+    )
+    second = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:race-second"
+    )
+    attempts = (
+        _dispatch_attempt(provider_modules, first, attempt_id="race-first"),
+        _dispatch_attempt(provider_modules, second, attempt_id="race-second"),
+    )
+    original_policy = dispatcher.evaluate_execution_launch
+    policy_barrier = threading.Barrier(2)
+
+    def synchronized_policy(record, facts):
+        try:
+            policy_barrier.wait(timeout=0.25)
+        except threading.BrokenBarrierError:
+            pass
+        return original_policy(record, facts)
+
+    monkeypatch.setattr(
+        dispatcher, "evaluate_execution_launch", synchronized_policy
+    )
+    outcomes = []
+    errors = []
+
+    def run(attempt, pid):
+        thread_conn = sqlite3.connect(
+            str(provider.database_path), isolation_level=None
+        )
+        thread_conn.row_factory = sqlite3.Row
+        try:
+            engine = dispatcher._LifecycleDispatcher(
+                provider, thread_conn, spawn_fn=lambda *a, **k: pid
+            )
+            outcomes.append(engine.dispatch(attempt))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            thread_conn.close()
+
+    threads = [
+        threading.Thread(target=run, args=(attempts[0], 6101)),
+        threading.Thread(target=run, args=(attempts[1], 6102)),
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert sum(
+            outcome.native is not None and outcome.native.state == "launched"
+            for outcome in outcomes
+        ) == 1
+        assert all(type(exc) is dispatcher._DispatcherRejected for exc in errors)
+        states = conn.execute(
+            "SELECT status, COUNT(*) FROM tasks "
+            "WHERE id IN ('task:race-first', 'task:race-second') "
+            "GROUP BY status ORDER BY status"
+        ).fetchall()
+        assert [tuple(row) for row in states] == [("ready", 1), ("running", 1)]
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 1
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_f04_different_profiles_are_not_globally_serialized(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    policy = provider_modules["policy"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    first = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:profile-a"
+    )
+
+    conn.execute(
+        "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES ('I2')"
+    )
+    initiative_card_id = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('initiative', 'I2', NULL, 'Initiative 2', 1)"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO initiative_transitions "
+        "(initiative_card_id, initiative_id, transition_id, to_phase, "
+        "actor_evidence, created_at) VALUES (?, 'I2', 1, 'D4', 'test', 2)",
+        (initiative_card_id,),
+    )
+    second = _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="task:profile-b",
+        assignee="test-authority-reviewer",
+        initiative_id="I2",
+        step="D4.2",
+    )
+    predecessor = policy.PredecessorEvidence(
+        reference="handoff:D4.1",
+        evidence_kind="accepted_handoff",
+        initiative_id="I2",
+        accepted=True,
+    )
+    attempts = (
+        _dispatch_attempt(provider_modules, first, attempt_id="profile-a"),
+        _dispatch_attempt(
+            provider_modules,
+            second,
+            attempt_id="profile-b",
+            predecessor=predecessor,
+        ),
+    )
+    spawn_barrier = threading.Barrier(2, timeout=3)
+    outcomes = []
+    errors = []
+
+    def spawn(task, workspace, *, board=None, worker_session_id=None):
+        spawn_barrier.wait()
+        return 7101 if task.id == "task:profile-a" else 7102
+
+    def run(attempt):
+        thread_conn = sqlite3.connect(
+            str(provider.database_path), isolation_level=None
+        )
+        thread_conn.row_factory = sqlite3.Row
+        try:
+            outcomes.append(
+                dispatcher._LifecycleDispatcher(
+                    provider, thread_conn, spawn_fn=spawn
+                ).dispatch(attempt)
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            thread_conn.close()
+
+    threads = [threading.Thread(target=run, args=(attempt,)) for attempt in attempts]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(outcomes) == 2
+        assert all(
+            outcome.native is not None and outcome.native.state == "launched"
+            for outcome in outcomes
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND id IN "
+            "('task:profile-a', 'task:profile-b')"
+        ).fetchone()[0] == 2
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u09_dispatcher_rejects_unassigned_task_before_capability_mint(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record = _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="task:unassigned",
+        assignee=None,
+    )
+    try:
+        with pytest.raises(dispatcher._DispatcherRejected, match="unassigned"):
+            dispatcher._LifecycleDispatcher(provider, conn).dispatch(
+                _dispatch_attempt(provider_modules, record)
+            )
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id = 'task:unassigned'"
+        ).fetchone()[0] == "ready"
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u04_raw_native_dispatch_remains_closed_under_plugin_authority(
+    provider_modules, tmp_path, monkeypatch
+):
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="legacy-ready",
+        attach_contract=False,
+    )
+    try:
+        with pytest.raises(kb.AuthorityAdmissionRejected, match="fails closed"):
+            kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 9191)
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = 'legacy-ready'"
+        ).fetchone()
+        assert tuple(row) == ("ready", None)
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        assert provider.is_healthy() is True
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_h12_actor_adapter_validates_live_opaque_evidence_and_renders_durable_form(
+    provider_modules,
+):
+    actor = provider_modules["actor"]
+    evidence = _trusted_evidence()
+
+    validated = actor.validate_authorizer_evidence(
+        evidence, expected_request_id="request-1", now=1_050
+    )
+
+    assert validated.evidence_type == "trusted_authorizer"
+    assert validated.evidence_version == 1
+    assert validated.canonical_payload == evidence._canonical_for_writegate()
+    assert json.loads(validated.canonical_payload) == {
+        "connection_id": "connection-1",
+        "expires_at": 1_121,
+        "issued_at": 1_001,
+        "peer_identity": "adrian@tailnet",
+        "request_id": "request-1",
+        "route": "gateway/tailscale",
+        "type": "trusted_authorizer",
+        "version": 1,
+    }
+    assert "session_id" not in validated.__dataclass_fields__
+    assert "execution_profile" not in validated.__dataclass_fields__
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected_request_id", "now"),
+    (
+        ({"type": "trusted_authorizer"}, "request-1", 1_050),
+        ("trusted", "request-1", 1_050),
+        (object(), "request-1", 1_050),
+        (None, "request-1", 1_050),
+    ),
+)
+def test_u08_actor_adapter_rejects_caller_constructible_identity_material(
+    provider_modules, evidence, expected_request_id, now
+):
+    actor = provider_modules["actor"]
+    with pytest.raises(actor.ActorEvidenceRejected):
+        actor.validate_authorizer_evidence(
+            evidence, expected_request_id=expected_request_id, now=now
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_request_id", "now", "reported"),
+    (
+        ("different-request", 1_050, "request_id"),
+        ("request-1", 1_000, "time_range"),
+        ("request-1", 1_121, "time_range"),
+        ("request-1", 1_122, "time_range"),
+    ),
+)
+def test_f05_actor_request_and_expiry_bindings_are_exact(
+    provider_modules, expected_request_id, now, reported
+):
+    actor = provider_modules["actor"]
+    with pytest.raises(actor.ActorEvidenceRejected) as rejected:
+        actor.validate_authorizer_evidence(
+            _trusted_evidence(),
+            expected_request_id=expected_request_id,
+            now=now,
+        )
+
+    assert reported in str(rejected.value)
+    assert expected_request_id not in str(rejected.value)
+
+
+def test_u08_actor_adapter_rejects_noncanonical_or_duplicate_source_json(
+    provider_modules, monkeypatch
+):
+    actor = provider_modules["actor"]
+    evidence = _trusted_evidence()
+    duplicate = (
+        '{"connection_id":"connection-1","expires_at":1121,'
+        '"issued_at":1001,"peer_identity":"adrian@tailnet",'
+        '"request_id":"request-1","route":"gateway/tailscale",'
+        '"type":"trusted_authorizer","type":"trusted_authorizer",'
+        '"version":1}'
+    )
+    monkeypatch.setattr(
+        trusted.TrustedAuthorizerEvidence,
+        "_canonical_for_writegate",
+        lambda self: duplicate,
+    )
+
+    with pytest.raises(actor.ActorEvidenceRejected, match="duplicate_key"):
+        actor.validate_authorizer_evidence(
+            evidence, expected_request_id="request-1", now=1_050
+        )
+
+
+def test_u08_validated_actor_record_cannot_claim_inconsistent_canonical_payload(
+    provider_modules,
+):
+    actor = provider_modules["actor"]
+    with pytest.raises(actor.ActorEvidenceRejected, match="canonical_payload"):
+        actor.ValidatedAuthorizerEvidence(
+            evidence_type="trusted_authorizer",
+            evidence_version=1,
+            route="gateway/tailscale",
+            connection_id="connection-1",
+            peer_identity="adrian@tailnet",
+            request_id="request-1",
+            issued_at=1_001,
+            expires_at=1_121,
+            canonical_payload="{}",
+        )
