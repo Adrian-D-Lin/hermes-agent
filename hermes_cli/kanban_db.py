@@ -3146,6 +3146,7 @@ class _AuthorityCapabilityEnvelope:
     canonical_path: str
     connection_identity: int
     state: str = "fresh"
+    allow_multiple_writes: bool = False
 
 
 _ACTIVE_AUTHORITY_CAPABILITY: ContextVar[
@@ -3175,7 +3176,13 @@ def _scoped_authority_capability(
     context,
     *,
     db_path: Optional[str] = None,
+    allow_multiple_writes: bool = False,
 ):
+    if type(allow_multiple_writes) is not bool:
+        raise AuthorityAdmissionRejected(
+            "capability interface is unavailable; native mutation fails "
+            "closed/no fallback"
+        )
     selected_authority = resolve_selected_authority()
     if selected_authority != AUTHORITY_ADRIAN_KANBAN:
         raise AuthorityAdmissionRejected(
@@ -3237,11 +3244,13 @@ def _scoped_authority_capability(
         canonical_path=canonical_path,
         connection_identity=id(conn),
         state="fresh",
+        allow_multiple_writes=allow_multiple_writes,
     )
     token = _ACTIVE_AUTHORITY_CAPABILITY.set(envelope)
     try:
         yield conn
     finally:
+        envelope.state = "finished"
         _ACTIVE_AUTHORITY_CAPABILITY.reset(token)
 
 
@@ -3609,33 +3618,46 @@ def _enforce_seam_on_write_txn(
                     "fails closed/no fallback"
                 )
         else:
-            if envelope.state != "fresh":
+            if envelope.state == "fresh":
+                result = provider.validate_capability(
+                    envelope.capability,
+                    envelope.context,
+                    canonical_path,
+                    allow_consumed=False,
+                )
+                if result is not True:
+                    raise AuthorityAdmissionRejected(
+                        "capability interface is unavailable; native mutation "
+                        "fails closed/no fallback"
+                    )
+                consume_result = provider.consume_capability(
+                    envelope.capability,
+                    envelope.context,
+                    canonical_path,
+                )
+                if consume_result is not True:
+                    raise AuthorityAdmissionRejected(
+                        "capability interface is unavailable; native mutation "
+                        "fails closed/no fallback"
+                    )
+                envelope.state = "active"
+            elif envelope.state == "active" and envelope.allow_multiple_writes:
+                result = provider.validate_capability(
+                    envelope.capability,
+                    envelope.context,
+                    canonical_path,
+                    allow_consumed=True,
+                )
+                if result is not True:
+                    raise AuthorityAdmissionRejected(
+                        "capability interface is unavailable; native mutation "
+                        "fails closed/no fallback"
+                    )
+            else:
                 raise AuthorityAdmissionRejected(
                     "capability interface is unavailable; native mutation "
                     "fails closed/no fallback"
                 )
-            result = provider.validate_capability(
-                envelope.capability,
-                envelope.context,
-                canonical_path,
-                allow_consumed=False,
-            )
-            if result is not True:
-                raise AuthorityAdmissionRejected(
-                    "capability interface is unavailable; native mutation "
-                    "fails closed/no fallback"
-                )
-            consume_result = provider.consume_capability(
-                envelope.capability,
-                envelope.context,
-                canonical_path,
-            )
-            if consume_result is not True:
-                raise AuthorityAdmissionRejected(
-                    "capability interface is unavailable; native mutation "
-                    "fails closed/no fallback"
-                )
-            envelope.state = "active"
     except AuthorityAdmissionRejected:
         raise
     except Exception as exc:
@@ -3716,7 +3738,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             else:
                 _check_file_length_invariant(conn)
     finally:
-        if envelope is not None:
+        if envelope is not None and not getattr(
+            envelope, "allow_multiple_writes", False
+        ):
             envelope.state = "finished"
 
 
@@ -5239,6 +5263,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -5294,18 +5319,23 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        cas_params = [lock, expires, now, task_id]
+        cas_where = "AND status = 'ready' AND claim_lock IS NULL"
+        if expected_assignee is not None and expected_assignee.strip():
+            cas_where += " AND assignee = ?"
+            cas_params.append(expected_assignee)
+
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
-               AND claim_lock IS NULL
+               {cas_where}
             """,
-            (lock, expires, now, task_id),
+            cas_params,
         )
         if cur.rowcount != 1:
             return None
@@ -10484,6 +10514,173 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         )
     except Exception:
         return "unknown"
+
+
+@dataclass(frozen=True)
+class _AdmittedTaskLaunchEvidence:
+    task_id: str
+    state: str
+    assignee: Optional[str]
+    workspace: Optional[str]
+    worker_session_id: Optional[str]
+    pid: Optional[int]
+    auto_blocked: bool
+
+
+def _launch_admitted_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_assignee: str,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    board: Optional[str] = None,
+) -> _AdmittedTaskLaunchEvidence:
+    board = _normalize_board_slug(board) or get_current_board()
+
+    claimed = claim_task(
+        conn,
+        task_id,
+        ttl_seconds=ttl_seconds,
+        expected_assignee=expected_assignee,
+    )
+    if claimed is None:
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="claim_lost",
+            assignee=expected_assignee,
+            workspace=None,
+            worker_session_id=None,
+            pid=None,
+            auto_blocked=False,
+        )
+
+    try:
+        resolved_branch_name = None
+        if claimed.workspace_kind == "worktree":
+            workspace, resolved_branch_name = _resolve_worktree_workspace(
+                claimed, board=board
+            )
+        else:
+            workspace = resolve_workspace(claimed, board=board)
+    except Exception as exc:
+        auto = _record_spawn_failure(
+            conn,
+            claimed.id,
+            f"workspace: {exc}",
+            failure_limit=failure_limit,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="failed",
+            assignee=claimed.assignee,
+            workspace=None,
+            worker_session_id=None,
+            pid=None,
+            auto_blocked=auto,
+        )
+
+    set_workspace_path(conn, claimed.id, str(workspace))
+    if claimed.workspace_kind == "worktree":
+        set_branch_name(
+            conn,
+            claimed.id,
+            resolved_branch_name
+            or (claimed.branch_name or "").strip()
+            or f"wt/{claimed.id}",
+        )
+    _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+
+    try:
+        worker_session_id = prepare_worker_launch(
+            conn,
+            claimed,
+            str(workspace),
+            board=board,
+            resolved_branch_name=resolved_branch_name,
+        )
+    except Exception as exc:
+        auto = _record_spawn_failure(
+            conn,
+            claimed.id,
+            f"writegate pre-spawn binding: {exc}",
+            failure_limit=failure_limit,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="failed",
+            assignee=claimed.assignee,
+            workspace=str(workspace),
+            worker_session_id=None,
+            pid=None,
+            auto_blocked=auto,
+        )
+
+    _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    try:
+        import inspect
+
+        try:
+            sig = inspect.signature(_spawn)
+            params = sig.parameters
+            if "board" in params and "worker_session_id" in params:
+                pid = _spawn(
+                    claimed,
+                    str(workspace),
+                    board=board,
+                    worker_session_id=worker_session_id,
+                )
+            elif "board" in params:
+                pid = _spawn(claimed, str(workspace), board=board)
+            elif "worker_session_id" in params:
+                pid = _spawn(
+                    claimed,
+                    str(workspace),
+                    worker_session_id=worker_session_id,
+                )
+            else:
+                pid = _spawn(claimed, str(workspace))
+        except (TypeError, ValueError):
+            pid = _spawn(claimed, str(workspace))
+
+        if pid:
+            _set_worker_pid(
+                conn,
+                claimed.id,
+                int(pid),
+                worker_session_id=worker_session_id,
+            )
+
+        _fire_worker_spawned_hook(
+            conn, claimed, str(workspace), pid, board=board
+        )
+
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="launched",
+            assignee=claimed.assignee,
+            workspace=str(workspace),
+            worker_session_id=worker_session_id,
+            pid=int(pid) if pid else None,
+            auto_blocked=False,
+        )
+    except Exception as exc:
+        auto = _record_spawn_failure(
+            conn,
+            claimed.id,
+            str(exc),
+            failure_limit=failure_limit,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id=task_id,
+            state="failed",
+            assignee=claimed.assignee,
+            workspace=str(workspace),
+            worker_session_id=worker_session_id,
+            pid=None,
+            auto_blocked=auto,
+        )
 
 
 def dispatch_once(
