@@ -1,0 +1,442 @@
+"""Adrian Kanban workspace foundation."""
+
+import os
+import re
+import sqlite3
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+__all__ = ()
+
+
+class _WorkspaceRejected(ValueError):
+    pass
+
+
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$")
+
+
+def _validate_nonblank_str(value, name):
+    if not isinstance(value, str):
+        raise _WorkspaceRejected(f"{name} must be str")
+    if not value.strip():
+        raise _WorkspaceRejected(f"{name} must be nonblank")
+    return value
+
+
+def _validate_absolute_str(value, name):
+    _validate_nonblank_str(value, name)
+    if not os.path.isabs(value):
+        raise _WorkspaceRejected(f"{name} must be absolute")
+    return value
+
+
+def _validate_sha(value, name):
+    _validate_nonblank_str(value, name)
+    if not _SHA_RE.match(value):
+        raise _WorkspaceRejected(f"{name} must be a valid SHA")
+    return value
+
+
+def _validate_bool(value, name):
+    if not isinstance(value, bool):
+        raise _WorkspaceRejected(f"{name} must be bool")
+    return value
+
+
+@dataclass(frozen=True)
+class _RepositoryRegistration:
+    repository_identity: str
+    repository_root: str
+    controlled_worktree_root: str
+
+    def __post_init__(self):
+        _validate_nonblank_str(self.repository_identity, "repository_identity")
+        _validate_absolute_str(self.repository_root, "repository_root")
+        _validate_absolute_str(self.controlled_worktree_root, "controlled_worktree_root")
+
+
+@dataclass(frozen=True)
+class _WorkspaceMember:
+    workspace_id: str
+    repository_identity: str
+    repository_root: str
+    controlled_worktree_root: str
+    relative_path: str
+    target_path: str
+    branch: str
+    required_base_sha: str
+    observed_head: Optional[str]
+    member_state: str
+
+    def __post_init__(self):
+        _validate_nonblank_str(self.workspace_id, "workspace_id")
+        _validate_nonblank_str(self.repository_identity, "repository_identity")
+        _validate_absolute_str(self.repository_root, "repository_root")
+        _validate_absolute_str(self.controlled_worktree_root, "controlled_worktree_root")
+        _validate_nonblank_str(self.relative_path, "relative_path")
+        _validate_absolute_str(self.target_path, "target_path")
+        _validate_nonblank_str(self.branch, "branch")
+        _validate_sha(self.required_base_sha, "required_base_sha")
+        if self.observed_head is not None:
+            _validate_sha(self.observed_head, "observed_head")
+        _validate_nonblank_str(self.member_state, "member_state")
+
+
+@dataclass(frozen=True)
+class _WorkspacePlan:
+    workspace_id: str
+    initiative_id: str
+    segment_id: str
+    controller_binding_ref: str
+    members: Tuple[_WorkspaceMember, ...]
+
+    def __post_init__(self):
+        _validate_nonblank_str(self.workspace_id, "workspace_id")
+        _validate_nonblank_str(self.initiative_id, "initiative_id")
+        _validate_nonblank_str(self.segment_id, "segment_id")
+        _validate_nonblank_str(self.controller_binding_ref, "controller_binding_ref")
+        if not isinstance(self.members, tuple):
+            raise _WorkspaceRejected("members must be tuple")
+        if len(self.members) < 1:
+            raise _WorkspaceRejected("members must contain at least one member")
+        for m in self.members:
+            if not isinstance(m, _WorkspaceMember):
+                raise _WorkspaceRejected("members must contain _WorkspaceMember")
+
+
+@dataclass(frozen=True)
+class _MemberVerification:
+    repository_identity: str
+    target_path: str
+    observed_head: Optional[str]
+    branch_matches: bool
+    base_contained: bool
+    common_repository: Optional[str]
+    ready: bool
+    failures: Tuple[str, ...]
+
+    def __post_init__(self):
+        _validate_nonblank_str(self.repository_identity, "repository_identity")
+        _validate_absolute_str(self.target_path, "target_path")
+        if self.observed_head is not None:
+            _validate_sha(self.observed_head, "observed_head")
+        _validate_bool(self.branch_matches, "branch_matches")
+        _validate_bool(self.base_contained, "base_contained")
+        if self.common_repository is not None:
+            _validate_absolute_str(self.common_repository, "common_repository")
+        _validate_bool(self.ready, "ready")
+        if not isinstance(self.failures, tuple):
+            raise _WorkspaceRejected("failures must be tuple")
+        for f in self.failures:
+            _validate_nonblank_str(f, "failure")
+
+
+class _TrustedRepositoryRegistry:
+    def __init__(self, registrations: Tuple[_RepositoryRegistration, ...] = ()):
+        if not isinstance(registrations, tuple):
+            raise _WorkspaceRejected("registrations must be tuple")
+        seen = set()
+        for r in registrations:
+            if not isinstance(r, _RepositoryRegistration):
+                raise _WorkspaceRejected("registrations must contain _RepositoryRegistration")
+            if r.repository_identity in seen:
+                raise _WorkspaceRejected(f"duplicate repository_identity in registry: {r.repository_identity}")
+            seen.add(r.repository_identity)
+        self._registrations = registrations
+
+    def lookup(self, repository_identity: str) -> _RepositoryRegistration:
+        _validate_nonblank_str(repository_identity, "repository_identity")
+        for r in self._registrations:
+            if r.repository_identity == repository_identity:
+                return r
+        raise _WorkspaceRejected(f"repository_identity not found in registry: {repository_identity}")
+
+
+class _SegmentWorkspaceController:
+    def __init__(self, conn, registry: _TrustedRepositoryRegistry):
+        if not isinstance(conn, sqlite3.Connection):
+            raise _WorkspaceRejected("conn must be sqlite3.Connection")
+        if not isinstance(registry, _TrustedRepositoryRegistry):
+            raise _WorkspaceRejected("registry must be _TrustedRepositoryRegistry")
+        self._conn = conn
+        self._registry = registry
+
+    def load(self, *, workspace_id: str, expected_initiative_id: str, expected_segment_id: str, expected_controller_binding: str) -> _WorkspacePlan:
+        _validate_nonblank_str(workspace_id, "workspace_id")
+        _validate_nonblank_str(expected_initiative_id, "expected_initiative_id")
+        _validate_nonblank_str(expected_segment_id, "expected_segment_id")
+        _validate_nonblank_str(expected_controller_binding, "expected_controller_binding")
+
+        cur = self._conn.execute(
+            "SELECT initiative_id, segment_id, controller_binding_ref FROM segment_workspaces WHERE workspace_id=? AND active=1",
+            (workspace_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise _WorkspaceRejected(f"workspace not found or inactive: {workspace_id}")
+        initiative_id, segment_id, controller_binding_ref = row
+        _validate_nonblank_str(initiative_id, "initiative_id")
+        _validate_nonblank_str(segment_id, "segment_id")
+        _validate_nonblank_str(controller_binding_ref, "controller_binding_ref")
+
+        if initiative_id != expected_initiative_id:
+            raise _WorkspaceRejected(f"initiative mismatch: expected {expected_initiative_id}, got {initiative_id}")
+        if segment_id != expected_segment_id:
+            raise _WorkspaceRejected(f"segment mismatch: expected {expected_segment_id}, got {segment_id}")
+        if controller_binding_ref != expected_controller_binding:
+            raise _WorkspaceRejected(f"controller mismatch: expected {expected_controller_binding}, got {controller_binding_ref}")
+
+        cur = self._conn.execute(
+            "SELECT repository_identity, relative_path, branch, required_base_sha, observed_head, member_state FROM segment_workspace_members WHERE workspace_id=? ORDER BY repository_identity",
+            (workspace_id,),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            raise _WorkspaceRejected("workspace must have at least one member")
+
+        members = []
+        for row in rows:
+            repository_identity, relative_path, branch, required_base_sha, observed_head, member_state = row
+            _validate_nonblank_str(repository_identity, "repository_identity")
+            _validate_nonblank_str(relative_path, "relative_path")
+            _validate_nonblank_str(branch, "branch")
+            _validate_sha(required_base_sha, "required_base_sha")
+            if observed_head is not None:
+                _validate_sha(observed_head, "observed_head")
+            _validate_nonblank_str(member_state, "member_state")
+
+            reg = self._registry.lookup(repository_identity)
+            controlled_root = reg.controlled_worktree_root
+
+            if os.path.isabs(relative_path):
+                raise _WorkspaceRejected(f"relative path must not be absolute: {relative_path}")
+            parts = relative_path.replace("\\", "/").split("/")
+            for part in parts:
+                if part in ("", ".", ".."):
+                    raise _WorkspaceRejected(f"relative path contains invalid component: {part}")
+
+            resolved_target = os.path.normpath(os.path.join(controlled_root, relative_path))
+            try:
+                Path(resolved_target).resolve().relative_to(Path(controlled_root).resolve())
+            except ValueError:
+                raise _WorkspaceRejected(f"relative path resolves outside controlled root: {relative_path}")
+
+            members.append(
+                _WorkspaceMember(
+                    workspace_id=workspace_id,
+                    repository_identity=repository_identity,
+                    repository_root=reg.repository_root,
+                    controlled_worktree_root=controlled_root,
+                    relative_path=relative_path,
+                    target_path=resolved_target,
+                    branch=branch,
+                    required_base_sha=required_base_sha,
+                    observed_head=observed_head,
+                    member_state=member_state,
+                )
+            )
+
+        return _WorkspacePlan(
+            workspace_id=workspace_id,
+            initiative_id=initiative_id,
+            segment_id=segment_id,
+            controller_binding_ref=controller_binding_ref,
+            members=tuple(members),
+        )
+
+
+class _GitWorkspaceExecutor:
+    def __init__(self, timeout: float = 30):
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise _WorkspaceRejected("timeout must be numeric")
+        if timeout <= 0:
+            raise _WorkspaceRejected("timeout must be positive")
+        self._timeout = timeout
+
+    def _run(self, argv: list, cwd: str) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                argv,
+                cwd=cwd,
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self._timeout,
+            )
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+            raise _WorkspaceRejected(f"git command failed: {e}") from e
+
+    def _git(self, cwd: str, *args: str, allowed_returncodes: Tuple[int, ...] = (0,)) -> str:
+        argv = ["git"] + list(args)
+        result = self._run(argv, cwd)
+        if result.returncode not in allowed_returncodes:
+            stderr = result.stderr.strip() if result.stderr else ""
+            raise _WorkspaceRejected(f"git command failed: {stderr}")
+        stdout = result.stdout.strip() if result.stdout else ""
+        return stdout
+
+    def _resolve_git_common_dir(self, cwd: str) -> Optional[str]:
+        try:
+            stdout = self._git(cwd, "rev-parse", "--git-common-dir", allowed_returncodes=(0,))
+        except _WorkspaceRejected:
+            return None
+        if not stdout:
+            return None
+        if os.path.isabs(stdout):
+            resolved = os.path.realpath(stdout)
+        else:
+            resolved = os.path.realpath(os.path.join(cwd, stdout))
+        return resolved
+
+    def verify(self, member: _WorkspaceMember) -> _MemberVerification:
+        failures = []
+        observed_head = None
+        branch_matches = False
+        base_contained = False
+        common_repository = None
+
+        target_path = member.target_path
+        repository_root = member.repository_root
+
+        if not os.path.exists(target_path):
+            return _MemberVerification(
+                repository_identity=member.repository_identity,
+                target_path=target_path,
+                observed_head=None,
+                branch_matches=False,
+                base_contained=False,
+                common_repository=None,
+                ready=False,
+                failures=("member_absent",),
+            )
+
+        target_common = self._resolve_git_common_dir(target_path)
+        if target_common is None:
+            failures.append("not_git_worktree")
+            return _MemberVerification(
+                repository_identity=member.repository_identity,
+                target_path=target_path,
+                observed_head=None,
+                branch_matches=False,
+                base_contained=False,
+                common_repository=None,
+                ready=False,
+                failures=tuple(failures),
+            )
+
+        repo_common = self._resolve_git_common_dir(repository_root)
+        if repo_common is None:
+            failures.append("not_git_worktree")
+            return _MemberVerification(
+                repository_identity=member.repository_identity,
+                target_path=target_path,
+                observed_head=None,
+                branch_matches=False,
+                base_contained=False,
+                common_repository=None,
+                ready=False,
+                failures=tuple(failures),
+            )
+
+        if target_common != repo_common:
+            failures.append("repository_mismatch")
+
+        try:
+            stdout = self._git(target_path, "symbolic-ref", "--short", "HEAD", allowed_returncodes=(0,))
+            if stdout == member.branch:
+                branch_matches = True
+            else:
+                failures.append("branch_mismatch")
+        except _WorkspaceRejected:
+            failures.append("branch_mismatch")
+
+        try:
+            stdout = self._git(target_path, "rev-parse", "HEAD", allowed_returncodes=(0,))
+            observed_head = stdout
+        except _WorkspaceRejected:
+            failures.append("head_unavailable")
+
+        try:
+            result = self._run(
+                ["git", "merge-base", "--is-ancestor", member.required_base_sha, "HEAD"],
+                target_path,
+            )
+            if result.returncode == 0:
+                base_contained = True
+            elif result.returncode == 1:
+                base_contained = False
+            else:
+                base_contained = False
+        except _WorkspaceRejected:
+            base_contained = False
+
+        if not base_contained:
+            failures.append("base_not_contained")
+
+        common_repository = target_common
+
+        ready = len(failures) == 0
+
+        return _MemberVerification(
+            repository_identity=member.repository_identity,
+            target_path=target_path,
+            observed_head=observed_head,
+            branch_matches=branch_matches,
+            base_contained=base_contained,
+            common_repository=common_repository,
+            ready=ready,
+            failures=tuple(failures),
+        )
+
+    def materialize(self, member: _WorkspaceMember) -> _MemberVerification:
+        target_path = member.target_path
+        repository_root = member.repository_root
+        branch = member.branch
+        required_base_sha = member.required_base_sha
+
+        stdout = self._git(repository_root, "rev-parse", "origin/main", allowed_returncodes=(0,))
+        if stdout != required_base_sha:
+            raise _WorkspaceRejected(f"origin/main does not match required base sha")
+
+        self._git(repository_root, "check-ref-format", "--branch", branch, allowed_returncodes=(0,))
+
+        if os.path.exists(target_path):
+            verification = self.verify(member)
+            if verification.ready:
+                return verification
+            raise _WorkspaceRejected(f"existing target not ready: {verification.failures}")
+
+        target_parent = os.path.dirname(target_path)
+        os.makedirs(target_parent, exist_ok=True)
+
+        result = self._run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            repository_root,
+        )
+        if result.returncode == 0:
+            branch_exists = True
+        elif result.returncode == 1:
+            branch_exists = False
+        else:
+            raise _WorkspaceRejected(f"show-ref failed with rc={result.returncode}")
+
+        if branch_exists:
+            argv = ["git", "worktree", "add", target_path, branch]
+        else:
+            argv = ["git", "worktree", "add", "-b", branch, target_path, required_base_sha]
+
+        result = self._run(argv, repository_root)
+        if result.returncode != 0:
+            raise _WorkspaceRejected(f"worktree add failed: {result.stderr.strip()}")
+
+        verification = self.verify(member)
+        if not verification.ready:
+            raise _WorkspaceRejected(f"materialized target not ready: {verification.failures}")
+        return verification
