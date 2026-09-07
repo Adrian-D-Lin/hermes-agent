@@ -858,11 +858,9 @@ class _ModelToolRequestNormalizer:
         boundary: Any,
         *,
         board_resolver: Any = None,
-        version_resolver: Any = None,
     ) -> None:
         self._boundary = boundary
         self._board_resolver = board_resolver
-        self._version_resolver = version_resolver
 
     def submit(
         self,
@@ -909,10 +907,8 @@ class _ModelToolRequestNormalizer:
                     payload=payload,
                 )
 
-            if self._board_resolver is None or self._version_resolver is None:
-                raise ValueError(
-                    "mutation requires board_resolver and version_resolver"
-                )
+            if self._board_resolver is None:
+                raise ValueError("mutation requires board_resolver")
             session_id = runtime.get("session_id")
             if not isinstance(session_id, str) or not session_id.strip():
                 raise ValueError("session_id must be nonblank str")
@@ -938,18 +934,12 @@ class _ModelToolRequestNormalizer:
             target = _target_for_operation(operation, payload)
             if not isinstance(target, str) or not target.strip():
                 raise ValueError("target must be nonblank str")
-            expected_version = self._version_resolver(
-                operation,
-                target,
-                board,
-            )
-
             return self._boundary.submit(
                 operation,
                 attempt_id=attempt_id,
                 idempotency_key=idempotency_key,
                 target=target,
-                expected_version=expected_version,
+                derive_expected_version=True,
                 session_id=session_id.strip(),
                 workspace_id=workspace_id,
                 execution_context="model-tool",
@@ -1143,7 +1133,6 @@ def register_public_tools(
     boundary: Any,
     *,
     board_resolver: Any = None,
-    version_resolver: Any = None,
 ) -> None:
     """Register the 18 ratified public model-tools on the given toolset.
 
@@ -1156,7 +1145,6 @@ def register_public_tools(
     normalizer = _ModelToolRequestNormalizer(
         boundary,
         board_resolver=board_resolver,
-        version_resolver=version_resolver,
     )
 
     def _make_handler(operation: str):
@@ -1184,6 +1172,7 @@ _COMMAND_EXECUTION_FAILED = "COMMAND_EXECUTION_FAILED"
 _IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 _IDEMPOTENCY_KEY_REQUIRED = "IDEMPOTENCY_KEY_REQUIRED"
 _PUBLIC_REQUEST_NORMALIZATION_FAILED = "PUBLIC_REQUEST_NORMALIZATION_FAILED"
+_STALE_DERIVED_STATE = "STALE_DERIVED_STATE"
 
 _BOUNDARY_SOURCE = "adrian-kanban"
 _BOUNDARY_DESTINATION = "adrian-kanban"
@@ -1267,16 +1256,15 @@ def command_boundary(action: str, **fields: Any) -> dict[str, Any]:
 def _request_digest(
     operation: str,
     target: str,
-    expected_version: int,
     payload: dict[str, Any],
     session_id: str,
     workspace_id: str | None,
     execution_context: str,
+    expected_version: int | None = None,
 ) -> str:
     identity = {
         "operation": operation,
         "target": target,
-        "expected_version": expected_version,
         "payload": payload,
         "session_id": session_id,
         "workspace_id": workspace_id,
@@ -1284,6 +1272,8 @@ def _request_digest(
         "protocol_version": PROTOCOL_VERSION,
         "execution_context": execution_context,
     }
+    if expected_version is not None:
+        identity["expected_version"] = expected_version
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1322,14 +1312,18 @@ class _CommandBoundary:
         database_path: str,
         provider: AdrianKanbanAuthorityProvider,
         handlers: dict[str, Any],
+        state_resolver: Any = None,
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise TypeError("provider must be an AdrianKanbanAuthorityProvider")
         if not isinstance(database_path, str) or not database_path.strip():
             raise ValueError("database_path must be a nonblank string")
+        if state_resolver is not None and not callable(state_resolver):
+            raise TypeError("state_resolver must be callable or None")
         self._database_path = database_path
         self._provider = provider
         self._handlers = MappingProxyType(dict(handlers))
+        self._state_resolver = state_resolver
 
     def submit(self, action: str, **fields: Any) -> dict[str, Any]:
         attempt_id = _resolve_attempt_id(fields)
@@ -1404,9 +1398,9 @@ class _CommandBoundary:
         target = fields.get("target")
         session_id = fields.get("session_id")
         execution_context = fields.get("execution_context")
-        expected_version = fields.get("expected_version")
         workspace_id = fields.get("workspace_id")
         payload = fields.get("payload")
+        derive_expected_version = fields.get("derive_expected_version", False)
 
         if not isinstance(target, str) or not target.strip():
             return self._rejection_internal(
@@ -1420,11 +1414,7 @@ class _CommandBoundary:
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
             )
-        if (
-            isinstance(expected_version, bool)
-            or not isinstance(expected_version, int)
-            or expected_version < 0
-        ):
+        if type(derive_expected_version) is not bool:
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
             )
@@ -1442,31 +1432,16 @@ class _CommandBoundary:
         request_digest = _request_digest(
             operation=action,
             target=target,
-            expected_version=expected_version,
             payload=payload,
             session_id=session_id,
             workspace_id=workspace_id,
             execution_context=execution_context,
+            expected_version=(
+                None
+                if derive_expected_version
+                else fields.get("expected_version")
+            ),
         )
-
-        binding = CapabilityBinding(
-            operation=action,
-            target=target,
-            expected_version=expected_version,
-            canonical_digest=_canonical_digest(payload),
-            session_id=session_id,
-            workspace_id=workspace_id,
-            plugin_version=PLUGIN_VERSION,
-            protocol_version=PROTOCOL_VERSION,
-            execution_context=execution_context,
-        )
-
-        try:
-            capability = self._provider._mint_after_admission(binding)
-        except Exception:
-            return self._rejection_internal(
-                attempt_id, action, _COMMAND_EXECUTION_FAILED
-            )
 
         try:
             conn = sqlite3.connect(self._database_path)
@@ -1476,8 +1451,49 @@ class _CommandBoundary:
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
             )
 
-        adapter = self._provider._create_mutation_executor(conn)
         try:
+            row = conn.execute(
+                f"SELECT request_digest, response_json FROM {_RECEIPT_TABLE} "
+                "WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                if row["request_digest"] != request_digest:
+                    raise _ConflictError()
+                return json.loads(row["response_json"])
+
+            if derive_expected_version:
+                if self._state_resolver is None:
+                    raise TypeError("state_resolver is required")
+                expected_version = self._state_resolver(
+                    conn,
+                    action,
+                    target,
+                    payload,
+                )
+            else:
+                expected_version = fields.get("expected_version")
+            if (
+                isinstance(expected_version, bool)
+                or not isinstance(expected_version, int)
+                or expected_version < 0
+            ):
+                raise TypeError("expected_version must be a non-negative integer")
+
+            binding = CapabilityBinding(
+                operation=action,
+                target=target,
+                expected_version=expected_version,
+                canonical_digest=_canonical_digest(payload),
+                session_id=session_id,
+                workspace_id=workspace_id,
+                plugin_version=PLUGIN_VERSION,
+                protocol_version=PROTOCOL_VERSION,
+                execution_context=execution_context,
+            )
+            capability = self._provider._mint_after_admission(binding)
+            adapter = self._provider._create_mutation_executor(conn)
+
             with adapter.mutation_transaction(capability, binding):
                 row = conn.execute(
                     f"SELECT request_digest, response_json FROM {_RECEIPT_TABLE} "
@@ -1488,6 +1504,21 @@ class _CommandBoundary:
                     if row["request_digest"] != request_digest:
                         raise _ConflictError()
                     return json.loads(row["response_json"])
+
+                if derive_expected_version:
+                    current_version = self._state_resolver(
+                        conn,
+                        action,
+                        target,
+                        payload,
+                    )
+                    if (
+                        isinstance(current_version, bool)
+                        or not isinstance(current_version, int)
+                        or current_version < 0
+                        or current_version != expected_version
+                    ):
+                        raise _StaleDerivedStateError()
 
                 context = _CommandContext(
                     operation=action,
@@ -1533,6 +1564,10 @@ class _CommandBoundary:
             return self._rejection_internal(
                 attempt_id, action, _IDEMPOTENCY_CONFLICT
             )
+        except _StaleDerivedStateError:
+            return self._rejection_internal(
+                attempt_id, action, _STALE_DERIVED_STATE
+            )
         except Exception:
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
@@ -1567,6 +1602,10 @@ class _CommandBoundary:
 
 
 class _ConflictError(RuntimeError):
+    pass
+
+
+class _StaleDerivedStateError(RuntimeError):
     pass
 
 
