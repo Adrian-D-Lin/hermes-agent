@@ -136,7 +136,10 @@ def _requirements():
 
 
 def _preparer(task_inputs):
-    def prepare(payload):
+    def prepare(payload, preparation_context):
+        assert type(preparation_context) is task_inputs.TaskInputPreparationContext
+        assert preparation_context.session_id == "session-create"
+        assert preparation_context.execution_context == "model-tool"
         return task_inputs.prepare_task_input_manifest(
             payload["task_input_manifest_v1"],
             lambda _commit, _path: pytest.fail("snapshot create must not read Git"),
@@ -392,7 +395,10 @@ def test_manifest_preparation_occurs_once_before_idempotent_replay(
     _seed_initiative(database_path)
     calls = []
 
-    def prepare(payload):
+    def prepare(payload, preparation_context):
+        assert type(preparation_context) is modules[
+            "task_inputs"
+        ].TaskInputPreparationContext
         calls.append(payload["task_id"])
         return modules["task_inputs"].prepare_task_input_manifest(
             payload["task_input_manifest_v1"],
@@ -427,7 +433,7 @@ def test_boundary_rejects_non_prepared_manifest_result(
         provider=provider,
         handlers={"kanban_create": commands._handle_create},
         known_profiles={"default", "independent-reviewer"},
-        task_input_preparer=lambda _payload: object(),
+        task_input_preparer=lambda _payload, _context: object(),
     )
 
     result = _submit(boundary, _payload(), "bad-prepared-type")

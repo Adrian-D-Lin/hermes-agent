@@ -14,6 +14,7 @@ __all__ = [
     "PreparedManifest",
     "FinalizedEntry",
     "FinalizedManifest",
+    "TaskInputPreparationContext",
     "prepare_task_input_manifest",
     "finalize_task_input_manifest",
     "validate_contract_input_coverage",
@@ -55,6 +56,31 @@ def _validate_commit(value: Any) -> str:
     if not isinstance(value, str) or not _COMMIT_RE.match(value):
         raise ValueError("source_locator must be exactly 40 or 64 lowercase hexadecimal characters")
     return value
+
+
+@dataclass(frozen=True)
+class TaskInputPreparationContext:
+    session_id: str
+    execution_context: str
+    workspace_id: str | None = None
+    actor_profile: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.session_id) is not str or not self.session_id.strip():
+            raise ValueError("session_id must be a nonblank string")
+        if (
+            type(self.execution_context) is not str
+            or not self.execution_context.strip()
+        ):
+            raise ValueError("execution_context must be a nonblank string")
+        if self.workspace_id is not None and (
+            type(self.workspace_id) is not str or not self.workspace_id.strip()
+        ):
+            raise ValueError("workspace_id must be None or a nonblank string")
+        if self.actor_profile is not None and (
+            type(self.actor_profile) is not str or not self.actor_profile.strip()
+        ):
+            raise ValueError("actor_profile must be None or a nonblank string")
 
 
 @dataclass(frozen=True)

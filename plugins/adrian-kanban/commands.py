@@ -41,6 +41,7 @@ from .projections import attachments_projection, list_projection, show_projectio
 from .skill_bundle import resolve_skill_binding, skill_contract, validate_skill_bundle
 from .task_inputs import (
     PreparedManifest,
+    TaskInputPreparationContext,
     finalize_task_input_manifest,
     validate_contract_input_coverage,
 )
@@ -3007,7 +3008,19 @@ class _CommandBoundary:
             if "task_input_manifest_v1" in payload:
                 if self._task_input_preparer is None:
                     raise ValueError("task_input_preparer is required")
-                prepared_manifest = self._task_input_preparer(payload)
+                preparation_context = TaskInputPreparationContext(
+                    session_id=session_id.strip(),
+                    execution_context=execution_context.strip(),
+                    workspace_id=(
+                        workspace_id.strip() if workspace_id is not None else None
+                    ),
+                    actor_profile=(
+                        actor_profile.strip() if actor_profile is not None else None
+                    ),
+                )
+                prepared_manifest = self._task_input_preparer(
+                    payload, preparation_context
+                )
                 if type(prepared_manifest) is not PreparedManifest:
                     raise ValueError("task_input_preparer must return PreparedManifest")
 
