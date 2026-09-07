@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+from .journal import ExternalOperationJournal, JournalIntent, JournalRejected
+
 __all__ = ()
 
 
@@ -440,3 +442,184 @@ class _GitWorkspaceExecutor:
         if not verification.ready:
             raise _WorkspaceRejected(f"materialized target not ready: {verification.failures}")
         return verification
+
+
+class _JournaledWorkspaceOperations:
+    def __init__(self, conn, journal, executor):
+        if type(conn) is not sqlite3.Connection:
+            raise _WorkspaceRejected("connection must be sqlite3.Connection")
+        if type(journal) is not ExternalOperationJournal:
+            raise _WorkspaceRejected("journal must be ExternalOperationJournal")
+        if type(executor) is not _GitWorkspaceExecutor:
+            raise _WorkspaceRejected("executor must be _GitWorkspaceExecutor")
+        if journal._conn is not conn:
+            raise _WorkspaceRejected("journal connection mismatch")
+        self._conn = conn
+        self._journal = journal
+        self._executor = executor
+
+    def _validate_intent(self, intent, member):
+        if type(member) is not _WorkspaceMember:
+            raise _WorkspaceRejected("member must be _WorkspaceMember")
+        if type(intent) is not JournalIntent:
+            raise _WorkspaceRejected("intent must be JournalIntent")
+        if intent.operation_kind != "workspace_materialize":
+            raise _WorkspaceRejected("intent operation_kind must be workspace_materialize")
+        if intent.member_target != member.repository_identity:
+            raise _WorkspaceRejected("intent member_target mismatch")
+        if intent.workspace_id != member.workspace_id:
+            raise _WorkspaceRejected("intent workspace_id mismatch")
+        if intent.repository_identity != member.repository_identity:
+            raise _WorkspaceRejected("intent repository_identity mismatch")
+        expected_git = f"base={member.required_base_sha};branch={member.branch}"
+        if intent.intended_git_evidence != expected_git:
+            raise _WorkspaceRejected("intent intended_git_evidence mismatch")
+        expected_fs = f"target={member.target_path}"
+        if intent.intended_filesystem_evidence != expected_fs:
+            raise _WorkspaceRejected("intent intended_filesystem_evidence mismatch")
+
+    def _owned_transaction(self, callback):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            result = callback()
+            self._conn.commit()
+            return result
+        except BaseException as e:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            if isinstance(e, _WorkspaceRejected):
+                raise
+            if isinstance(e, (JournalRejected, sqlite3.Error)):
+                raise _WorkspaceRejected(str(e)) from e
+            raise
+
+    def _verified_evidence(self, member, v):
+        return (
+            f"head={v.observed_head};branch={member.branch};base_contained=true;common={v.common_repository}",
+            f"exists=true;target={member.target_path}"
+        )
+
+    def _append_verified(self, intent, member, v, at):
+        git_ev, fs_ev = self._verified_evidence(member, v)
+        def _append():
+            return self._journal.append_verified(
+                operation_id=intent.operation_id,
+                member_target=intent.member_target,
+                observed_git_evidence=git_ev,
+                observed_filesystem_evidence=fs_ev,
+                actor_evidence=intent.actor_evidence,
+                created_at=at,
+            )
+        return self._owned_transaction(_append)
+
+    def _append_failed(self, intent, member, v, at, resumable):
+        git_ev = f"head={v.observed_head}" if v.observed_head else None
+        fs_ev = f"exists={'true' if os.path.exists(member.target_path) else 'false'};target={member.target_path}"
+        error_disp = "effect absent after verification" if resumable else "unsafe workspace state after verification"
+        recovery_disp = "resume" if resumable else "manual intervention required"
+        def _append():
+            return self._journal.append_failed(
+                operation_id=intent.operation_id,
+                member_target=intent.member_target,
+                observed_git_evidence=git_ev,
+                observed_filesystem_evidence=fs_ev,
+                actor_evidence=intent.actor_evidence,
+                created_at=at,
+                error_disposition=error_disp,
+                recovery_disposition=recovery_disp,
+            )
+        return self._owned_transaction(_append)
+
+    def _finish_observation(self, intent, member, v, at, after_materialize_attempt):
+        if v.ready:
+            self._append_verified(intent, member, v, at)
+            return self._journal.verified_evidence(intent.operation_id, intent.member_target)
+        elif v.failures == ('member_absent',):
+            if after_materialize_attempt:
+                self._append_failed(intent, member, v, at, resumable=True)
+                return self._journal.head(intent.operation_id, intent.member_target)
+            else:
+                try:
+                    self._executor.materialize(member)
+                except _WorkspaceRejected:
+                    pass
+                v2 = self._executor.verify(member)
+                return self._finish_observation(intent, member, v2, at, after_materialize_attempt=True)
+        else:
+            self._append_failed(intent, member, v, at, resumable=False)
+            return self._journal.head(intent.operation_id, intent.member_target)
+
+    def prepare_materialize(self, intent, member):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        self._validate_intent(intent, member)
+        def _append():
+            self._journal.append_prepared(intent)
+            return self._journal.head(intent.operation_id, intent.member_target)
+        return self._owned_transaction(_append)
+
+    def run_materialize(self, intent, member, outcome_at):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        if type(outcome_at) is not int or outcome_at <= 0:
+            raise _WorkspaceRejected("outcome_at must be positive exact int")
+        self._validate_intent(intent, member)
+        action = self._journal.recovery_action(intent.operation_id, intent.member_target)
+        if action == "prepare":
+            raise _WorkspaceRejected("must prepare first")
+        if action == "consume_verified":
+            return self._journal.verified_evidence(intent.operation_id, intent.member_target)
+        if action == "halt":
+            raise _WorkspaceRejected("halted")
+        if action == "resume":
+            def _append_resume():
+                self._journal.append_resume_prepared(
+                    operation_id=intent.operation_id,
+                    member_target=intent.member_target,
+                    actor_evidence=intent.actor_evidence,
+                    created_at=outcome_at,
+                )
+            self._owned_transaction(_append_resume)
+            action = "verify"
+        if action == "verify":
+            v = self._executor.verify(member)
+            return self._finish_observation(intent, member, v, outcome_at, after_materialize_attempt=False)
+        raise _WorkspaceRejected("unknown recovery action")
+
+    def consume_materialization(self, intent, member, consumed_at):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        if type(consumed_at) is not int or consumed_at <= 0:
+            raise _WorkspaceRejected("consumed_at must be positive exact int")
+        self._validate_intent(intent, member)
+        action = self._journal.recovery_action(intent.operation_id, intent.member_target)
+        if action != "consume_verified":
+            raise _WorkspaceRejected("verified")
+        called_evidence = self._journal.verified_evidence(intent.operation_id, intent.member_target)
+        v = self._executor.verify(member)
+        if not v.ready:
+            raise _WorkspaceRejected("verified")
+        expected_git, expected_fs = self._verified_evidence(member, v)
+        if called_evidence.observed_git_evidence != expected_git or called_evidence.observed_filesystem_evidence != expected_fs:
+            raise _WorkspaceRejected("verified")
+        def _consume():
+            row = self._conn.execute(
+                "SELECT observed_head, member_state, observed_at FROM segment_workspace_members WHERE workspace_id = ? AND repository_identity = ?",
+                (member.workspace_id, member.repository_identity),
+            ).fetchone()
+            if row and row[1] == "materialized" and row[0] == v.observed_head and row[2] == consumed_at:
+                return v
+            if not row or row[1] != "planned":
+                raise _WorkspaceRejected("consume")
+            cur = self._conn.execute(
+                "UPDATE segment_workspace_members SET observed_head = ?, member_state = 'materialized', observed_at = ? WHERE workspace_id = ? AND repository_identity = ? AND member_state = 'planned'",
+                (v.observed_head, consumed_at, member.workspace_id, member.repository_identity),
+            )
+            if cur.rowcount != 1:
+                raise _WorkspaceRejected("consume")
+            return v
+        return self._owned_transaction(_consume)

@@ -1483,6 +1483,206 @@ def test_workspace_materialization_fails_closed_when_worktree_add_fails(
     conn.close()
 
 
+def _workspace_materialize_intent(journal_mod, member, **changes):
+    values = {
+        "operation_id": "materialize-1",
+        "idempotency_id": "materialize-idempotency-1",
+        "member_target": member.repository_identity,
+        "operation_kind": "workspace_materialize",
+        "workspace_id": member.workspace_id,
+        "repository_identity": member.repository_identity,
+        "intended_git_evidence": (
+            f"base={member.required_base_sha};branch={member.branch}"
+        ),
+        "intended_filesystem_evidence": f"target={member.target_path}",
+        "actor_evidence": "system:workspace-controller",
+        "created_at": 2_000,
+    }
+    values.update(changes)
+    return journal_mod.JournalIntent(**values)
+
+
+def test_journaled_materialization_commits_prepare_before_effect_and_consumes_later(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    intent = _workspace_materialize_intent(journal_mod, member)
+    original_materialize = executor.materialize
+
+    def observe_committed_prepare(materialize_member):
+        assert conn.in_transaction is False
+        assert journal.head(intent.operation_id, intent.member_target).state == "prepared"
+        return original_materialize(materialize_member)
+
+    monkeypatch.setattr(executor, "materialize", observe_committed_prepare)
+    prepared = operations.prepare_materialize(intent, member)
+    assert prepared.state == "prepared"
+    assert conn.in_transaction is False
+
+    verified = operations.run_materialize(intent, member, outcome_at=2_001)
+    assert verified.state == "verified"
+    assert conn.execute(
+        "SELECT member_state FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()[0] == "planned"
+
+    consumed = operations.consume_materialization(intent, member, consumed_at=2_002)
+    assert consumed.observed_head == member.required_base_sha
+    row = conn.execute(
+        "SELECT observed_head, member_state, observed_at "
+        "FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()
+    assert tuple(row) == (member.required_base_sha, "materialized", 2_002)
+    assert conn.in_transaction is False
+    conn.close()
+
+
+def test_journaled_materialization_recovers_after_effect_without_replay(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    executor.materialize(member)
+
+    def blind_replay(_member):
+        raise AssertionError("materialize must not replay an already-observed effect")
+
+    monkeypatch.setattr(executor, "materialize", blind_replay)
+    verified = operations.run_materialize(intent, member, outcome_at=2_001)
+    assert verified.state == "verified"
+    assert [
+        row[0]
+        for row in conn.execute(
+            "SELECT state FROM external_operation_journal ORDER BY ordinal"
+        )
+    ] == ["prepared", "verified"]
+
+    monkeypatch.setattr(
+        executor,
+        "verify",
+        lambda _member: (_ for _ in ()).throw(
+            AssertionError("verified retry must not inspect or replay the effect")
+        ),
+    )
+    assert operations.run_materialize(intent, member, outcome_at=2_002) == verified
+    assert conn.execute(
+        "SELECT COUNT(*) FROM external_operation_journal"
+    ).fetchone()[0] == 2
+    conn.close()
+
+
+def test_journaled_materialization_resumes_only_after_verified_absence(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    original_materialize = executor.materialize
+    monkeypatch.setattr(
+        executor,
+        "materialize",
+        lambda _member: (_ for _ in ()).throw(
+            workspace_mod._WorkspaceRejected("injected pre-effect failure")
+        ),
+    )
+
+    failed = operations.run_materialize(intent, member, outcome_at=2_001)
+    assert failed.state == "failed"
+    assert failed.recovery_disposition == "resume"
+    assert not Path(member.target_path).exists()
+
+    monkeypatch.setattr(executor, "materialize", original_materialize)
+    verified = operations.run_materialize(intent, member, outcome_at=2_002)
+    assert verified.state == "verified"
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT ordinal, state FROM external_operation_journal ORDER BY ordinal"
+        )
+    ] == [
+        (1, "prepared"),
+        (2, "failed"),
+        (3, "prepared"),
+        (4, "verified"),
+    ]
+    conn.close()
+
+
+def test_journaled_materialization_halts_on_unsafe_existing_target(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn, journal, workspace_mod._GitWorkspaceExecutor()
+    )
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    target = Path(member.target_path)
+    target.mkdir(parents=True)
+    (target / "preserve.txt").write_text("do not alter\n", encoding="utf-8")
+
+    failed = operations.run_materialize(intent, member, outcome_at=2_001)
+    assert failed.state == "failed"
+    assert failed.recovery_disposition == "manual intervention required"
+    assert (target / "preserve.txt").read_text(encoding="utf-8") == "do not alter\n"
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="halted"):
+        operations.run_materialize(intent, member, outcome_at=2_002)
+    conn.close()
+
+
+def test_materialization_consumption_requires_exact_verified_evidence(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn, journal, workspace_mod._GitWorkspaceExecutor()
+    )
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="verified"):
+        operations.consume_materialization(intent, member, consumed_at=2_001)
+    wrong_intent = replace(intent, intended_git_evidence="base=wrong;branch=wrong")
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="intent"):
+        operations.run_materialize(wrong_intent, member, outcome_at=2_001)
+    assert conn.execute(
+        "SELECT member_state FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()[0] == "planned"
+    conn.close()
+
+
 def test_h16_rejection_envelope_preserves_every_failure_and_remediation(
     provider_modules,
 ):
