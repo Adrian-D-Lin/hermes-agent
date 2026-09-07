@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS adrian_kanban_cards (
     created_at      INTEGER NOT NULL,
     board_slug      TEXT NOT NULL DEFAULT 'default',
     record_version  INTEGER NOT NULL DEFAULT 0 CHECK (record_version >= 0),
+    body            TEXT,
+    closed_at       INTEGER,
     -- Unified-card shape: an initiative card carries no task identity and a
     -- task card carries one; any other card_type is invalid. The CHECK pins
     -- card_type to the two valid shapes and ties each to the correct task_id
@@ -443,3 +445,7 @@ def create_schema(conn: object) -> None:
             "record_version INTEGER NOT NULL DEFAULT 0 "
             "CHECK (record_version >= 0)"
         )
+    if "body" not in existing:
+        conn.execute("ALTER TABLE adrian_kanban_cards ADD COLUMN body TEXT")
+    if "closed_at" not in existing:
+        conn.execute("ALTER TABLE adrian_kanban_cards ADD COLUMN closed_at INTEGER")

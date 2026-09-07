@@ -29,6 +29,11 @@ from .handoffs import (
     normalize_handoff_requirements,
     validate_candidate_metadata,
 )
+from .initiative_mutations import (
+    _handle_create_initiative,
+    _handle_transition_initiative,
+    _handle_update_initiative,
+)
 from .projections import attachments_projection, list_projection, show_projection
 
 # Public operation taxonomy. These sets are frozen by the ratified Canon
@@ -713,6 +718,10 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 "to_phase": {
                     "type": "string",
                     "description": "Target phase for the initiative.",
+                },
+                "to_segment_id": {
+                    "type": "string",
+                    "description": "Optional target segment identifier.",
                 },
                 "reconciliation_ref": {
                     "type": "string",
@@ -2454,6 +2463,7 @@ class _CommandContext:
         mutation_executor: Any = None,
         known_profiles: frozenset[str] = frozenset(),
         prepared_attachment: PreparedAttachment | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -2464,6 +2474,7 @@ class _CommandContext:
         self.mutation_executor = mutation_executor
         self.known_profiles = known_profiles
         self.prepared_attachment = prepared_attachment
+        self.idempotency_key = idempotency_key
 
 
 class _CommandBoundary:
@@ -2665,11 +2676,20 @@ class _CommandBoundary:
             ):
                 raise TypeError("expected_version must be a non-negative integer")
 
+            if action in INITIATIVE_OPERATIONS:
+                mutation_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "approval_id"
+                }
+            else:
+                mutation_payload = payload
+
             binding = CapabilityBinding(
                 operation=action,
                 target=target,
                 expected_version=expected_version,
-                canonical_digest=_canonical_digest(payload),
+                canonical_digest=_canonical_digest(mutation_payload),
                 session_id=session_id,
                 workspace_id=workspace_id,
                 plugin_version=PLUGIN_VERSION,
@@ -2719,6 +2739,7 @@ class _CommandBoundary:
                     mutation_executor=adapter,
                     known_profiles=self._known_profiles,
                     prepared_attachment=prepared_attachment,
+                    idempotency_key=idempotency_key,
                 )
                 try:
                     result = handler(context)
@@ -2822,4 +2843,7 @@ __all__ = [
     "_handle_heartbeat",
     "_handle_link",
     "_handle_unblock",
+    "_handle_create_initiative",
+    "_handle_update_initiative",
+    "_handle_transition_initiative",
 ]
