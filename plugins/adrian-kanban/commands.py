@@ -842,6 +842,46 @@ TOOL_SCHEMAS: dict[str, Any] = {
 TOOL_SCHEMAS = MappingProxyType(dict(TOOL_SCHEMAS))
 
 
+def _handle_link(context: Any) -> dict[str, Any]:
+    parent_id = context.payload.get("parent_id")
+    child_id = context.payload.get("child_id")
+    if not (type(parent_id) is str and parent_id.strip()):
+        raise ValueError("parent_id must be a nonblank string")
+    if not (type(child_id) is str and child_id.strip()):
+        raise ValueError("child_id must be a nonblank string")
+    if parent_id == child_id:
+        raise ValueError("a task cannot link to itself")
+
+    def _validate_endpoint(task_id: str) -> None:
+        row = context.connection.execute(
+            "SELECT card_type, task_id, initiative_id FROM adrian_kanban_cards "
+            "WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["card_type"] != "task" or row["task_id"] != task_id:
+            raise ValueError(f"{task_id} is not a valid task endpoint")
+        init_row = context.connection.execute(
+            "SELECT card_type, task_id FROM adrian_kanban_cards "
+            "WHERE initiative_id = ? AND task_id IS NULL",
+            (row["initiative_id"],),
+        ).fetchone()
+        if init_row is None or init_row["card_type"] != "initiative":
+            raise ValueError(
+                f"initiative for {task_id} has no canonical initiative card"
+            )
+
+    _validate_endpoint(parent_id)
+    _validate_endpoint(child_id)
+
+    context.mutation_executor._link_in_active_transaction(
+        context.capability,
+        context.binding,
+        parent_id=parent_id,
+        child_id=child_id,
+    )
+    return {"parent_id": parent_id, "child_id": child_id}
+
+
 def register_public_tools(ctx: Any, boundary: Any) -> None:
     """Register the 18 ratified public model-tools on the given toolset.
 
@@ -1269,4 +1309,5 @@ __all__ = [
     "RECOGNIZED_OPERATIONS",
     "command_boundary",
     "_CommandBoundary",
+    "_handle_link",
 ]

@@ -4469,10 +4469,18 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    _allow_nested: bool = False,
+) -> None:
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
