@@ -821,3 +821,310 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
         result["from_segment_id"] = from_segment_id
         result["to_segment_id"] = to_segment_id
     return result
+
+
+def _handle_close_initiative(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    unknown = set(payload.keys()) - {
+        "initiative_id",
+        "closure_result_ref",
+        "approval_id",
+        "board",
+    }
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+    initiative_id = payload.get("initiative_id")
+    closure_result_ref = payload.get("closure_result_ref")
+    approval_id = payload.get("approval_id")
+    board = payload.get("board")
+    if not (type(initiative_id) is str and initiative_id.strip()):
+        raise ValueError("initiative_id must be a nonblank string")
+    if not (type(closure_result_ref) is str and closure_result_ref.strip()):
+        raise ValueError("closure_result_ref must be a nonblank string")
+    if not (type(approval_id) is str and approval_id.strip()):
+        raise ValueError("approval_id must be a nonblank string")
+    if not (type(board) is str and board.strip()):
+        raise ValueError("board must be a nonblank string")
+    initiative_id = initiative_id.strip()
+    closure_result_ref = closure_result_ref.strip()
+    board = board.strip()
+
+    if context.binding.actor_profile != "default":
+        raise ValueError("closure actor profile must be default")
+
+    card = context.connection.execute(
+        "SELECT id, record_version FROM adrian_kanban_cards "
+        "WHERE initiative_id = ? AND board_slug = ? "
+        "AND card_type = 'initiative' AND task_id IS NULL AND closed_at IS NULL",
+        (initiative_id, board),
+    ).fetchone()
+    if card is None:
+        raise ValueError("open initiative card not found")
+    card_id = card["id"]
+    current_version = card["record_version"]
+    expected_version = context.binding.expected_version
+    if current_version != expected_version:
+        raise ValueError("stale initiative version")
+
+    latest = context.connection.execute(
+        "SELECT transition_id, to_phase, to_segment_id "
+        "FROM initiative_transitions WHERE initiative_id = ? "
+        "ORDER BY transition_id DESC LIMIT 1",
+        (initiative_id,),
+    ).fetchone()
+    if latest is None:
+        raise ValueError("no initiative transition found")
+    current_phase = latest["to_phase"]
+    current_segment_id = latest["to_segment_id"]
+    if current_phase not in {"DEV4", "PC1"}:
+        raise ValueError("closure requires DEV4 or PC1")
+    if current_phase == "PC1" and current_segment_id is not None:
+        raise ValueError(
+            "PC1 closure must be milestone-scoped (segment_id must be NULL)"
+        )
+
+    closure_row = context.connection.execute(
+        "SELECT initiative_card_id, initiative_id, phase, segment_id, accepted, "
+        "result_kind, contract_id, contract_version, actor_evidence, canonical_payload "
+        "FROM initiative_phase_results WHERE result_id = ?",
+        (closure_result_ref,),
+    ).fetchone()
+    if closure_row is None:
+        raise ValueError("closure result not found")
+    if closure_row["initiative_card_id"] != card_id:
+        raise ValueError("closure card mismatch")
+    if closure_row["initiative_id"] != initiative_id:
+        raise ValueError("closure initiative mismatch")
+    if closure_row["accepted"] != 1:
+        raise ValueError("closure result not accepted")
+    if closure_row["result_kind"] != "initiative_closure":
+        raise ValueError("closure kind mismatch")
+    if closure_row["phase"] != current_phase:
+        raise ValueError("closure phase mismatch")
+    if closure_row["segment_id"] != current_segment_id:
+        raise ValueError("closure segment mismatch")
+    expected_contract = f"adrian-kanban.lifecycle.{current_phase.lower()}"
+    if closure_row["contract_id"] != expected_contract:
+        raise ValueError("closure contract mismatch")
+    if closure_row["contract_version"] != "1":
+        raise ValueError("closure contract version mismatch")
+
+    try:
+        closure_actor = json.loads(closure_row["actor_evidence"])
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError("invalid closure actor evidence")
+    if not isinstance(closure_actor, dict):
+        raise ValueError("closure actor evidence must be an object")
+    if closure_actor.get("actor_profile") != "default":
+        raise ValueError("closure actor profile must be default")
+
+    try:
+        closure_payload = json.loads(closure_row["canonical_payload"])
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError("invalid closure payload")
+    if not isinstance(closure_payload, dict):
+        raise ValueError("closure payload must be an object")
+    required_keys = {
+        "final_summary_ref",
+        "user_approval_ref",
+        "repository_reconciliation_ref",
+        "resolved_phase_result_refs",
+        "cancelled_task_refs",
+        "closure_conclusion",
+    }
+    if set(closure_payload.keys()) != required_keys:
+        raise ValueError("closure payload must contain exact fields")
+    for key in ("final_summary_ref", "user_approval_ref"):
+        value = closure_payload.get(key)
+        if not (type(value) is str and value.strip()):
+            raise ValueError(f"closure {key} must be nonblank")
+    if closure_payload.get("closure_conclusion") != "approved":
+        raise ValueError("closure conclusion must be approved")
+    resolved_refs = closure_payload.get("resolved_phase_result_refs")
+    cancelled_refs = closure_payload.get("cancelled_task_refs")
+    if not isinstance(resolved_refs, list):
+        raise ValueError("resolved_phase_result_refs must be a list")
+    if not isinstance(cancelled_refs, list):
+        raise ValueError("cancelled_task_refs must be a list")
+    for ref in resolved_refs:
+        if not (type(ref) is str and ref.strip()):
+            raise ValueError("resolved_phase_result_refs must contain nonblank strings")
+    for ref in cancelled_refs:
+        if not (type(ref) is str and ref.strip()):
+            raise ValueError("cancelled_task_refs must contain nonblank strings")
+    if len(resolved_refs) != len(set(resolved_refs)):
+        raise ValueError("resolved_phase_result_refs must be unique")
+    if len(cancelled_refs) != len(set(cancelled_refs)):
+        raise ValueError("cancelled_task_refs must be unique")
+
+    reconciliation_ref = closure_payload["repository_reconciliation_ref"]
+    if not (type(reconciliation_ref) is str and reconciliation_ref.strip()):
+        raise ValueError("repository_reconciliation_ref must be nonblank")
+    _validate_reconciliation(
+        context.connection,
+        card_id,
+        initiative_id,
+        board,
+        reconciliation_ref,
+        latest["transition_id"],
+        current_phase,
+        current_segment_id,
+        "closed",
+        None,
+    )
+
+    projection_row = context.connection.execute(
+        "SELECT parsed_segment_definitions, validation_result "
+        "FROM initiative_segment_projections WHERE initiative_card_id = ? "
+        "ORDER BY projection_version DESC LIMIT 1",
+        (card_id,),
+    ).fetchone()
+    if projection_row is None:
+        raise ValueError("no segment projection found")
+    if projection_row["validation_result"] != "accepted":
+        raise ValueError("segment projection not accepted")
+    try:
+        parsed_definitions = json.loads(projection_row["parsed_segment_definitions"])
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError("invalid segment definitions")
+    if not isinstance(parsed_definitions, list) or not parsed_definitions:
+        raise ValueError("segment definitions must be a nonempty list")
+    segment_ids: set[str] = set()
+    ordinals: set[int] = set()
+    max_ordinal = 0
+    max_segment_id: str | None = None
+    for definition in parsed_definitions:
+        if not isinstance(definition, dict):
+            raise ValueError("segment definition must be an object")
+        segment_id = definition.get("segment_id")
+        if not isinstance(segment_id, str) or not segment_id.strip():
+            raise ValueError("segment_id must be a nonblank string")
+        if segment_id in segment_ids:
+            raise ValueError("duplicate segment_id")
+        segment_ids.add(segment_id)
+        ordinal = definition.get("ordinal")
+        if not (type(ordinal) is int and not isinstance(ordinal, bool) and ordinal > 0):
+            raise ValueError("segment ordinal must be a positive integer")
+        if ordinal in ordinals:
+            raise ValueError("duplicate segment ordinal")
+        ordinals.add(ordinal)
+        if ordinal > max_ordinal:
+            max_ordinal = ordinal
+            max_segment_id = segment_id
+
+    if current_phase == "DEV4":
+        if current_segment_id is None:
+            raise ValueError("DEV4 closure requires a segment")
+        if current_segment_id != max_segment_id:
+            raise ValueError("DEV4 closure requires the final registered segment")
+
+    required_coverage: set[tuple[str, str | None]] = set()
+    for phase in ("D1", "D2", "D3", "D4", "DEV1"):
+        required_coverage.add((phase, None))
+    for segment_id in segment_ids:
+        for phase in ("DEV2", "DEV3", "DEV4"):
+            required_coverage.add((phase, segment_id))
+
+    covered: set[tuple[str, str | None]] = set()
+    for ref in resolved_refs:
+        row = context.connection.execute(
+            "SELECT initiative_card_id, initiative_id, phase, segment_id, result_kind, contract_id, contract_version, accepted "
+            "FROM initiative_phase_results WHERE result_id = ?",
+            (ref,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("resolved result not found")
+        if row["initiative_card_id"] != card_id:
+            raise ValueError("resolved result card mismatch")
+        if row["initiative_id"] != initiative_id:
+            raise ValueError("resolved result initiative mismatch")
+        if row["accepted"] != 1:
+            raise ValueError("resolved result not accepted")
+        if row["result_kind"] in {"repository_reconciliation", "initiative_closure"}:
+            continue
+        phase = row["phase"]
+        segment_id = row["segment_id"]
+        expected_contract = f"adrian-kanban.lifecycle.{phase.lower()}"
+        if row["contract_id"] != expected_contract:
+            raise ValueError("resolved result contract mismatch")
+        if row["contract_version"] != "1":
+            raise ValueError("resolved result contract version mismatch")
+        covered.add((phase, segment_id))
+    if not required_coverage.issubset(covered):
+        raise ValueError("incomplete phase coverage")
+
+    tasks = context.connection.execute(
+        "SELECT c.task_id, c.id AS task_card_id, t.status FROM adrian_kanban_cards c "
+        "JOIN tasks t ON c.task_id = t.id "
+        "WHERE c.initiative_id = ? AND c.card_type = 'task'",
+        (initiative_id,),
+    ).fetchall()
+    archived_task_ids: set[str] = set()
+    for task in tasks:
+        task_id = task["task_id"]
+        status = task["status"]
+        if status not in {"done", "archived"}:
+            raise ValueError("task not resolved")
+        if status == "archived":
+            archived_task_ids.add(task_id)
+        elif status == "done":
+            task_card_id = task["task_card_id"]
+            contract_row = context.connection.execute(
+                "SELECT 1 FROM task_lifecycle_contracts WHERE task_card_id = ?",
+                (task_card_id,),
+            ).fetchone()
+            if contract_row is not None:
+                verdict_row = context.connection.execute(
+                    "SELECT 1 FROM task_reviewer_verdicts WHERE task_card_id = ? AND verdict = 'accepted'",
+                    (task_card_id,),
+                ).fetchone()
+                if verdict_row is None:
+                    raise ValueError("lifecycle task done without accepted verdict")
+    cancelled_set = set(cancelled_refs)
+    if not archived_task_ids.issubset(cancelled_set):
+        raise ValueError("archived task not cancelled")
+    if not cancelled_set.issubset(archived_task_ids):
+        raise ValueError("cancelled ref not archived")
+
+    workspaces = context.connection.execute(
+        "SELECT workspace_id, active, lifecycle_state FROM segment_workspaces "
+        "WHERE initiative_card_id = ?",
+        (card_id,),
+    ).fetchall()
+    for ws in workspaces:
+        if ws["active"] != 0:
+            raise ValueError("workspace active")
+        if ws["lifecycle_state"] != "retired":
+            raise ValueError("workspace not retired")
+        members = context.connection.execute(
+            "SELECT member_state FROM segment_workspace_members WHERE workspace_id = ?",
+            (ws["workspace_id"],),
+        ).fetchall()
+        for member in members:
+            if member["member_state"] not in {"merged", "retired"}:
+                raise ValueError("workspace member not resolved")
+
+    _consume_approval(
+        context.connection,
+        context,
+        approval_id,
+        "kanban_close_initiative",
+        expected_version,
+        payload,
+        initiative_id,
+        None,
+    )
+    now = int(time.time())
+    cursor = context.connection.execute(
+        "UPDATE adrian_kanban_cards SET closed_at = ?, record_version = record_version + 1 "
+        "WHERE id = ? AND record_version = ? AND closed_at IS NULL",
+        (now, card_id, expected_version),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("stale initiative version")
+    return {
+        "initiative_id": initiative_id,
+        "closure_result_ref": closure_result_ref,
+        "closed_at": now,
+        "record_version": expected_version + 1,
+    }
