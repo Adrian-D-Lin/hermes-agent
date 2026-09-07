@@ -1966,6 +1966,274 @@ def test_journaled_merge_marks_safe_absence_resumable_after_effect_failure(
     conn.close()
 
 
+def _mark_workspace_member_materialized(conn, member, source_head):
+    conn.execute(
+        "UPDATE segment_workspace_members SET observed_head = ?, member_state = 'materialized' "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (source_head, member.workspace_id, member.repository_identity),
+    )
+
+
+def _complete_journaled_member_merge(
+    operations,
+    journal_mod,
+    member,
+    base_sha,
+    source_head,
+    *,
+    operation_id,
+    at,
+):
+    intent = _workspace_merge_intent(
+        journal_mod,
+        member,
+        base_sha,
+        source_head,
+        operation_id=operation_id,
+        idempotency_id=f"{operation_id}-idempotency",
+        created_at=at,
+    )
+    operations.prepare_merge(intent, member, base_sha, source_head)
+    assert operations.run_merge(
+        intent,
+        member,
+        base_sha,
+        source_head,
+        outcome_at=at + 1,
+    ).state == "verified"
+    operations.consume_merge(
+        intent,
+        member,
+        base_sha,
+        source_head,
+        consumed_at=at + 2,
+    )
+    return intent
+
+
+def test_workspace_retirement_releases_authority_but_retains_clean_evidence(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    _mark_workspace_member_materialized(conn, member, source_head)
+    conn.execute(
+        "UPDATE segment_workspaces SET lifecycle_state = 'active' WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    )
+    _complete_journaled_member_merge(
+        operations,
+        journal_mod,
+        member,
+        base_sha,
+        source_head,
+        operation_id="merge-retire-1",
+        at=4_000,
+    )
+
+    assert operations.retire_workspace(plan, retired_at=4_003) == ("repo-1",)
+    assert conn.execute(
+        "SELECT lifecycle_state, active, updated_at FROM segment_workspaces "
+        "WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[:] == ("retired", 0, 4_003)
+    assert conn.execute(
+        "SELECT observed_head, member_state, observed_at FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (plan.workspace_id, member.repository_identity),
+    ).fetchone()[:] == (source_head, "retired", 4_003)
+    assert Path(member.target_path).exists()
+    assert _git(member.target_path, "status", "--porcelain") == ""
+    assert _git(member.target_path, "rev-parse", "HEAD") == source_head
+    assert operations.retire_workspace(plan, retired_at=4_003) == ("repo-1",)
+    conn.close()
+
+
+def test_workspace_retirement_rejects_dirty_retained_evidence_without_db_change(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn, journal_mod.ExternalOperationJournal(conn), executor
+    )
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    _mark_workspace_member_materialized(conn, member, source_head)
+    conn.execute(
+        "UPDATE segment_workspaces SET lifecycle_state = 'active' WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    )
+    _complete_journaled_member_merge(
+        operations,
+        journal_mod,
+        member,
+        base_sha,
+        source_head,
+        operation_id="merge-dirty-1",
+        at=4_100,
+    )
+    (Path(member.target_path) / "untracked.txt").write_text(
+        "must be reconciled\n", encoding="utf-8"
+    )
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="clean"):
+        operations.retire_workspace(plan, retired_at=4_103)
+
+    assert conn.execute(
+        "SELECT lifecycle_state, active FROM segment_workspaces WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[:] == ("active", 1)
+    assert conn.execute(
+        "SELECT member_state FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (plan.workspace_id, member.repository_identity),
+    ).fetchone()[0] == "merged"
+    assert Path(member.target_path).exists()
+    conn.close()
+
+
+def _two_repository_workspace_plan(provider_modules, tmp_path):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    repository_one, base_one = _disposable_repository(tmp_path / "one")
+    repository_two, base_two = _disposable_repository(tmp_path / "two")
+    conn.execute(
+        "UPDATE segment_workspace_members SET required_base_sha = ? "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (base_one, "workspace-1", "repo-1"),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspace_members "
+        "(workspace_id, repository_identity, relative_path, branch, required_base_sha, "
+        "observed_head, member_state, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "workspace-1",
+            "repo-2",
+            "initiative-1/S1/repo-2",
+            "initiative-1/S1",
+            base_two,
+            None,
+            "planned",
+            1_002,
+        ),
+    )
+    conn.execute(
+        "UPDATE segment_workspaces SET lifecycle_state = 'active' WHERE workspace_id = ?",
+        ("workspace-1",),
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1",
+                str(repository_one),
+                str(repository_one / ".segment-worktrees"),
+            ),
+            workspace_mod._RepositoryRegistration(
+                "repo-2",
+                str(repository_two),
+                str(repository_two / ".segment-worktrees"),
+            ),
+        )
+    )
+    plan = workspace_mod._SegmentWorkspaceController(conn, registry).load(
+        workspace_id="workspace-1",
+        expected_initiative_id="initiative-1",
+        expected_segment_id="S1",
+        expected_controller_binding="controller-1",
+    )
+    return conn, (base_one, base_two), plan
+
+
+def test_multi_repository_partial_merge_stays_active_with_truthful_member_journals(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, bases, plan = _two_repository_workspace_plan(provider_modules, tmp_path)
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    first, second = plan.members
+    executor.materialize(first)
+    executor.materialize(second)
+    first_head = _commit_workspace_feature(first)
+    second_head = _commit_workspace_feature(second)
+    _mark_workspace_member_materialized(conn, first, first_head)
+    _mark_workspace_member_materialized(conn, second, second_head)
+    _complete_journaled_member_merge(
+        operations,
+        journal_mod,
+        first,
+        bases[0],
+        first_head,
+        operation_id="merge-partial-1",
+        at=4_200,
+    )
+
+    second_intent = _workspace_merge_intent(
+        journal_mod,
+        second,
+        bases[1],
+        second_head,
+        operation_id="merge-partial-2",
+        idempotency_id="merge-partial-2-idempotency",
+        created_at=4_203,
+    )
+    operations.prepare_merge(second_intent, second, bases[1], second_head)
+    monkeypatch.setattr(
+        executor,
+        "merge_to_origin_main",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            workspace_mod._WorkspaceRejected("injected second repository failure")
+        ),
+    )
+    second_failed = operations.run_merge(
+        second_intent,
+        second,
+        bases[1],
+        second_head,
+        outcome_at=4_204,
+    )
+    assert second_failed.state == "failed"
+    assert second_failed.recovery_disposition == "resume"
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="all members"):
+        operations.retire_workspace(plan, retired_at=4_205)
+
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT repository_identity, observed_head, member_state "
+            "FROM segment_workspace_members WHERE workspace_id = ? "
+            "ORDER BY repository_identity",
+            (plan.workspace_id,),
+        )
+    ] == [
+        ("repo-1", first_head, "merged"),
+        ("repo-2", second_head, "materialized"),
+    ]
+    assert conn.execute(
+        "SELECT lifecycle_state, active FROM segment_workspaces WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[:] == ("active", 1)
+    assert journal.head("merge-partial-1", "repo-1").state == "verified"
+    assert journal.head("merge-partial-2", "repo-2").state == "failed"
+    assert Path(first.target_path).exists()
+    assert Path(second.target_path).exists()
+    conn.close()
+
+
 def test_h16_rejection_envelope_preserves_every_failure_and_remediation(
     provider_modules,
 ):

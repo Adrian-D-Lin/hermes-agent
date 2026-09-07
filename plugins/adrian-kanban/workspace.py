@@ -756,7 +756,137 @@ class _JournaledWorkspaceOperations:
                 created_at=at,
             )
         return self._owned_transaction(_append)
+    def retire_workspace(self, plan, *, retired_at):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        if type(plan) is not _WorkspacePlan:
+            raise _WorkspaceRejected("plan must be _WorkspacePlan")
+        if type(retired_at) is not int or retired_at <= 0:
+            raise _WorkspaceRejected("retired_at must be positive exact int")
 
+        ws = self._conn.execute(
+            "SELECT controller_binding_ref, lifecycle_state, active, updated_at "
+            "FROM segment_workspaces WHERE workspace_id = ?",
+            (plan.workspace_id,),
+        ).fetchone()
+        if ws is None or ws[0] != plan.controller_binding_ref:
+            raise _WorkspaceRejected("workspace binding mismatch")
+        ws = tuple(ws)
+
+        members = [
+            tuple(row)
+            for row in self._conn.execute(
+                "SELECT repository_identity, observed_head, member_state, observed_at "
+                "FROM segment_workspace_members WHERE workspace_id = ? "
+                "ORDER BY repository_identity",
+                (plan.workspace_id,),
+            )
+        ]
+        member_identities = tuple(m[0] for m in members)
+        if member_identities != tuple(m.repository_identity for m in plan.members):
+            raise _WorkspaceRejected("member identities mismatch")
+
+        # Map plan members by identity for verification
+        plan_member_map = {m.repository_identity: m for m in plan.members}
+
+        # Idempotent path
+        if ws[1] == "retired" and ws[2] == 0:
+            if ws[3] != retired_at:
+                raise _WorkspaceRejected("retire mismatch")
+            for m in members:
+                if m[2] != "retired" or m[3] != retired_at:
+                    raise _WorkspaceRejected("retire mismatch")
+
+            for m in members:
+                _validate_sha(m[1], "observed_head")
+                plan_member = plan_member_map[m[0]]
+                v = self._executor.verify_merge(
+                    plan_member,
+                    expected_main_sha=plan_member.required_base_sha,
+                    expected_source_head=m[1],
+                )
+                if not v.ready:
+                    raise _WorkspaceRejected("merge verification failed")
+                status = self._executor._git(
+                    plan_member.target_path, "status", "--porcelain"
+                )
+                if status != "":
+                    raise _WorkspaceRejected("worktree must be clean")
+            return member_identities
+
+        # Normal path
+        if ws[1] != "active" or ws[2] != 1:
+            raise _WorkspaceRejected("workspace not active")
+
+        for m in members:
+            if m[2] != "merged" or m[1] is None:
+                raise _WorkspaceRejected("all members must be merged")
+
+        for m in members:
+            _validate_sha(m[1], "observed_head")
+            plan_member = plan_member_map[m[0]]
+            v = self._executor.verify_merge(
+                plan_member,
+                expected_main_sha=plan_member.required_base_sha,
+                expected_source_head=m[1],
+            )
+            if not v.ready:
+                raise _WorkspaceRejected("merge verification failed")
+            status = self._executor._git(
+                plan_member.target_path, "status", "--porcelain"
+            )
+            if status != "":
+                raise _WorkspaceRejected("worktree must be clean")
+
+        # Capture preflight snapshots for re-verification in transaction
+        preflight_ws = ws
+        preflight_members = list(members)
+
+        def _retire():
+            # Re-read workspace
+            ws_new = self._conn.execute(
+                "SELECT controller_binding_ref, lifecycle_state, active, updated_at "
+                "FROM segment_workspaces WHERE workspace_id = ?",
+                (plan.workspace_id,),
+            ).fetchone()
+            if ws_new is None or tuple(ws_new) != preflight_ws:
+                raise _WorkspaceRejected("workspace state changed")
+
+            # Re-read members
+            members_new = [
+                tuple(row)
+                for row in self._conn.execute(
+                    "SELECT repository_identity, observed_head, member_state, observed_at "
+                    "FROM segment_workspace_members WHERE workspace_id = ? "
+                    "ORDER BY repository_identity",
+                    (plan.workspace_id,),
+                )
+            ]
+            if members_new != preflight_members:
+                raise _WorkspaceRejected("member state changed")
+
+            # Update members
+            for m in members_new:
+                cur = self._conn.execute(
+                    "UPDATE segment_workspace_members SET member_state = 'retired', observed_at = ? "
+                    "WHERE workspace_id = ? AND repository_identity = ? AND member_state = 'merged' AND observed_head = ?",
+                    (retired_at, plan.workspace_id, m[0], m[1]),
+                )
+                if cur.rowcount != 1:
+                    raise _WorkspaceRejected("member update failed")
+
+            # Update workspace
+            cur = self._conn.execute(
+                "UPDATE segment_workspaces SET lifecycle_state = 'retired', active = 0, updated_at = ? "
+                "WHERE workspace_id = ? AND controller_binding_ref = ? AND lifecycle_state = 'active' AND active = 1",
+                (retired_at, plan.workspace_id, plan.controller_binding_ref),
+            )
+            if cur.rowcount != 1:
+                raise _WorkspaceRejected("workspace update failed")
+
+            return member_identities
+
+        return self._owned_transaction(_retire)
     def _append_failed(self, intent, member, v, at, resumable):
         git_ev = f"head={v.observed_head}" if v.observed_head else None
         fs_ev = f"exists={'true' if os.path.exists(member.target_path) else 'false'};target={member.target_path}"
