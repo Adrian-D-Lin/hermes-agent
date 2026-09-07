@@ -124,9 +124,7 @@ class _CreateTaskArgs:
         if not _is_optional_nonblank_str(self.model):
             raise _PrivateAdapterRejected("model must be None or a nonblank string")
         if not _is_optional_nonblank_str(self.provider):
-            raise _PrivateAdapterRejected(
-                "provider must be None or a nonblank string"
-            )
+            raise _PrivateAdapterRejected("provider must be None or a nonblank string")
         if self.provider is not None and self.model is None:
             raise _PrivateAdapterRejected("provider requires a model")
         if not _is_optional_nonblank_str(self.board):
@@ -295,57 +293,47 @@ class _LaunchTaskArgs:
         if not _is_nonblank_str(self.task_id):
             raise _PrivateAdapterRejected("task_id must be a nonblank string")
         if not _is_nonblank_str(self.expected_assignee):
-            raise _PrivateAdapterRejected(
-                "expected_assignee must be a nonblank string"
-            )
+            raise _PrivateAdapterRejected("expected_assignee must be a nonblank string")
         if self.board is not None and not (
             _is_exact_str(self.board) and self.board.strip() != ""
         ):
-            raise _PrivateAdapterRejected(
-                "board must be None or a nonblank string"
-            )
+            raise _PrivateAdapterRejected("board must be None or a nonblank string")
         if not _is_optional_positive_int(self.ttl_seconds):
             raise _PrivateAdapterRejected(
                 "ttl_seconds must be None or a positive integer"
             )
         if not _is_positive_int(self.failure_limit):
-            raise _PrivateAdapterRejected(
-                "failure_limit must be a positive integer"
-            )
+            raise _PrivateAdapterRejected("failure_limit must be a positive integer")
 
 
-_OPERATION_ARGUMENT_TYPES = MappingProxyType(
-    {
-        "kanban_create": _CreateTaskArgs,
-        "kanban_complete": _CompleteTaskArgs,
-        "kanban_block": _BlockTaskArgs,
-        "kanban_unblock": _UnblockTaskArgs,
-        "kanban_comment": _CommentArgs,
-        "kanban_heartbeat": _HeartbeatArgs,
-        "kanban_request_changes": _RequestChangesArgs,
-        "kanban_request_review": _RequestReviewArgs,
-        "kanban_link": _LinkArgs,
-        "kanban_launch": _LaunchTaskArgs,
-    }
-)
+_OPERATION_ARGUMENT_TYPES = MappingProxyType({
+    "kanban_create": _CreateTaskArgs,
+    "kanban_complete": _CompleteTaskArgs,
+    "kanban_block": _BlockTaskArgs,
+    "kanban_unblock": _UnblockTaskArgs,
+    "kanban_comment": _CommentArgs,
+    "kanban_heartbeat": _HeartbeatArgs,
+    "kanban_request_changes": _RequestChangesArgs,
+    "kanban_request_review": _RequestReviewArgs,
+    "kanban_link": _LinkArgs,
+    "kanban_launch": _LaunchTaskArgs,
+})
 
 
 # Only operations whose native mutators already use nested savepoint
 # semantics may be admitted inside the boundary's outer transaction. Any
 # other operation is rejected explicitly rather than falsely claimed safe.
-_ACTIVE_TRANSACTION_OPERATIONS = frozenset(
-    {
-        "kanban_create",
-        "kanban_complete",
-        "kanban_block",
-        "kanban_unblock",
-        "kanban_comment",
-        "kanban_heartbeat",
-        "kanban_request_changes",
-        "kanban_request_review",
-        "kanban_link",
-    }
-)
+_ACTIVE_TRANSACTION_OPERATIONS = frozenset({
+    "kanban_create",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_unblock",
+    "kanban_comment",
+    "kanban_heartbeat",
+    "kanban_request_changes",
+    "kanban_request_review",
+    "kanban_link",
+})
 
 
 class _PrivateNativeAdapter:
@@ -369,6 +357,7 @@ class _PrivateNativeAdapter:
         self._spawn_fn = spawn_fn
         self._active_capability: Optional[Any] = None
         self._active_binding: Optional[CapabilityBinding] = None
+        self._deferred_cleanup_task_ids: list[str] = []
 
     def _validate_binding_and_arguments(
         self, capability: Any, binding: CapabilityBinding, arguments: Any
@@ -431,7 +420,7 @@ class _PrivateNativeAdapter:
                     _task_id=arguments.task_id,
                 )
         elif operation == "kanban_complete":
-            return _kb.complete_task(
+            completed = _kb.complete_task(
                 self._conn,
                 arguments.task_id,
                 result=arguments.result,
@@ -441,7 +430,11 @@ class _PrivateNativeAdapter:
                 expected_run_id=arguments.expected_run_id,
                 fire_lifecycle_hook=False,
                 _allow_nested=allow_nested,
+                _defer_cleanup=allow_nested,
             )
+            if allow_nested and completed is True:
+                self._deferred_cleanup_task_ids.append(arguments.task_id)
+            return completed
         elif operation == "kanban_block":
             return _kb.block_task(
                 self._conn,
@@ -511,9 +504,7 @@ class _PrivateNativeAdapter:
     def execute(
         self, capability: Any, binding: CapabilityBinding, arguments: Any
     ) -> Any:
-        operation = self._validate_binding_and_arguments(
-            capability, binding, arguments
-        )
+        operation = self._validate_binding_and_arguments(capability, binding, arguments)
 
         if operation == "kanban_launch":
             with _capability_scope(
@@ -550,17 +541,13 @@ class _PrivateNativeAdapter:
         if binding is not self._active_binding:
             raise _PrivateAdapterRejected("active boundary transaction required")
 
-        operation = self._validate_binding_and_arguments(
-            capability, binding, arguments
-        )
+        operation = self._validate_binding_and_arguments(capability, binding, arguments)
         if operation not in _ACTIVE_TRANSACTION_OPERATIONS:
             raise _PrivateAdapterRejected(
                 "operation is not admitted inside the active boundary transaction"
             )
 
-        return self._dispatch_native(
-            operation, binding, arguments, allow_nested=True
-        )
+        return self._dispatch_native(operation, binding, arguments, allow_nested=True)
 
     def _complete_in_active_transaction(
         self,
@@ -734,21 +721,24 @@ class _PrivateNativeAdapter:
         return self._execute_in_active_transaction(capability, binding, args)
 
     @contextlib.contextmanager
-    def mutation_transaction(
-        self, capability: Any, binding: CapabilityBinding
-    ):
+    def mutation_transaction(self, capability: Any, binding: CapabilityBinding):
         if type(binding) is not CapabilityBinding:
             raise _PrivateAdapterRejected("binding must be a CapabilityBinding")
         if self._active_capability is not None or self._active_binding is not None:
             raise _PrivateAdapterRejected("active boundary transaction required")
+        self._deferred_cleanup_task_ids = []
         self._active_capability = capability
         self._active_binding = binding
         try:
-            with _capability_scope(
-                self._provider, self._conn, capability, binding
-            ):
+            with _capability_scope(self._provider, self._conn, capability, binding):
                 with _kb.write_txn(self._conn):
                     yield self._conn
+                for task_id in self._deferred_cleanup_task_ids:
+                    try:
+                        _kb._cleanup_workspace(self._conn, task_id)
+                    except Exception:
+                        pass
         finally:
             self._active_capability = None
             self._active_binding = None
+            self._deferred_cleanup_task_ids = []

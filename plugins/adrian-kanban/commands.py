@@ -5,7 +5,7 @@ import json
 import sqlite3
 import time
 import uuid
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 from .capability import CapabilityBinding
@@ -19,41 +19,42 @@ from .provider import (
     PLUGIN_VERSION,
     PROTOCOL_VERSION,
 )
+from .handoffs import (
+    HandoffFinding,
+    HandoffValidationRejected,
+    canonical_handoff_requirements,
+    normalize_handoff_requirements,
+    validate_candidate_metadata,
+)
 
 # Public operation taxonomy. These sets are frozen by the ratified Canon
 # operation map and are consumed verbatim by every later S3 slice.
-READ_ONLY_OPERATIONS = frozenset(
-    {
-        "kanban_show",
-        "kanban_list",
-        "kanban_attachments",
-    }
-)
+READ_ONLY_OPERATIONS = frozenset({
+    "kanban_show",
+    "kanban_list",
+    "kanban_attachments",
+})
 
-ORDINARY_TASK_OPERATIONS = frozenset(
-    {
-        "kanban_create",
-        "kanban_complete",
-        "kanban_block",
-        "kanban_unblock",
-        "kanban_comment",
-        "kanban_link",
-        "kanban_heartbeat",
-        "kanban_attach",
-        "kanban_attach_url",
-        "kanban_request_changes",
-        "kanban_request_review",
-    }
-)
+ORDINARY_TASK_OPERATIONS = frozenset({
+    "kanban_create",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_unblock",
+    "kanban_comment",
+    "kanban_link",
+    "kanban_heartbeat",
+    "kanban_attach",
+    "kanban_attach_url",
+    "kanban_request_changes",
+    "kanban_request_review",
+})
 
-INITIATIVE_OPERATIONS = frozenset(
-    {
-        "kanban_create_initiative",
-        "kanban_update_initiative",
-        "kanban_transition_initiative",
-        "kanban_close_initiative",
-    }
-)
+INITIATIVE_OPERATIONS = frozenset({
+    "kanban_create_initiative",
+    "kanban_update_initiative",
+    "kanban_transition_initiative",
+    "kanban_close_initiative",
+})
 
 RECOGNIZED_OPERATIONS = (
     READ_ONLY_OPERATIONS | ORDINARY_TASK_OPERATIONS | INITIATIVE_OPERATIONS
@@ -62,9 +63,7 @@ RECOGNIZED_OPERATIONS = (
 TOOL_SCHEMAS: dict[str, Any] = {
     "kanban_show": {
         "name": "kanban_show",
-        "description": (
-            "Read a single kanban task by its immutable identifier."
-        ),
+        "description": ("Read a single kanban task by its immutable identifier."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -83,17 +82,13 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_list": {
         "name": "kanban_list",
-        "description": (
-            "List kanban tasks within a scope without mutating state."
-        ),
+        "description": ("List kanban tasks within a scope without mutating state."),
         "parameters": {
             "type": "object",
             "properties": {
                 "initiative_id": {
                     "type": "string",
-                    "description": (
-                        "Optional initiative scope to list tasks within."
-                    ),
+                    "description": ("Optional initiative scope to list tasks within."),
                 },
                 "assignee": {
                     "type": "string",
@@ -109,9 +104,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "include_archived": {
                     "type": "boolean",
-                    "description": (
-                        "Optional flag to include archived tasks."
-                    ),
+                    "description": ("Optional flag to include archived tasks."),
                 },
                 "limit": {
                     "type": "integer",
@@ -128,9 +121,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_attachments": {
         "name": "kanban_attachments",
-        "description": (
-            "Read the attachments associated with a kanban task."
-        ),
+        "description": ("Read the attachments associated with a kanban task."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -149,9 +140,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_create": {
         "name": "kanban_create",
-        "description": (
-            "Create a new ordinary kanban task at both identity levels."
-        ),
+        "description": ("Create a new ordinary kanban task at both identity levels."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -209,6 +198,12 @@ TOOL_SCHEMAS: dict[str, Any] = {
                     "type": "integer",
                     "description": "Optional maximum goal turns.",
                 },
+                "handoff_requirements_v1": {
+                    "type": "object",
+                    "description": (
+                        "Optional immutable lifecycle handoff declaration."
+                    ),
+                },
                 "model": {
                     "type": "string",
                     "description": "Optional model reference.",
@@ -219,9 +214,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -244,9 +237,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_complete": {
         "name": "kanban_complete",
-        "description": (
-            "Mark an ordinary kanban task as complete."
-        ),
+        "description": ("Mark an ordinary kanban task as complete."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -278,9 +269,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -297,9 +286,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_block": {
         "name": "kanban_block",
-        "description": (
-            "Block an ordinary kanban task, halting its forward progress."
-        ),
+        "description": ("Block an ordinary kanban task, halting its forward progress."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -323,9 +310,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -354,9 +339,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -373,9 +356,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_comment": {
         "name": "kanban_comment",
-        "description": (
-            "Attach a comment to an ordinary kanban task."
-        ),
+        "description": ("Attach a comment to an ordinary kanban task."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -389,9 +370,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -408,9 +387,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_link": {
         "name": "kanban_link",
-        "description": (
-            "Link an ordinary kanban task to external references."
-        ),
+        "description": ("Link an ordinary kanban task to external references."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -424,9 +401,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -459,9 +434,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -478,9 +451,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_attach": {
         "name": "kanban_attach",
-        "description": (
-            "Attach a local artifact to an ordinary kanban task."
-        ),
+        "description": ("Attach a local artifact to an ordinary kanban task."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -502,9 +473,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -521,9 +490,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_attach_url": {
         "name": "kanban_attach_url",
-        "description": (
-            "Attach a remote URL to an ordinary kanban task."
-        ),
+        "description": ("Attach a remote URL to an ordinary kanban task."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -545,9 +512,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -564,9 +529,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_request_changes": {
         "name": "kanban_request_changes",
-        "description": (
-            "Request changes to an ordinary kanban task."
-        ),
+        "description": ("Request changes to an ordinary kanban task."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -580,9 +543,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -599,9 +560,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_request_review": {
         "name": "kanban_request_review",
-        "description": (
-            "Request a review of an ordinary kanban task."
-        ),
+        "description": ("Request a review of an ordinary kanban task."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -623,9 +582,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -642,9 +599,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_create_initiative": {
         "name": "kanban_create_initiative",
-        "description": (
-            "Create a new kanban initiative."
-        ),
+        "description": ("Create a new kanban initiative."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -666,9 +621,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -691,9 +644,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_update_initiative": {
         "name": "kanban_update_initiative",
-        "description": (
-            "Update an existing kanban initiative."
-        ),
+        "description": ("Update an existing kanban initiative."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -715,9 +666,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -740,9 +689,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_transition_initiative": {
         "name": "kanban_transition_initiative",
-        "description": (
-            "Transition an existing kanban initiative to a new phase."
-        ),
+        "description": ("Transition an existing kanban initiative to a new phase."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -758,9 +705,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "reconciliation_ref": {
                     "type": "string",
-                    "description": (
-                        "Reconciliation reference backing the transition."
-                    ),
+                    "description": ("Reconciliation reference backing the transition."),
                 },
                 "approval_id": {
                     "type": "string",
@@ -768,9 +713,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -793,9 +736,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_close_initiative": {
         "name": "kanban_close_initiative",
-        "description": (
-            "Close an existing kanban initiative."
-        ),
+        "description": ("Close an existing kanban initiative."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -805,9 +746,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "closure_result_ref": {
                     "type": "string",
-                    "description": (
-                        "Reference describing the closure outcome."
-                    ),
+                    "description": ("Reference describing the closure outcome."),
                 },
                 "approval_id": {
                     "type": "string",
@@ -815,9 +754,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": (
-                        "Caller-supplied key guaranteeing safe replay."
-                    ),
+                    "description": ("Caller-supplied key guaranteeing safe replay."),
                 },
                 "attempt_id": {
                     "type": "string",
@@ -891,11 +828,11 @@ class _ModelToolRequestNormalizer:
                         dict(args),
                         dict(runtime_fields),
                     )
-                    if type(resolved) is not tuple or len(resolved) != 2:
+                    if type(resolved) is not tuple or len(resolved) != 3:
                         raise ValueError(
-                            "board_resolver must return a two-item tuple"
+                            "board_resolver must return a three-item tuple"
                         )
-                    board, _workspace_id = resolved
+                    board, _workspace_id, _actor_profile = resolved
                     if not isinstance(board, str) or not board.strip():
                         raise ValueError("resolved board must be nonblank")
                     if "board" in payload and payload["board"] != board:
@@ -918,15 +855,17 @@ class _ModelToolRequestNormalizer:
                 dict(args),
                 dict(runtime_fields),
             )
-            if type(resolved) is not tuple or len(resolved) != 2:
-                raise ValueError("board_resolver must return a two-item tuple")
-            board, workspace_id = resolved
+            if type(resolved) is not tuple or len(resolved) != 3:
+                raise ValueError("board_resolver must return a three-item tuple")
+            board, workspace_id, actor_profile = resolved
             if not isinstance(board, str) or not board.strip():
                 raise ValueError("resolved board must be nonblank str")
             if workspace_id is not None and (
                 not isinstance(workspace_id, str) or not workspace_id.strip()
             ):
                 raise ValueError("workspace_id must be None or nonblank str")
+            if not (type(actor_profile) is str and actor_profile.strip()):
+                raise ValueError("actor_profile must be a nonblank str")
             if "board" in payload and payload["board"] != board:
                 raise ValueError("public board mismatch")
             payload["board"] = board
@@ -943,6 +882,7 @@ class _ModelToolRequestNormalizer:
                 session_id=session_id.strip(),
                 workspace_id=workspace_id,
                 execution_context="model-tool",
+                actor_profile=actor_profile.strip(),
                 payload=payload,
             )
         except Exception:
@@ -969,6 +909,7 @@ def _handle_create(context: Any) -> dict[str, Any]:
         "project",
         "goal_mode",
         "goal_max_turns",
+        "handoff_requirements_v1",
         "model",
         "provider",
         "board",
@@ -982,6 +923,7 @@ def _handle_create(context: Any) -> dict[str, Any]:
     title = payload.get("title")
     assignee = payload.get("assignee")
     board = payload.get("board")
+    raw_handoff_requirements = payload.get("handoff_requirements_v1")
 
     for field_name, value in (
         ("task_id", task_id),
@@ -998,6 +940,17 @@ def _handle_create(context: Any) -> dict[str, Any]:
     title = title.strip()
     assignee = assignee.strip()
     board = board.strip()
+
+    handoff_requirements = None
+    if raw_handoff_requirements is not None:
+        if payload.get("goal_mode") is not True:
+            raise ValueError("handoff-governed tasks require goal_mode to be true")
+        handoff_requirements = normalize_handoff_requirements(
+            raw_handoff_requirements,
+            context.known_profiles,
+        )
+        if assignee not in context.known_profiles:
+            raise ValueError("assignee must be a known execution profile")
 
     if "parents" not in payload:
         parents: tuple[str, ...] = ()
@@ -1053,11 +1006,7 @@ def _handle_create(context: Any) -> dict[str, Any]:
         "WHERE initiative_id = ? AND task_id IS NULL",
         (initiative_id,),
     ).fetchone()
-    if (
-        row is None
-        or row["card_type"] != "initiative"
-        or row["board_slug"] != board
-    ):
+    if row is None or row["card_type"] != "initiative" or row["board_slug"] != board:
         raise ValueError("initiative card not found")
 
     kwargs: dict[str, Any] = {
@@ -1088,7 +1037,7 @@ def _handle_create(context: Any) -> dict[str, Any]:
         **kwargs,
     )
 
-    context.connection.execute(
+    inserted = context.connection.execute(
         "INSERT INTO adrian_kanban_cards "
         "(card_type, initiative_id, task_id, title, created_at, "
         "board_slug, record_version) "
@@ -1096,7 +1045,29 @@ def _handle_create(context: Any) -> dict[str, Any]:
         (initiative_id, task_id, title, int(time.time()), board),
     )
 
-    return {"initiative_id": initiative_id, "task_id": task_id}
+    if handoff_requirements is not None:
+        task_card_id = int(inserted.lastrowid or 0)
+        if task_card_id <= 0:
+            raise ValueError("unified task card identity was not created")
+        context.connection.execute(
+            "INSERT INTO task_handoff_requirements "
+            "(task_card_id, task_id, version, execution_profile, reviewer, "
+            "canonical_payload, created_at) VALUES (?, ?, 1, ?, ?, ?, ?)",
+            (
+                task_card_id,
+                task_id,
+                assignee,
+                handoff_requirements["reviewer"],
+                canonical_handoff_requirements(handoff_requirements),
+                int(time.time()),
+            ),
+        )
+
+    return {
+        "initiative_id": initiative_id,
+        "task_id": task_id,
+        "handoff_governed": handoff_requirements is not None,
+    }
 
 
 def _handle_link(context: Any) -> dict[str, Any]:
@@ -1176,7 +1147,7 @@ def _load_versioned_task(
     board = board.strip()
 
     card_rows = context.connection.execute(
-        "SELECT card_type, initiative_id, task_id, board_slug, record_version "
+        "SELECT id, card_type, initiative_id, task_id, board_slug, record_version "
         "FROM adrian_kanban_cards WHERE task_id = ?",
         (task_id,),
     ).fetchall()
@@ -1196,25 +1167,98 @@ def _load_versioned_task(
         (card["initiative_id"],),
     ).fetchall()
     if len(initiative_rows) != 1:
-        raise ValueError(
-            "task must belong to exactly one canonical initiative card"
-        )
+        raise ValueError("task must belong to exactly one canonical initiative card")
     initiative = initiative_rows[0]
-    if (
-        initiative["card_type"] != "initiative"
-        or initiative["board_slug"] != board
-    ):
+    if initiative["card_type"] != "initiative" or initiative["board_slug"] != board:
         raise ValueError("task initiative does not match the resolved board")
     if card["record_version"] != context.binding.expected_version:
         raise ValueError("task version changed before mutation")
 
     native_rows = context.connection.execute(
-        "SELECT id, current_run_id, claim_lock FROM tasks WHERE id = ?",
+        "SELECT id, status, assignee, current_run_id, claim_lock "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchall()
     if len(native_rows) != 1 or native_rows[0]["id"] != task_id:
         raise ValueError("canonical native task not found")
     return card, native_rows[0]
+
+
+def _load_validated_handoff_requirement(
+    context: Any,
+    task_card_id: int,
+    task_id: str,
+) -> SimpleNamespace | None:
+    if not (type(task_card_id) is int and task_card_id > 0):
+        raise ValueError("task_card_id must be a positive integer")
+    if not (type(task_id) is str and task_id.strip()):
+        raise ValueError("task_id must be a nonblank string")
+
+    handoff_rows = context.connection.execute(
+        "SELECT task_card_id, task_id, version, execution_profile, reviewer, "
+        "canonical_payload FROM task_handoff_requirements "
+        "WHERE task_card_id = ? AND task_id = ?",
+        (task_card_id, task_id),
+    ).fetchall()
+    if len(handoff_rows) > 1:
+        raise ValueError("corrupt handoff requirements: multiple rows found")
+    if not handoff_rows:
+        return None
+
+    handoff = handoff_rows[0]
+    if not (type(handoff["version"]) is int and handoff["version"] == 1):
+        raise ValueError("handoff version must be 1")
+
+    execution_profile = handoff["execution_profile"]
+    if not (
+        type(execution_profile) is str
+        and execution_profile
+        and execution_profile == execution_profile.strip()
+    ):
+        raise ValueError("handoff execution_profile must be a nonblank string")
+    if execution_profile not in context.known_profiles:
+        raise ValueError("handoff execution_profile is not a known profile")
+
+    fixed_reviewer = handoff["reviewer"]
+    if not (
+        type(fixed_reviewer) is str
+        and fixed_reviewer
+        and fixed_reviewer == fixed_reviewer.strip()
+    ):
+        raise ValueError("handoff reviewer must be a nonblank string")
+    if fixed_reviewer not in context.known_profiles:
+        raise ValueError("handoff reviewer is not a known profile")
+
+    stored_payload = handoff["canonical_payload"]
+    if not (
+        type(stored_payload) is str
+        and stored_payload
+        and stored_payload == stored_payload.strip()
+    ):
+        raise ValueError("handoff canonical_payload must be a nonblank string")
+    try:
+        parsed_payload = json.loads(stored_payload)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("handoff canonical_payload is not valid JSON") from exc
+    if type(parsed_payload) is not dict:
+        raise ValueError("handoff canonical_payload must be a dict")
+    try:
+        normalized = normalize_handoff_requirements(
+            parsed_payload,
+            context.known_profiles,
+        )
+    except HandoffValidationRejected as exc:
+        raise ValueError("handoff canonical_payload failed normalization") from exc
+    if canonical_handoff_requirements(normalized) != stored_payload:
+        raise ValueError("handoff canonical_payload does not match normalized form")
+    if fixed_reviewer != normalized["reviewer"]:
+        raise ValueError("handoff reviewer does not match normalized reviewer")
+
+    return SimpleNamespace(
+        execution_profile=execution_profile,
+        reviewer=fixed_reviewer,
+        normalized=normalized,
+    )
 
 
 def _advance_task_version(context: Any, task_id: str, board: str) -> None:
@@ -1335,6 +1379,594 @@ def _handle_comment(context: Any) -> dict[str, Any]:
     return {"task_id": task_id, "comment_id": comment_id}
 
 
+def _handle_complete(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    allowed_fields = {
+        "task_id",
+        "summary",
+        "metadata",
+        "result",
+        "created_cards",
+        "artifacts",
+        "board",
+    }
+    unknown = set(payload.keys()) - allowed_fields
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    task_id = payload.get("task_id")
+    summary = payload.get("summary")
+    metadata = payload.get("metadata")
+    result = payload.get("result")
+    created_cards = payload.get("created_cards")
+    artifacts = payload.get("artifacts")
+    board = payload.get("board")
+
+    if not (type(task_id) is str and task_id.strip()):
+        raise ValueError("task_id must be a nonblank string")
+    if not (type(board) is str and board.strip()):
+        raise ValueError("board must be a nonblank string")
+    if summary is not None and type(summary) is not str:
+        raise ValueError("summary must be absent or a string")
+    if result is not None and type(result) is not str:
+        raise ValueError("result must be absent or a string")
+    if metadata is not None and type(metadata) is not dict:
+        raise ValueError("metadata must be absent or a dict")
+    if created_cards is not None:
+        if type(created_cards) is not list:
+            raise ValueError("created_cards must be absent or a list")
+        seen = set()
+        for item in created_cards:
+            if not (type(item) is str and item.strip()):
+                raise ValueError("created_cards items must be nonblank strings")
+            trimmed = item.strip()
+            if trimmed in seen:
+                raise ValueError("created_cards must contain unique items")
+            seen.add(trimmed)
+    if artifacts is not None:
+        if type(artifacts) is not list:
+            raise ValueError("artifacts must be absent or a list")
+        seen = set()
+        for item in artifacts:
+            if not (type(item) is str and item.strip()):
+                raise ValueError("artifacts items must be nonblank strings")
+            trimmed = item.strip()
+            if trimmed in seen:
+                raise ValueError("artifacts must contain unique items")
+            seen.add(trimmed)
+
+    task_id = task_id.strip()
+    board = board.strip()
+    if created_cards is not None:
+        created_cards = tuple(item.strip() for item in created_cards)
+    if artifacts is not None:
+        artifacts = [item.strip() for item in artifacts]
+
+    if metadata is not None:
+        metadata = dict(metadata)
+    elif artifacts is not None:
+        metadata = {}
+    if artifacts is not None:
+        if "artifacts" in metadata:
+            if metadata["artifacts"] != artifacts:
+                raise ValueError("artifacts conflict with metadata")
+        else:
+            metadata["artifacts"] = artifacts
+
+    card, native = _load_versioned_task(context, task_id, board)
+    card_id = card["id"]
+    if not (type(card_id) is int and card_id > 0):
+        raise ValueError("card id must be a positive integer")
+    handoff = _load_validated_handoff_requirement(context, card_id, task_id)
+
+    if handoff is None:
+        expected_run_id = native["current_run_id"]
+        if expected_run_id is not None and not (
+            type(expected_run_id) is int and expected_run_id > 0
+        ):
+            raise ValueError("native current_run_id must be a positive integer")
+        changed = context.mutation_executor._complete_in_active_transaction(
+            context.capability,
+            context.binding,
+            task_id=task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+            created_cards=created_cards,
+            expected_run_id=expected_run_id,
+        )
+        if changed is not True:
+            raise ValueError("native task was not completable")
+        _advance_task_version(context, task_id, board)
+        return {"task_id": task_id, "accepted_candidate_id": None}
+
+    execution_profile = handoff.execution_profile
+    fixed_reviewer = handoff.reviewer
+    if native["status"] != "running":
+        raise ValueError("task must be in running state for governed completion")
+    current_run_id = native["current_run_id"]
+    if not (type(current_run_id) is int and current_run_id > 0):
+        raise ValueError("task must have a positive current_run_id")
+    if not (type(native["claim_lock"]) is str and native["claim_lock"].strip()):
+        raise ValueError("task must have a nonblank claim_lock")
+    if native["assignee"] != fixed_reviewer:
+        raise ValueError("task assignee does not match fixed reviewer")
+    if context.binding.actor_profile != fixed_reviewer:
+        raise ValueError("actor_profile does not match fixed reviewer")
+
+    run_row = context.connection.execute(
+        "SELECT status, ended_at, profile FROM task_runs WHERE id = ? AND task_id = ?",
+        (current_run_id, task_id),
+    ).fetchone()
+    if run_row is None:
+        raise ValueError("execution run not found")
+    if run_row["status"] != "running":
+        raise ValueError("execution run must be in running state")
+    if run_row["ended_at"] is not None:
+        raise ValueError("execution run must not be ended")
+    if run_row["profile"] != fixed_reviewer:
+        raise ValueError("execution run profile does not match fixed reviewer")
+
+    claimed_event = context.connection.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, current_run_id),
+    ).fetchone()
+    if claimed_event is None:
+        raise ValueError("claimed event not found")
+    try:
+        claimed_payload = json.loads(claimed_event["payload"])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("claimed event payload is not valid JSON") from exc
+    if type(claimed_payload) is not dict:
+        raise ValueError("claimed event payload must be a dict")
+    if claimed_payload.get("source_status") != "review":
+        raise ValueError("active run was not claimed from review")
+
+    candidate_row = context.connection.execute(
+        "SELECT candidate_id, task_card_id, task_id, execution_run_id, "
+        "reviewer, submitted_by FROM task_candidate_handoffs "
+        "WHERE task_card_id = ? AND task_id = ? "
+        "ORDER BY execution_run_id DESC LIMIT 1",
+        (card_id, task_id),
+    ).fetchone()
+    if candidate_row is None:
+        raise ValueError("no structurally admitted candidate found")
+    if candidate_row["task_card_id"] != card_id:
+        raise ValueError("candidate task_card_id mismatch")
+    if candidate_row["task_id"] != task_id:
+        raise ValueError("candidate task_id mismatch")
+    if candidate_row["reviewer"] != fixed_reviewer:
+        raise ValueError("candidate reviewer mismatch")
+    if candidate_row["submitted_by"] != execution_profile:
+        raise ValueError("candidate submitted_by does not match execution profile")
+
+    candidate_run = context.connection.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+        (candidate_row["execution_run_id"], task_id),
+    ).fetchone()
+    if candidate_run is None:
+        raise ValueError("candidate execution run not found")
+    if candidate_run["outcome"] != "review_requested":
+        raise ValueError("candidate execution run outcome must be review_requested")
+    if not (type(candidate_run["ended_at"]) is int and candidate_run["ended_at"] > 0):
+        raise ValueError("candidate execution run must have a positive ended_at")
+
+    verdict_row = context.connection.execute(
+        "SELECT 1 FROM task_reviewer_verdicts WHERE candidate_id = ?",
+        (candidate_row["candidate_id"],),
+    ).fetchone()
+    if verdict_row is not None:
+        raise ValueError("candidate already has a reviewer verdict")
+
+    changed = context.mutation_executor._complete_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+        result=result,
+        summary=summary,
+        metadata=metadata,
+        created_cards=created_cards,
+        expected_run_id=current_run_id,
+    )
+    if changed is not True:
+        raise ValueError("native task was not completable")
+
+    ended_run = context.connection.execute(
+        "SELECT outcome, ended_at, summary FROM task_runs WHERE id = ? AND task_id = ?",
+        (current_run_id, task_id),
+    ).fetchone()
+    if ended_run is None:
+        raise ValueError("execution run not found after mutation")
+    if ended_run["outcome"] != "completed":
+        raise ValueError("execution run outcome must be completed")
+    if not (type(ended_run["ended_at"]) is int and ended_run["ended_at"] > 0):
+        raise ValueError("execution run must have a positive ended_at")
+    if ended_run["summary"] is not None and type(ended_run["summary"]) is not str:
+        raise ValueError("execution run summary must be a string or null")
+
+    context.connection.execute(
+        "INSERT INTO task_reviewer_verdicts "
+        "(verdict_id, task_card_id, task_id, candidate_id, review_run_id, "
+        "reviewer, verdict, summary, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            str(uuid.uuid4()),
+            card_id,
+            task_id,
+            candidate_row["candidate_id"],
+            current_run_id,
+            fixed_reviewer,
+            "accepted",
+            ended_run["summary"],
+            int(time.time()),
+        ),
+    )
+    _advance_task_version(context, task_id, board)
+    return {
+        "task_id": task_id,
+        "accepted_candidate_id": candidate_row["candidate_id"],
+    }
+
+
+def _handle_request_changes(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    unknown = set(payload.keys()) - {"task_id", "reason", "board"}
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+    task_id = payload.get("task_id")
+    reason = payload.get("reason")
+    board = payload.get("board")
+    for field_name, value in (
+        ("task_id", task_id),
+        ("reason", reason),
+        ("board", board),
+    ):
+        if not (type(value) is str and value.strip()):
+            raise ValueError(f"{field_name} must be a nonblank string")
+    task_id = task_id.strip()
+    reason = reason.strip()
+    board = board.strip()
+
+    card, native = _load_versioned_task(context, task_id, board)
+    card_id = card["id"]
+    if not (type(card_id) is int and card_id > 0):
+        raise ValueError("card id must be a positive integer")
+    handoff = _load_validated_handoff_requirement(context, card_id, task_id)
+
+    current_run_id = native["current_run_id"]
+    if not (type(current_run_id) is int and current_run_id > 0):
+        raise ValueError("native current_run_id must be a positive integer")
+
+    if handoff is not None:
+        execution_profile = handoff.execution_profile
+        fixed_reviewer = handoff.reviewer
+        if native["status"] != "running":
+            raise ValueError("task must be in running state for governed changes")
+        if not (type(native["claim_lock"]) is str and native["claim_lock"].strip()):
+            raise ValueError("task must have a nonblank claim_lock")
+        if native["assignee"] != fixed_reviewer:
+            raise ValueError("task assignee does not match fixed reviewer")
+        if context.binding.actor_profile != fixed_reviewer:
+            raise ValueError("actor_profile does not match fixed reviewer")
+
+        run_row = context.connection.execute(
+            "SELECT status, ended_at, profile FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (current_run_id, task_id),
+        ).fetchone()
+        if run_row is None:
+            raise ValueError("execution run not found")
+        if run_row["status"] != "running":
+            raise ValueError("execution run must be in running state")
+        if run_row["ended_at"] is not None:
+            raise ValueError("execution run must not be ended")
+        if run_row["profile"] != fixed_reviewer:
+            raise ValueError("execution run profile does not match fixed reviewer")
+
+        claimed_event = context.connection.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, current_run_id),
+        ).fetchone()
+        if claimed_event is None:
+            raise ValueError("claimed event not found")
+        try:
+            claimed_payload = json.loads(claimed_event["payload"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("claimed event payload is not valid JSON") from exc
+        if type(claimed_payload) is not dict:
+            raise ValueError("claimed event payload must be a dict")
+        if claimed_payload.get("source_status") != "review":
+            raise ValueError("active run was not claimed from review")
+
+        candidate_row = context.connection.execute(
+            "SELECT candidate_id, task_card_id, task_id, execution_run_id, "
+            "reviewer, submitted_by FROM task_candidate_handoffs "
+            "WHERE task_card_id = ? AND task_id = ? "
+            "ORDER BY execution_run_id DESC LIMIT 1",
+            (card_id, task_id),
+        ).fetchone()
+        if candidate_row is None:
+            raise ValueError("no structurally admitted candidate found")
+        if candidate_row["task_card_id"] != card_id:
+            raise ValueError("candidate task_card_id mismatch")
+        if candidate_row["task_id"] != task_id:
+            raise ValueError("candidate task_id mismatch")
+        if candidate_row["reviewer"] != fixed_reviewer:
+            raise ValueError("candidate reviewer mismatch")
+        if candidate_row["submitted_by"] != execution_profile:
+            raise ValueError("candidate submitted_by does not match execution profile")
+
+        candidate_run = context.connection.execute(
+            "SELECT status, outcome, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (candidate_row["execution_run_id"], task_id),
+        ).fetchone()
+        if candidate_run is None:
+            raise ValueError("candidate execution run not found")
+        if candidate_run["outcome"] != "review_requested":
+            raise ValueError("candidate execution run outcome must be review_requested")
+        if not (
+            type(candidate_run["ended_at"]) is int and candidate_run["ended_at"] > 0
+        ):
+            raise ValueError("candidate execution run must have a positive ended_at")
+
+        verdict_row = context.connection.execute(
+            "SELECT 1 FROM task_reviewer_verdicts WHERE candidate_id = ?",
+            (candidate_row["candidate_id"],),
+        ).fetchone()
+        if verdict_row is not None:
+            raise ValueError("candidate already has a reviewer verdict")
+
+    result = context.mutation_executor._request_changes_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+        reason=reason,
+        expected_run_id=current_run_id,
+    )
+    if (
+        type(result) is not tuple
+        or len(result) != 2
+        or result[0] is not True
+        or not (type(result[1]) is str and result[1].strip())
+    ):
+        raise ValueError("native request_changes did not succeed")
+
+    returned_implementer = result[1]
+    if handoff is not None and returned_implementer != handoff.execution_profile:
+        raise ValueError("native implementer does not match execution profile")
+
+    _advance_task_version(context, task_id, board)
+    return {"task_id": task_id, "execution_profile": returned_implementer}
+
+
+def _handle_request_review(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    allowed_fields = {"task_id", "summary", "reviewer", "metadata", "board"}
+    unknown = set(payload.keys()) - allowed_fields
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    task_id = payload.get("task_id")
+    summary = payload.get("summary")
+    reviewer = payload.get("reviewer")
+    metadata = payload.get("metadata")
+    board = payload.get("board")
+
+    for field_name, value in (
+        ("task_id", task_id),
+        ("summary", summary),
+        ("board", board),
+    ):
+        if not (type(value) is str and value.strip()):
+            raise ValueError(f"{field_name} must be a nonblank string")
+    if reviewer is not None and not (type(reviewer) is str and reviewer.strip()):
+        raise ValueError("reviewer must be absent or a nonblank string")
+    if metadata is not None and type(metadata) is not dict:
+        raise ValueError("metadata must be absent or a dict")
+
+    task_id = task_id.strip()
+    summary = summary.strip()
+    board = board.strip()
+    reviewer = reviewer.strip() if reviewer is not None else None
+
+    card, native = _load_versioned_task(context, task_id, board)
+    card_id = card["id"]
+    if not (type(card_id) is int and card_id > 0):
+        raise ValueError("card id must be a positive integer")
+
+    handoff = _load_validated_handoff_requirement(context, card_id, task_id)
+    if handoff is None:
+        expected_run_id = native["current_run_id"]
+        if expected_run_id is not None and not (
+            type(expected_run_id) is int and expected_run_id > 0
+        ):
+            raise ValueError("native current_run_id must be a positive integer")
+
+        result = context.mutation_executor._request_review_in_active_transaction(
+            context.capability,
+            context.binding,
+            task_id=task_id,
+            summary=summary,
+            metadata=metadata,
+            reviewer=reviewer,
+            expected_run_id=expected_run_id,
+            force=False,
+            with_reason=True,
+        )
+        if (
+            type(result) is not tuple
+            or len(result) != 2
+            or result[0] is not True
+            or result[1] is not None
+        ):
+            raise ValueError("native request_review did not succeed")
+
+        _advance_task_version(context, task_id, board)
+        if reviewer is None:
+            new_native = context.connection.execute(
+                "SELECT assignee FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if new_native is None:
+                raise ValueError("task not found after mutation")
+            reviewer = new_native["assignee"]
+        return {"task_id": task_id, "candidate_id": None, "reviewer": reviewer}
+
+    execution_profile = handoff.execution_profile
+    fixed_reviewer = handoff.reviewer
+    normalized = handoff.normalized
+
+    if native["status"] != "running":
+        raise ValueError("task must be in running state for governed review")
+    if not (type(native["current_run_id"]) is int and native["current_run_id"] > 0):
+        raise ValueError("task must have a positive current_run_id")
+    if not (type(native["claim_lock"]) is str and native["claim_lock"].strip()):
+        raise ValueError("task must have a nonblank claim_lock")
+    if native["assignee"] != execution_profile:
+        raise ValueError("task assignee does not match execution profile")
+
+    run_id = native["current_run_id"]
+    run_row = context.connection.execute(
+        "SELECT status, ended_at, profile FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if run_row is None:
+        raise ValueError("execution run not found")
+    if run_row["status"] != "running":
+        raise ValueError("execution run must be in running state")
+    if run_row["ended_at"] is not None:
+        raise ValueError("execution run must not be ended")
+    if run_row["profile"] != execution_profile:
+        raise ValueError("execution run profile does not match execution profile")
+
+    findings = []
+    if context.binding.actor_profile != execution_profile:
+        findings.append(
+            HandoffFinding("actor_profile", "does not match execution profile")
+        )
+    if reviewer is not None and reviewer != fixed_reviewer:
+        findings.append(HandoffFinding("reviewer", "does not match handoff reviewer"))
+    try:
+        validate_candidate_metadata(normalized, metadata)
+    except HandoffValidationRejected as exc:
+        findings.extend(exc.findings)
+
+    if findings:
+        findings_json = json.dumps(
+            [
+                {"field": finding.field, "reason": finding.reason}
+                for finding in findings
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        context.connection.execute(
+            "INSERT INTO task_handoff_rejections "
+            "(rejection_id, task_card_id, task_id, execution_run_id, "
+            "attempt_id, submitted_by, findings_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(uuid.uuid4()),
+                card_id,
+                task_id,
+                run_id,
+                context.attempt_id,
+                context.binding.actor_profile,
+                findings_json,
+                int(time.time()),
+            ),
+        )
+        failed_checks = tuple(
+            FailedCheck(
+                code=f"HANDOFF_FIELD_INVALID_{index + 1:03d}",
+                target=finding.field,
+                expected="the immutable handoff requirement",
+                observed="missing or invalid",
+                accepted_format=finding.reason,
+                remediation="correct this field and retry the same review request",
+                responsible_actor="session_agent",
+                retry="same_operation",
+            )
+            for index, finding in enumerate(findings)
+        )
+        raise _AuditedMutationRejection(failed_checks)
+
+    result = context.mutation_executor._request_review_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+        summary=summary,
+        metadata=metadata,
+        reviewer=fixed_reviewer,
+        expected_run_id=run_id,
+        force=False,
+        with_reason=True,
+    )
+    if (
+        type(result) is not tuple
+        or len(result) != 2
+        or result[0] is not True
+        or result[1] is not None
+    ):
+        raise ValueError("native request_review did not succeed")
+
+    ended_run = context.connection.execute(
+        "SELECT outcome, ended_at, summary, metadata FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if ended_run is None:
+        raise ValueError("execution run not found after mutation")
+    if ended_run["outcome"] != "review_requested":
+        raise ValueError("execution run outcome must be review_requested")
+    if not (type(ended_run["ended_at"]) is int and ended_run["ended_at"] > 0):
+        raise ValueError("execution run must have a positive ended_at")
+    if ended_run["summary"] is not None and type(ended_run["summary"]) is not str:
+        raise ValueError("execution run summary must be a string or null")
+    if ended_run["metadata"] is None:
+        raise ValueError("execution run metadata must not be null")
+    try:
+        persisted_metadata = json.loads(ended_run["metadata"])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("execution run metadata is not valid JSON") from exc
+    if type(persisted_metadata) is not dict:
+        raise ValueError("execution run metadata must be a dict")
+
+    candidate_id = str(uuid.uuid4())
+    context.connection.execute(
+        "INSERT INTO task_candidate_handoffs "
+        "(candidate_id, task_card_id, task_id, execution_run_id, reviewer, "
+        "summary, metadata_json, submitted_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            candidate_id,
+            card_id,
+            task_id,
+            run_id,
+            fixed_reviewer,
+            ended_run["summary"],
+            json.dumps(
+                persisted_metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            context.binding.actor_profile,
+            int(time.time()),
+        ),
+    )
+    _advance_task_version(context, task_id, board)
+    return {
+        "task_id": task_id,
+        "candidate_id": candidate_id,
+        "reviewer": fixed_reviewer,
+    }
+
+
 def _handle_heartbeat(context: Any) -> dict[str, Any]:
     payload = context.payload
     unknown = set(payload.keys()) - {"task_id", "note", "board"}
@@ -1413,6 +2045,7 @@ def register_public_tools(
             is_async=False,
         )
 
+
 _UNRECOGNIZED_OPERATION = "UNRECOGNIZED_OPERATION"
 _COMMAND_BOUNDARY_UNAVAILABLE = "COMMAND_BOUNDARY_UNAVAILABLE"
 _OPERATION_NOT_IMPLEMENTED = "OPERATION_NOT_IMPLEMENTED"
@@ -1428,6 +2061,17 @@ _BOUNDARY_DESTINATION = "adrian-kanban"
 _RECEIPT_TABLE = "adrian_kanban_command_receipts"
 
 
+class _AuditedMutationRejection(Exception):
+    def __init__(self, failed_checks: tuple[FailedCheck, ...]) -> None:
+        if type(failed_checks) is not tuple:
+            raise TypeError("failed_checks must be a tuple")
+        if not failed_checks:
+            raise ValueError("failed_checks must be nonempty")
+        if any(type(check) is not FailedCheck for check in failed_checks):
+            raise TypeError("failed_checks must contain only FailedCheck instances")
+        self.failed_checks = failed_checks
+
+
 def _resolve_attempt_id(fields: dict[str, Any]) -> str:
     """Return the caller's attempt_id only when it is a nonblank string.
 
@@ -1440,6 +2084,24 @@ def _resolve_attempt_id(fields: dict[str, Any]) -> str:
         if trimmed:
             return trimmed
     return "attempt-" + uuid.uuid4().hex
+
+
+def _rejection_from_checks(
+    attempt_id: str,
+    operation: str,
+    checks: tuple[FailedCheck, ...],
+) -> dict[str, Any]:
+    collector = DiagnosticCollector(
+        attempt_id=attempt_id,
+        operation=operation,
+        boundary=Boundary(
+            source=_BOUNDARY_SOURCE,
+            destination=_BOUNDARY_DESTINATION,
+        ),
+    )
+    for check in checks:
+        collector.failure(check)
+    return collector.rejection().as_dict()
 
 
 def _rejection(
@@ -1465,9 +2127,7 @@ def _rejection(
         FailedCheck(
             code=code,
             target=operation,
-            expected=(
-                "a recognized operation admitted by the shared command boundary"
-            ),
+            expected=("a recognized operation admitted by the shared command boundary"),
             observed=operation,
             accepted_format=(
                 "one of READ_ONLY_OPERATIONS, ORDINARY_TASK_OPERATIONS, or "
@@ -1509,6 +2169,7 @@ def _request_digest(
     workspace_id: str | None,
     execution_context: str,
     expected_version: int | None = None,
+    actor_profile: str | None = None,
 ) -> str:
     identity = {
         "operation": operation,
@@ -1522,6 +2183,8 @@ def _request_digest(
     }
     if expected_version is not None:
         identity["expected_version"] = expected_version
+    if actor_profile is not None:
+        identity["actor_profile"] = actor_profile
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1543,6 +2206,7 @@ class _CommandContext:
         capability: Any = None,
         binding: Any = None,
         mutation_executor: Any = None,
+        known_profiles: frozenset[str] = frozenset(),
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -1551,6 +2215,7 @@ class _CommandContext:
         self.capability = capability
         self.binding = binding
         self.mutation_executor = mutation_executor
+        self.known_profiles = known_profiles
 
 
 class _CommandBoundary:
@@ -1561,6 +2226,7 @@ class _CommandBoundary:
         provider: AdrianKanbanAuthorityProvider,
         handlers: dict[str, Any],
         state_resolver: Any = None,
+        known_profiles: Any = (),
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise TypeError("provider must be an AdrianKanbanAuthorityProvider")
@@ -1568,10 +2234,20 @@ class _CommandBoundary:
             raise ValueError("database_path must be a nonblank string")
         if state_resolver is not None and not callable(state_resolver):
             raise TypeError("state_resolver must be callable or None")
+        if type(known_profiles) not in {tuple, frozenset, set}:
+            raise TypeError("known_profiles must be a tuple, frozenset, or set")
+        normalized_profiles: list[str] = []
+        for profile in known_profiles:
+            if not (type(profile) is str and profile.strip()):
+                raise TypeError("known_profiles must contain nonblank strings")
+            normalized_profiles.append(profile.strip())
+        if len(normalized_profiles) != len(set(normalized_profiles)):
+            raise ValueError("known_profiles must be unique after trimming")
         self._database_path = database_path
         self._provider = provider
         self._handlers = MappingProxyType(dict(handlers))
         self._state_resolver = state_resolver
+        self._known_profiles = frozenset(normalized_profiles)
 
     def submit(self, action: str, **fields: Any) -> dict[str, Any]:
         attempt_id = _resolve_attempt_id(fields)
@@ -1612,6 +2288,7 @@ class _CommandBoundary:
                 payload=payload,
                 connection=conn,
                 attempt_id=attempt_id,
+                known_profiles=self._known_profiles,
             )
             result = handler(context)
             if not isinstance(result, dict):
@@ -1649,6 +2326,7 @@ class _CommandBoundary:
         workspace_id = fields.get("workspace_id")
         payload = fields.get("payload")
         derive_expected_version = fields.get("derive_expected_version", False)
+        actor_profile = fields.get("actor_profile")
 
         if not isinstance(target, str) or not target.strip():
             return self._rejection_internal(
@@ -1672,6 +2350,12 @@ class _CommandBoundary:
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
             )
+        if actor_profile is not None and not (
+            type(actor_profile) is str and actor_profile.strip()
+        ):
+            return self._rejection_internal(
+                attempt_id, action, _COMMAND_EXECUTION_FAILED
+            )
         if not isinstance(payload, dict):
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
@@ -1685,9 +2369,10 @@ class _CommandBoundary:
             workspace_id=workspace_id,
             execution_context=execution_context,
             expected_version=(
-                None
-                if derive_expected_version
-                else fields.get("expected_version")
+                None if derive_expected_version else fields.get("expected_version")
+            ),
+            actor_profile=(
+                actor_profile.strip() if actor_profile is not None else None
             ),
         )
 
@@ -1738,10 +2423,14 @@ class _CommandBoundary:
                 plugin_version=PLUGIN_VERSION,
                 protocol_version=PROTOCOL_VERSION,
                 execution_context=execution_context,
+                actor_profile=(
+                    actor_profile.strip() if actor_profile is not None else None
+                ),
             )
             capability = self._provider._mint_after_admission(binding)
             adapter = self._provider._create_mutation_executor(conn)
 
+            audited_rejection: _AuditedMutationRejection | None = None
             with adapter.mutation_transaction(capability, binding):
                 row = conn.execute(
                     f"SELECT request_digest, response_json FROM {_RECEIPT_TABLE} "
@@ -1776,46 +2465,51 @@ class _CommandBoundary:
                     capability=capability,
                     binding=binding,
                     mutation_executor=adapter,
+                    known_profiles=self._known_profiles,
                 )
-                result = handler(context)
-                if not isinstance(result, dict):
-                    raise TypeError("handler must return a dict")
                 try:
-                    response_json = json.dumps(
-                        {
-                            "result": "ACCEPTED",
-                            "state_changed": True,
-                            "attempt_id": attempt_id,
-                            "operation": action,
-                            "value": result,
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
+                    result = handler(context)
+                except _AuditedMutationRejection as exc:
+                    audited_rejection = exc
+                else:
+                    if not isinstance(result, dict):
+                        raise TypeError("handler must return a dict")
+                    try:
+                        response_json = json.dumps(
+                            {
+                                "result": "ACCEPTED",
+                                "state_changed": True,
+                                "attempt_id": attempt_id,
+                                "operation": action,
+                                "value": result,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    except (TypeError, ValueError):
+                        raise TypeError("handler result is not JSON serializable")
+                    conn.execute(
+                        f"INSERT INTO {_RECEIPT_TABLE} "
+                        "(idempotency_key, operation, target, request_digest, "
+                        "response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            idempotency_key,
+                            action,
+                            target,
+                            request_digest,
+                            response_json,
+                            int(time.time()),
+                        ),
                     )
-                except (TypeError, ValueError):
-                    raise TypeError("handler result is not JSON serializable")
-                conn.execute(
-                    f"INSERT INTO {_RECEIPT_TABLE} "
-                    "(idempotency_key, operation, target, request_digest, "
-                    "response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        idempotency_key,
-                        action,
-                        target,
-                        request_digest,
-                        response_json,
-                        int(time.time()),
-                    ),
+                    return json.loads(response_json)
+            if audited_rejection is not None:
+                return _rejection_from_checks(
+                    attempt_id, action, audited_rejection.failed_checks
                 )
-                return json.loads(response_json)
         except _ConflictError:
-            return self._rejection_internal(
-                attempt_id, action, _IDEMPOTENCY_CONFLICT
-            )
+            return self._rejection_internal(attempt_id, action, _IDEMPOTENCY_CONFLICT)
         except _StaleDerivedStateError:
-            return self._rejection_internal(
-                attempt_id, action, _STALE_DERIVED_STATE
-            )
+            return self._rejection_internal(attempt_id, action, _STALE_DERIVED_STATE)
         except Exception:
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED

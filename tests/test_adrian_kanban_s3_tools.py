@@ -334,7 +334,7 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
 
     def board_resolver(operation, args, runtime_fields):
         board_calls.append((operation, args, runtime_fields))
-        return ("orchestrator", "workspace-1")
+        return ("orchestrator", "workspace-1", "builder")
 
     commands_module.register_public_tools(
         context,
@@ -396,6 +396,7 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
                 "derive_expected_version": True,
                 "session_id": "host-session-1",
                 "workspace_id": "workspace-1",
+                "actor_profile": "builder",
                 "execution_context": "model-tool",
                 "payload": fields["payload"],
             }
@@ -450,7 +451,7 @@ def test_model_tool_rejects_undeclared_authority_fields_and_board_conflicts(
     boundary = _RecordingBoundary()
     normalizer = commands_module._ModelToolRequestNormalizer(
         boundary,
-        board_resolver=lambda *_: ("orchestrator", "workspace-1"),
+        board_resolver=lambda *_: ("orchestrator", "workspace-1", "builder"),
     )
 
     undeclared = normalizer.submit(

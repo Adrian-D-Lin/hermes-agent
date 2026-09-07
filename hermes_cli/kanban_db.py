@@ -86,7 +86,17 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage",
+    "todo",
+    "scheduled",
+    "ready",
+    "running",
+    "blocked",
+    "review",
+    "done",
+    "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
@@ -387,6 +397,7 @@ def kanban_home() -> Path:
     if override:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
+
     return get_default_hermes_root()
 
 
@@ -667,6 +678,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 
 
 # --- Data classes ---
+
 
 @dataclass
 class Task:
@@ -1053,6 +1065,7 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 
 # --- ID generation ---
 
+
 def _new_task_id() -> str:
     """``t_`` + 4 hex bytes (collision ~1e-3 at 100k tasks; 2 bytes would hit 50%
     by 10k). Idempotency belongs to ``idempotency_key``, not id uniqueness."""
@@ -1062,6 +1075,7 @@ def _new_task_id() -> str:
 def _claimer_id() -> str:
     """Return a ``host:pid`` string that identifies this claimer."""
     import socket
+
     try:
         host = socket.gethostname() or "unknown"
     except Exception:
@@ -1085,6 +1099,7 @@ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> t
     if provider and not model:
         raise ValueError("provider_override requires a model_override")
     return model, provider
+
 
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
@@ -1531,7 +1546,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 "last_failure_error = NULL WHERE id = ?", (profile, task_id),
             )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+            conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id)
+            )
         _append_event(conn, task_id, "assigned", {"assignee": profile})
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee",))
@@ -1584,6 +1601,7 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
 
 
 # --- Links ---
+
 
 def link_tasks(
     conn: sqlite3.Connection,
@@ -1976,6 +1994,7 @@ def _synthesize_ended_run(
 
 # --- Dependency resolution (todo -> ready) ---
 
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """True when the newest ``blocked``/``unblocked`` event is ``blocked`` — an
     explicit ``kanban_block`` that must wait for an operator. A breaker trip
@@ -2037,10 +2056,12 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -2065,7 +2086,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                     failures = int(row["consecutive_failures"] or 0)
                     task_limit = row["max_retries"]
                     effective_limit = (
-                        int(task_limit) if task_limit is not None
+                        int(task_limit)
+                        if task_limit is not None
                         else int(failure_limit)
                     )
                     if failures >= effective_limit:
@@ -2080,7 +2102,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                         (resume_status, task_id),
                     )
                 _append_event(
-                    conn, task_id, "promoted",
+                    conn,
+                    task_id,
+                    "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
                 )
                 promoted += 1
@@ -2088,6 +2112,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 
 
 # --- Claim / complete / block ---
+
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
@@ -2338,12 +2363,18 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"],
+            row["claim_lock"],
+            signal_fn=signal_fn,
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
-                conn, row["id"], row["claim_lock"], now, termination,
+                conn,
+                row["id"],
+                row["claim_lock"],
+                now,
+                termination,
                 reason="ttl_expired_worker_alive",
             )
             continue
@@ -2555,6 +2586,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
     _allow_nested: bool = False,
+    _defer_cleanup: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2568,6 +2600,10 @@ def complete_task(
     """
     if type(_allow_nested) is not bool:
         raise TypeError("_allow_nested must be a bool")
+    if type(_defer_cleanup) is not bool:
+        raise TypeError("_defer_cleanup must be a bool")
+    if _defer_cleanup and not _allow_nested:
+        raise ValueError("_defer_cleanup=True requires _allow_nested=True")
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2575,7 +2611,11 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
+        conn,
+        task_id,
+        metadata,
+        summary=summary,
+        result=result,
     )
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
@@ -2938,7 +2978,9 @@ def edit_completed_task_result(
                     (json.dumps(metadata, ensure_ascii=False), run_id),
                 )
         _append_event(
-            conn, task_id, "edited",
+            conn,
+            task_id,
+            "edited",
             {
                 "fields": ["result", "summary"] + (["metadata"] if metadata is not None else []),
                 "result_len": len(result) if result else 0,
@@ -3299,7 +3341,12 @@ def promote_task(
 
 
 def _reclaim_dangling_run(
-    conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    statuses,
+    now: int,
+    note: str,
 ) -> None:
     """Close a leaked open run before a status flip so the invariant
     ``current_run_id IS NULL <=> run row terminal`` holds; no-op normally."""
@@ -3339,7 +3386,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             else "ready"
         )
         _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            conn,
+            task_id,
+            statuses=("blocked", "scheduled"),
+            now=now,
             note="invariant recovery on unblock",
         )
         # Re-gate on parent completion before restoring the source phase.
@@ -3362,7 +3412,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         _append_event(
-            conn, task_id, "unblocked",
+            conn,
+            task_id,
+            "unblocked",
             (
                 {"status": new_status, "resume_status": resume_status}
                 if new_status != "ready" or resume_status != "ready"
@@ -3380,7 +3432,10 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
-            conn, task_id, statuses=("review",), now=now,
+            conn,
+            task_id,
+            statuses=("review",),
+            now=now,
             note="invariant recovery on review reopen",
         )
         new_status = _landing_status_after_parents(conn, task_id)
@@ -3667,6 +3722,7 @@ def schedule_task(
 
 # --- Worker context builder (what a spawned worker sees) ---
 
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Everything a worker should read about its task: header, body,
     attachments, prior attempts, done-parent handoffs, the assignee's recent
@@ -3731,12 +3787,16 @@ def _ctx_header(lines: list[str], task: Task) -> None:
     lines.append(f"Status:   {task.status}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    lines.append(
+        f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}"
+    )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
         )
-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+        effective_terminal_timeout = terminal_timeout or os.environ.get(
+            "TERMINAL_TIMEOUT"
+        )
         lines.append(f"Max runtime: {task.max_runtime_seconds}s")
         if effective_terminal_timeout:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
@@ -3881,6 +3941,7 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
 
 # --- Stats + SLA helpers ---
 
+
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
     by_status: dict[str, int] = {}
@@ -3898,7 +3959,8 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     now = int(time.time())
     oldest_ready_age = (
         (now - int(oldest_row["ts"]))
-        if oldest_row and oldest_row["ts"] is not None else None
+        if oldest_row and oldest_row["ts"] is not None
+        else None
     )
 
     return {
@@ -3937,6 +3999,7 @@ def _to_epoch(val) -> Optional[int]:
     # ISO-8601 fallback (e.g. '2026-05-10T15:00:00Z')
     try:
         from datetime import datetime
+
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return int(dt.timestamp())
     except (ValueError, OSError):
@@ -3986,6 +4049,7 @@ def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[
 
 # --- Worker log accessor ---
 
+
 def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
     """Worker log path (may not exist). The dispatcher always passes ``board``
     explicitly to avoid resolution ambiguity."""
@@ -4018,11 +4082,13 @@ def read_worker_log(
 
 # --- Assignee enumeration (known profiles + per-profile board stats) ---
 
+
 def list_profiles_on_disk() -> list[str]:
     """Profiles with a ``config.yaml`` plus the implicit ``default``; reads paths
     directly to avoid importing ``hermes_cli.profiles`` at startup."""
     try:
         from hermes_constants import get_default_hermes_root
+
         default_root = get_default_hermes_root()
         profiles_dir = default_root / "profiles"
     except Exception:
@@ -4051,6 +4117,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
 
 
 # --- Runs (attempt history on a task) ---
+
 
 def list_runs(
     conn: sqlite3.Connection, task_id: str, *, include_active: bool = True,
