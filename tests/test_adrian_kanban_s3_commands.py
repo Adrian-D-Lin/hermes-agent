@@ -866,3 +866,149 @@ def test_active_transaction_entry_rejects_outside_its_exact_boundary_scope(
         assert provider.is_consumed(capability) is False
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    ("operation", "native_name"),
+    (
+        ("kanban_complete", "complete_task"),
+        ("kanban_block", "block_task"),
+        ("kanban_unblock", "unblock_task"),
+        ("kanban_comment", "add_comment"),
+        ("kanban_heartbeat", "heartbeat_worker"),
+        ("kanban_request_changes", "request_changes"),
+        ("kanban_request_review", "request_review"),
+    ),
+)
+def test_all_retained_s2_mutations_use_the_active_boundary_transaction(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+    operation,
+    native_name,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    adapter_module = modules["private_adapter"]
+    observed = {}
+
+    def native_spy(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        observed["in_transaction"] = args[0].in_transaction
+        return f"native:{operation}"
+
+    monkeypatch.setattr(kb, native_name, native_spy)
+
+    arguments = {
+        "kanban_complete": adapter_module._CompleteTaskArgs("task-retained"),
+        "kanban_block": adapter_module._BlockTaskArgs(
+            "task-retained", reason="waiting", kind="needs_input"
+        ),
+        "kanban_unblock": adapter_module._UnblockTaskArgs("task-retained"),
+        "kanban_comment": adapter_module._CommentArgs(
+            "task-retained", "orchestrator", "evidence"
+        ),
+        "kanban_heartbeat": adapter_module._HeartbeatArgs(
+            "task-retained", note="alive"
+        ),
+        "kanban_request_changes": adapter_module._RequestChangesArgs(
+            "task-retained", "revise"
+        ),
+        "kanban_request_review": adapter_module._RequestReviewArgs(
+            "task-retained", summary="ready"
+        ),
+    }[operation]
+
+    def handler(context):
+        result = context.mutation_executor._execute_in_active_transaction(
+            context.capability,
+            context.binding,
+            arguments,
+        )
+        return {"native_result": result}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={operation: handler},
+    )
+    result = boundary.submit(
+        operation,
+        attempt_id=f"attempt-{operation}",
+        idempotency_key=f"key-{operation}",
+        target="task-retained",
+        expected_version=0,
+        session_id="session-retained",
+        workspace_id=None,
+        execution_context="run-retained",
+        payload={"operation": operation},
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {"native_result": f"native:{operation}"}
+    assert observed["in_transaction"] is True
+    if operation == "kanban_comment":
+        assert "_allow_nested" not in observed["kwargs"]
+    else:
+        assert observed["kwargs"]["_allow_nested"] is True
+
+
+def test_active_transaction_operation_allowlist_matches_retained_s2_mutations(
+    commands_module,
+):
+    adapter_module = _runtime_modules(commands_module)["private_adapter"]
+
+    assert adapter_module._ACTIVE_TRANSACTION_OPERATIONS == frozenset(
+        {
+            "kanban_complete",
+            "kanban_block",
+            "kanban_unblock",
+            "kanban_comment",
+            "kanban_heartbeat",
+            "kanban_request_changes",
+            "kanban_request_review",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (
+        "kanban_complete",
+        "kanban_block",
+        "kanban_unblock",
+        "kanban_heartbeat",
+        "kanban_request_changes",
+        "kanban_request_review",
+    ),
+)
+def test_native_nested_transaction_switch_requires_an_exact_bool(operation):
+    calls = {
+        "kanban_complete": lambda conn: kb.complete_task(
+            conn, "task-exact-bool", _allow_nested=1
+        ),
+        "kanban_block": lambda conn: kb.block_task(
+            conn, "task-exact-bool", _allow_nested=1
+        ),
+        "kanban_unblock": lambda conn: kb.unblock_task(
+            conn, "task-exact-bool", _allow_nested=1
+        ),
+        "kanban_heartbeat": lambda conn: kb.heartbeat_worker(
+            conn, "task-exact-bool", _allow_nested=1
+        ),
+        "kanban_request_changes": lambda conn: kb.request_changes(
+            conn, "task-exact-bool", reason="revise", _allow_nested=1
+        ),
+        "kanban_request_review": lambda conn: kb.request_review(
+            conn, "task-exact-bool", _allow_nested=1
+        ),
+    }
+
+    with sqlite3.connect(":memory:", isolation_level=None) as conn:
+        with pytest.raises(TypeError, match="_allow_nested must be a bool"):
+            calls[operation](conn)

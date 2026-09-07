@@ -245,7 +245,17 @@ _OPERATION_ARGUMENT_TYPES = MappingProxyType(
 # Only operations whose native mutators already use nested savepoint
 # semantics may be admitted inside the boundary's outer transaction. Any
 # other operation is rejected explicitly rather than falsely claimed safe.
-_ACTIVE_TRANSACTION_OPERATIONS = frozenset({"kanban_comment"})
+_ACTIVE_TRANSACTION_OPERATIONS = frozenset(
+    {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_unblock",
+        "kanban_comment",
+        "kanban_heartbeat",
+        "kanban_request_changes",
+        "kanban_request_review",
+    }
+)
 
 
 class _PrivateNativeAdapter:
@@ -294,7 +304,12 @@ class _PrivateNativeAdapter:
         return operation
 
     def _dispatch_native(
-        self, operation: str, binding: CapabilityBinding, arguments: Any
+        self,
+        operation: str,
+        binding: CapabilityBinding,
+        arguments: Any,
+        *,
+        allow_nested: bool = False,
     ) -> Any:
         if operation == "kanban_complete":
             return _kb.complete_task(
@@ -306,6 +321,7 @@ class _PrivateNativeAdapter:
                 created_cards=arguments.created_cards,
                 expected_run_id=arguments.expected_run_id,
                 fire_lifecycle_hook=False,
+                _allow_nested=allow_nested,
             )
         elif operation == "kanban_block":
             return _kb.block_task(
@@ -314,9 +330,14 @@ class _PrivateNativeAdapter:
                 reason=arguments.reason,
                 kind=arguments.kind,
                 expected_run_id=arguments.expected_run_id,
+                _allow_nested=allow_nested,
             )
         elif operation == "kanban_unblock":
-            return _kb.unblock_task(self._conn, arguments.task_id)
+            return _kb.unblock_task(
+                self._conn,
+                arguments.task_id,
+                _allow_nested=allow_nested,
+            )
         elif operation == "kanban_comment":
             return _kb.add_comment(
                 self._conn,
@@ -330,6 +351,7 @@ class _PrivateNativeAdapter:
                 arguments.task_id,
                 note=arguments.note,
                 expected_run_id=arguments.expected_run_id,
+                _allow_nested=allow_nested,
             )
         elif operation == "kanban_request_changes":
             return _kb.request_changes(
@@ -337,6 +359,7 @@ class _PrivateNativeAdapter:
                 arguments.task_id,
                 reason=arguments.reason,
                 expected_run_id=arguments.expected_run_id,
+                _allow_nested=allow_nested,
             )
         elif operation == "kanban_request_review":
             return _kb.request_review(
@@ -348,6 +371,7 @@ class _PrivateNativeAdapter:
                 expected_run_id=arguments.expected_run_id,
                 force=arguments.force,
                 with_reason=arguments.with_reason,
+                _allow_nested=allow_nested,
             )
         raise _PrivateAdapterRejected("unreachable")
 
@@ -401,7 +425,9 @@ class _PrivateNativeAdapter:
                 "operation is not admitted inside the active boundary transaction"
             )
 
-        return self._dispatch_native(operation, binding, arguments)
+        return self._dispatch_native(
+            operation, binding, arguments, allow_nested=True
+        )
 
     @contextlib.contextmanager
     def mutation_transaction(

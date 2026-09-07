@@ -6008,6 +6008,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    _allow_nested: bool = False,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -6041,6 +6042,8 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -6057,7 +6060,7 @@ def complete_task(
             conn, task_id, created_cards
         )
         if phantom_cards:
-            with write_txn(conn):
+            with write_txn(conn, allow_nested=_allow_nested):
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -6077,7 +6080,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -6210,7 +6213,7 @@ def complete_task(
         # belt-and-suspenders).
         phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
         if phantom_refs:
-            with write_txn(conn):
+            with write_txn(conn, allow_nested=_allow_nested):
                 _append_event(
                     conn, task_id, "suspected_hallucinated_references",
                     {
@@ -6899,6 +6902,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6927,12 +6931,14 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -7146,6 +7152,7 @@ def request_review(
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    _allow_nested: bool = False,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -7167,12 +7174,15 @@ def request_review(
     diagnostic string on failure, ``None`` on success.
     """
 
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
+
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -7304,6 +7314,7 @@ def request_changes(
     *,
     reason: str,
     expected_run_id: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -7313,11 +7324,13 @@ def request_changes(
     ``changes_requested`` event.  The second tuple item is the implementer on
     success or a diagnostic reason on failure.
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
 
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
@@ -7536,7 +7549,12 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _allow_nested: bool = False,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -7546,8 +7564,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -9046,6 +9066,7 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -9057,8 +9078,10 @@ def heartbeat_worker(
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
