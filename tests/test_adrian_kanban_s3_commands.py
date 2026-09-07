@@ -958,7 +958,7 @@ def test_all_retained_s2_mutations_use_the_active_boundary_transaction(
         assert observed["kwargs"]["_allow_nested"] is True
 
 
-def test_active_transaction_operation_allowlist_matches_retained_s2_mutations(
+def test_active_transaction_operation_allowlist_matches_implemented_mutations(
     commands_module,
 ):
     adapter_module = _runtime_modules(commands_module)["private_adapter"]
@@ -972,6 +972,7 @@ def test_active_transaction_operation_allowlist_matches_retained_s2_mutations(
             "kanban_heartbeat",
             "kanban_request_changes",
             "kanban_request_review",
+            "kanban_link",
         }
     )
 
@@ -1012,3 +1013,211 @@ def test_native_nested_transaction_switch_requires_an_exact_bool(operation):
     with sqlite3.connect(":memory:", isolation_level=None) as conn:
         with pytest.raises(TypeError, match="_allow_nested must be a bool"):
             calls[operation](conn)
+
+
+def _insert_unified_card(
+    database_path,
+    *,
+    initiative_id: str,
+    task_id: str | None,
+    title: str,
+) -> None:
+    with sqlite3.connect(database_path, isolation_level=None) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO adrian_kanban_initiatives "
+            "(initiative_id) VALUES (?)",
+            (initiative_id,),
+        )
+        if task_id is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO adrian_kanban_cards "
+                "(card_type, initiative_id, task_id, title, created_at) "
+                "VALUES ('initiative', ?, NULL, ?, ?)",
+                (initiative_id, f"Initiative {initiative_id}", 999),
+            )
+        conn.execute(
+            "INSERT INTO adrian_kanban_cards "
+            "(card_type, initiative_id, task_id, title, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "task" if task_id is not None else "initiative",
+                initiative_id,
+                task_id,
+                title,
+                1_000,
+            ),
+        )
+
+
+def test_link_handler_atomically_links_two_unified_task_cards(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    for task_id, initiative_id in (
+        ("task-parent", "initiative-link-parent"),
+        ("task-child", "initiative-link-child"),
+    ):
+        _insert_native_task(database_path, task_id)
+        _insert_unified_card(
+            database_path,
+            initiative_id=initiative_id,
+            task_id=task_id,
+            title=task_id,
+        )
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_link": commands_module._handle_link},
+    )
+    result = boundary.submit(
+        "kanban_link",
+        attempt_id="attempt-link",
+        idempotency_key="idempotency-link",
+        target="task-child",
+        expected_version=0,
+        session_id="session-link",
+        workspace_id=None,
+        execution_context="run-link",
+        payload={"parent_id": "task-parent", "child_id": "task-child"},
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {
+        "parent_id": "task-parent",
+        "child_id": "task-child",
+    }
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links "
+            "WHERE parent_id = ? AND child_id = ?",
+            ("task-parent", "task-child"),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
+            "WHERE idempotency_key = ?",
+            ("idempotency-link",),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("invalid_kind", ("initiative", "legacy"))
+def test_link_handler_rejects_non_task_endpoint_without_state_or_receipt(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+    invalid_kind,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _insert_native_task(database_path, "task-child")
+    _insert_unified_card(
+        database_path,
+        initiative_id="initiative-link-reject",
+        task_id="task-child",
+        title="Child",
+    )
+    if invalid_kind == "initiative":
+        _insert_unified_card(
+            database_path,
+            initiative_id="initiative-endpoint",
+            task_id=None,
+            title="Not a task",
+        )
+        parent_id = "initiative-endpoint"
+    else:
+        _insert_native_task(database_path, "legacy-parent")
+        parent_id = "legacy-parent"
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_link": commands_module._handle_link},
+    )
+    result = boundary.submit(
+        "kanban_link",
+        attempt_id=f"attempt-link-{invalid_kind}",
+        idempotency_key=f"idempotency-link-{invalid_kind}",
+        target="task-child",
+        expected_version=0,
+        session_id="session-link-reject",
+        workspace_id=None,
+        execution_context="run-link-reject",
+        payload={"parent_id": parent_id, "child_id": "task-child"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_link",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
+
+
+def test_link_native_nested_transaction_switch_requires_an_exact_bool():
+    with sqlite3.connect(":memory:", isolation_level=None) as conn:
+        with pytest.raises(TypeError, match="_allow_nested must be a bool"):
+            kb.link_tasks(conn, "parent", "child", _allow_nested=1)
+
+
+def test_link_binding_target_must_be_the_child(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    for task_id in ("task-parent", "task-child"):
+        _insert_native_task(database_path, task_id)
+        _insert_unified_card(
+            database_path,
+            initiative_id=f"initiative-{task_id}",
+            task_id=task_id,
+            title=task_id,
+        )
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_link": commands_module._handle_link},
+    )
+    result = boundary.submit(
+        "kanban_link",
+        attempt_id="attempt-link-target-mismatch",
+        idempotency_key="idempotency-link-target-mismatch",
+        target="task-parent",
+        expected_version=0,
+        session_id="session-link-target-mismatch",
+        workspace_id=None,
+        execution_context="run-link-target-mismatch",
+        payload={"parent_id": "task-parent", "child_id": "task-child"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_link",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0

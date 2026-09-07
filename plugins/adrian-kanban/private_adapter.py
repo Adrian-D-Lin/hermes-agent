@@ -198,6 +198,18 @@ class _RequestReviewArgs:
 
 
 @dataclass(frozen=True)
+class _LinkArgs:
+    parent_id: str
+    child_id: str
+
+    def __post_init__(self) -> None:
+        if not _is_nonblank_str(self.parent_id):
+            raise _PrivateAdapterRejected("parent_id must be a nonblank string")
+        if not _is_nonblank_str(self.child_id):
+            raise _PrivateAdapterRejected("child_id must be a nonblank string")
+
+
+@dataclass(frozen=True)
 class _LaunchTaskArgs:
     task_id: str
     expected_assignee: str
@@ -237,6 +249,7 @@ _OPERATION_ARGUMENT_TYPES = MappingProxyType(
         "kanban_heartbeat": _HeartbeatArgs,
         "kanban_request_changes": _RequestChangesArgs,
         "kanban_request_review": _RequestReviewArgs,
+        "kanban_link": _LinkArgs,
         "kanban_launch": _LaunchTaskArgs,
     }
 )
@@ -254,6 +267,7 @@ _ACTIVE_TRANSACTION_OPERATIONS = frozenset(
         "kanban_heartbeat",
         "kanban_request_changes",
         "kanban_request_review",
+        "kanban_link",
     }
 )
 
@@ -296,7 +310,12 @@ class _PrivateNativeAdapter:
                 f"arguments must be {expected_args_type.__name__}"
             )
 
-        if binding.target != arguments.task_id:
+        if operation == "kanban_link":
+            if binding.target != arguments.child_id:
+                raise _PrivateAdapterRejected(
+                    "binding.target does not match arguments.child_id"
+                )
+        elif binding.target != arguments.task_id:
             raise _PrivateAdapterRejected(
                 "binding.target does not match arguments.task_id"
             )
@@ -373,6 +392,13 @@ class _PrivateNativeAdapter:
                 with_reason=arguments.with_reason,
                 _allow_nested=allow_nested,
             )
+        elif operation == "kanban_link":
+            return _kb.link_tasks(
+                self._conn,
+                arguments.parent_id,
+                arguments.child_id,
+                _allow_nested=allow_nested,
+            )
         raise _PrivateAdapterRejected("unreachable")
 
     def execute(
@@ -428,6 +454,17 @@ class _PrivateNativeAdapter:
         return self._dispatch_native(
             operation, binding, arguments, allow_nested=True
         )
+
+    def _link_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        parent_id: str,
+        child_id: str,
+    ) -> Any:
+        args = _LinkArgs(parent_id=parent_id, child_id=child_id)
+        return self._execute_in_active_transaction(capability, binding, args)
 
     @contextlib.contextmanager
     def mutation_transaction(

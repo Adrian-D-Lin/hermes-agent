@@ -1583,7 +1583,15 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
 
 # --- Links ---
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    _allow_nested: bool = False,
+) -> None:
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
