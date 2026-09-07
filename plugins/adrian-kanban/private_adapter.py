@@ -1,3 +1,4 @@
+import contextlib
 import sqlite3
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -357,3 +358,13 @@ class _PrivateNativeAdapter:
                     with_reason=arguments.with_reason,
                 )
         raise _PrivateAdapterRejected("unreachable")
+
+    @contextlib.contextmanager
+    def mutation_transaction(self, capability: Any, binding: CapabilityBinding):
+        if type(binding) is not CapabilityBinding:
+            raise _PrivateAdapterRejected("binding must be a CapabilityBinding")
+        with _capability_scope(
+            self._provider, self._conn, capability, binding
+        ):
+            with _kb.write_txn(self._conn):
+                yield self._conn

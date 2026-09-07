@@ -78,6 +78,11 @@ class AdrianKanbanAuthorityProvider:
     def is_consumed(self, capability) -> bool:
         return self._registry.is_consumed(capability)
 
+    def _create_mutation_executor(self, conn: sqlite3.Connection):
+        from .private_adapter import _PrivateNativeAdapter
+
+        return _PrivateNativeAdapter(self, conn)
+
 
 @contextlib.contextmanager
 def _capability_scope(
