@@ -981,12 +981,14 @@ def _handle_create(context: Any) -> dict[str, Any]:
     initiative_id = payload.get("initiative_id")
     title = payload.get("title")
     assignee = payload.get("assignee")
+    board = payload.get("board")
 
     for field_name, value in (
         ("task_id", task_id),
         ("initiative_id", initiative_id),
         ("title", title),
         ("assignee", assignee),
+        ("board", board),
     ):
         if not (type(value) is str and value.strip()):
             raise ValueError(f"{field_name} must be a nonblank string")
@@ -995,6 +997,7 @@ def _handle_create(context: Any) -> dict[str, Any]:
     initiative_id = initiative_id.strip()
     title = title.strip()
     assignee = assignee.strip()
+    board = board.strip()
 
     if "parents" not in payload:
         parents: tuple[str, ...] = ()
@@ -1018,7 +1021,8 @@ def _handle_create(context: Any) -> dict[str, Any]:
 
     for parent_id in parents:
         parent_row = context.connection.execute(
-            "SELECT card_type, task_id, initiative_id FROM adrian_kanban_cards "
+            "SELECT card_type, task_id, initiative_id, board_slug "
+            "FROM adrian_kanban_cards "
             "WHERE task_id = ?",
             (parent_id,),
         ).fetchone()
@@ -1026,28 +1030,34 @@ def _handle_create(context: Any) -> dict[str, Any]:
             parent_row is None
             or parent_row["card_type"] != "task"
             or parent_row["task_id"] != parent_id
+            or parent_row["board_slug"] != board
         ):
             raise ValueError(f"parent task card not found: {parent_id}")
         parent_initiative_id = parent_row["initiative_id"]
         parent_initiative_row = context.connection.execute(
-            "SELECT card_type, task_id FROM adrian_kanban_cards "
+            "SELECT card_type, task_id, board_slug FROM adrian_kanban_cards "
             "WHERE initiative_id = ? AND task_id IS NULL",
             (parent_initiative_id,),
         ).fetchone()
         if (
             parent_initiative_row is None
             or parent_initiative_row["card_type"] != "initiative"
+            or parent_initiative_row["board_slug"] != board
         ):
             raise ValueError(
                 f"parent initiative card not found: {parent_initiative_id}"
             )
 
     row = context.connection.execute(
-        "SELECT card_type, task_id FROM adrian_kanban_cards "
+        "SELECT card_type, task_id, board_slug FROM adrian_kanban_cards "
         "WHERE initiative_id = ? AND task_id IS NULL",
         (initiative_id,),
     ).fetchone()
-    if row is None or row["card_type"] != "initiative":
+    if (
+        row is None
+        or row["card_type"] != "initiative"
+        or row["board_slug"] != board
+    ):
         raise ValueError("initiative card not found")
 
     kwargs: dict[str, Any] = {
@@ -1055,6 +1065,7 @@ def _handle_create(context: Any) -> dict[str, Any]:
         "title": title,
         "assignee": assignee,
         "parents": parents,
+        "board": board,
     }
     for optional_field in (
         "body",
@@ -1067,7 +1078,6 @@ def _handle_create(context: Any) -> dict[str, Any]:
         "goal_max_turns",
         "model",
         "provider",
-        "board",
     ):
         if optional_field in payload:
             kwargs[optional_field] = payload[optional_field]
@@ -1080,9 +1090,10 @@ def _handle_create(context: Any) -> dict[str, Any]:
 
     context.connection.execute(
         "INSERT INTO adrian_kanban_cards "
-        "(card_type, initiative_id, task_id, title, created_at) "
-        "VALUES ('task', ?, ?, ?, ?)",
-        (initiative_id, task_id, title, int(time.time())),
+        "(card_type, initiative_id, task_id, title, created_at, "
+        "board_slug, record_version) "
+        "VALUES ('task', ?, ?, ?, ?, ?, 0)",
+        (initiative_id, task_id, title, int(time.time()), board),
     )
 
     return {"initiative_id": initiative_id, "task_id": task_id}
@@ -1091,27 +1102,43 @@ def _handle_create(context: Any) -> dict[str, Any]:
 def _handle_link(context: Any) -> dict[str, Any]:
     parent_id = context.payload.get("parent_id")
     child_id = context.payload.get("child_id")
+    board = context.payload.get("board")
     if not (type(parent_id) is str and parent_id.strip()):
         raise ValueError("parent_id must be a nonblank string")
     if not (type(child_id) is str and child_id.strip()):
         raise ValueError("child_id must be a nonblank string")
+    if not (type(board) is str and board.strip()):
+        raise ValueError("board must be a nonblank string")
+    parent_id = parent_id.strip()
+    child_id = child_id.strip()
+    board = board.strip()
     if parent_id == child_id:
         raise ValueError("a task cannot link to itself")
 
     def _validate_endpoint(task_id: str) -> None:
         row = context.connection.execute(
-            "SELECT card_type, task_id, initiative_id FROM adrian_kanban_cards "
+            "SELECT card_type, task_id, initiative_id, board_slug "
+            "FROM adrian_kanban_cards "
             "WHERE task_id = ?",
             (task_id,),
         ).fetchone()
-        if row is None or row["card_type"] != "task" or row["task_id"] != task_id:
+        if (
+            row is None
+            or row["card_type"] != "task"
+            or row["task_id"] != task_id
+            or row["board_slug"] != board
+        ):
             raise ValueError(f"{task_id} is not a valid task endpoint")
         init_row = context.connection.execute(
-            "SELECT card_type, task_id FROM adrian_kanban_cards "
+            "SELECT card_type, task_id, board_slug FROM adrian_kanban_cards "
             "WHERE initiative_id = ? AND task_id IS NULL",
             (row["initiative_id"],),
         ).fetchone()
-        if init_row is None or init_row["card_type"] != "initiative":
+        if (
+            init_row is None
+            or init_row["card_type"] != "initiative"
+            or init_row["board_slug"] != board
+        ):
             raise ValueError(
                 f"initiative for {task_id} has no canonical initiative card"
             )
@@ -1125,6 +1152,14 @@ def _handle_link(context: Any) -> dict[str, Any]:
         parent_id=parent_id,
         child_id=child_id,
     )
+    updated = context.connection.execute(
+        "UPDATE adrian_kanban_cards "
+        "SET record_version = record_version + 1 "
+        "WHERE task_id = ? AND board_slug = ? AND record_version = ?",
+        (child_id, board, context.binding.expected_version),
+    )
+    if updated.rowcount != 1:
+        raise ValueError("task version changed during link")
     return {"parent_id": parent_id, "child_id": child_id}
 
 

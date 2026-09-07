@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS adrian_kanban_cards (
     task_id         TEXT,                     -- nullable; NULL for initiatives
     title           TEXT NOT NULL,
     created_at      INTEGER NOT NULL,
+    board_slug      TEXT NOT NULL DEFAULT 'default',
+    record_version  INTEGER NOT NULL DEFAULT 0 CHECK (record_version >= 0),
     -- Unified-card shape: an initiative card carries no task identity and a
     -- task card carries one; any other card_type is invalid. The CHECK pins
     -- card_type to the two valid shapes and ties each to the correct task_id
@@ -323,3 +325,18 @@ CREATE TABLE IF NOT EXISTS adrian_kanban_command_receipts (
 def create_schema(conn: object) -> None:
     """Apply the foundational schema (idempotent)."""
     conn.executescript(SCHEMA_SQL)
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(adrian_kanban_cards)")
+    }
+    if "board_slug" not in existing:
+        conn.execute(
+            "ALTER TABLE adrian_kanban_cards ADD COLUMN "
+            "board_slug TEXT NOT NULL DEFAULT 'default'"
+        )
+    if "record_version" not in existing:
+        conn.execute(
+            "ALTER TABLE adrian_kanban_cards ADD COLUMN "
+            "record_version INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (record_version >= 0)"
+        )
