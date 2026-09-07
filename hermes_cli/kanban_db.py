@@ -5586,15 +5586,18 @@ def heartbeat_claim(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    _allow_nested: bool = False,
 ) -> bool:
     """Extend a running claim.  Returns True if we still own it.
 
     Workers that know they'll exceed 15 minutes should call this every
     few minutes to keep ownership.
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock = ?",

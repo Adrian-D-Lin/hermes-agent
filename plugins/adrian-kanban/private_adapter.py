@@ -208,12 +208,15 @@ class _CommentArgs:
 @dataclass(frozen=True)
 class _HeartbeatArgs:
     task_id: str
+    claim_lock: str
     note: Optional[str] = None
     expected_run_id: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not _is_nonblank_str(self.task_id):
             raise _PrivateAdapterRejected("task_id must be a nonblank string")
+        if not _is_nonblank_str(self.claim_lock):
+            raise _PrivateAdapterRejected("claim_lock must be a nonblank string")
         if not _is_optional_str(self.note):
             raise _PrivateAdapterRejected("note must be None or a string")
         if not _is_optional_positive_int(self.expected_run_id):
@@ -462,6 +465,13 @@ class _PrivateNativeAdapter:
                 arguments.body,
             )
         elif operation == "kanban_heartbeat":
+            if not _kb.heartbeat_claim(
+                self._conn,
+                arguments.task_id,
+                claimer=arguments.claim_lock,
+                _allow_nested=allow_nested,
+            ):
+                return False
             return _kb.heartbeat_worker(
                 self._conn,
                 arguments.task_id,
@@ -620,11 +630,13 @@ class _PrivateNativeAdapter:
         binding: CapabilityBinding,
         *,
         task_id: str,
+        claim_lock: str,
         note: Optional[str] = None,
         expected_run_id: Optional[int] = None,
     ) -> Any:
         args = _HeartbeatArgs(
             task_id=task_id,
+            claim_lock=claim_lock,
             note=note,
             expected_run_id=expected_run_id,
         )
