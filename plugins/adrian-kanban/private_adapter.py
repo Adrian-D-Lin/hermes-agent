@@ -1,4 +1,5 @@
 import contextlib
+import os
 import sqlite3
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -306,6 +307,32 @@ class _LaunchTaskArgs:
             raise _PrivateAdapterRejected("failure_limit must be a positive integer")
 
 
+@dataclass(frozen=True)
+class _AttachArgs:
+    task_id: str
+    filename: str
+    data: bytes
+    content_type: Optional[str] = None
+    uploaded_by: str = "adrian-kanban"
+    board: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not _is_nonblank_str(self.task_id):
+            raise _PrivateAdapterRejected("task_id must be a nonblank string")
+        if not _is_nonblank_str(self.filename):
+            raise _PrivateAdapterRejected("filename must be a nonblank string")
+        if type(self.data) is not bytes:
+            raise _PrivateAdapterRejected("data must be bytes")
+        if not _is_optional_nonblank_str(self.content_type):
+            raise _PrivateAdapterRejected(
+                "content_type must be None or a nonblank string"
+            )
+        if not _is_nonblank_str(self.uploaded_by):
+            raise _PrivateAdapterRejected("uploaded_by must be a nonblank string")
+        if not _is_optional_nonblank_str(self.board):
+            raise _PrivateAdapterRejected("board must be None or a nonblank string")
+
+
 _OPERATION_ARGUMENT_TYPES = MappingProxyType({
     "kanban_create": _CreateTaskArgs,
     "kanban_complete": _CompleteTaskArgs,
@@ -317,6 +344,8 @@ _OPERATION_ARGUMENT_TYPES = MappingProxyType({
     "kanban_request_review": _RequestReviewArgs,
     "kanban_link": _LinkArgs,
     "kanban_launch": _LaunchTaskArgs,
+    "kanban_attach": _AttachArgs,
+    "kanban_attach_url": _AttachArgs,
 })
 
 
@@ -333,6 +362,8 @@ _ACTIVE_TRANSACTION_OPERATIONS = frozenset({
     "kanban_request_changes",
     "kanban_request_review",
     "kanban_link",
+    "kanban_attach",
+    "kanban_attach_url",
 })
 
 
@@ -358,6 +389,7 @@ class _PrivateNativeAdapter:
         self._active_capability: Optional[Any] = None
         self._active_binding: Optional[CapabilityBinding] = None
         self._deferred_cleanup_task_ids: list[str] = []
+        self._rollback_attachment_paths: list[str] = []
 
     def _validate_binding_and_arguments(
         self, capability: Any, binding: CapabilityBinding, arguments: Any
@@ -499,6 +531,27 @@ class _PrivateNativeAdapter:
                 arguments.child_id,
                 _allow_nested=allow_nested,
             )
+        elif operation in ("kanban_attach", "kanban_attach_url"):
+            attachment_id = _kb.store_attachment_bytes(
+                self._conn,
+                arguments.task_id,
+                arguments.filename,
+                arguments.data,
+                content_type=arguments.content_type,
+                uploaded_by=arguments.uploaded_by,
+                board=arguments.board,
+                _allow_nested=allow_nested,
+            )
+            row = _kb.get_attachment(self._conn, attachment_id)
+            if (
+                row is None
+                or row.task_id != arguments.task_id
+                or not row.stored_path
+                or not row.stored_path.strip()
+            ):
+                raise _PrivateAdapterRejected("attachment validation failed")
+            self._rollback_attachment_paths.append(row.stored_path)
+            return attachment_id
         raise _PrivateAdapterRejected("unreachable")
 
     def execute(
@@ -720,6 +773,26 @@ class _PrivateNativeAdapter:
         args = _LinkArgs(parent_id=parent_id, child_id=child_id)
         return self._execute_in_active_transaction(capability, binding, args)
 
+    def _attach_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        filename: str,
+        data: bytes,
+        content_type: Optional[str] = None,
+        board: Optional[str] = None,
+    ) -> Any:
+        args = _AttachArgs(
+            task_id=task_id,
+            filename=filename,
+            data=data,
+            content_type=content_type,
+            board=board,
+        )
+        return self._execute_in_active_transaction(capability, binding, args)
+
     @contextlib.contextmanager
     def mutation_transaction(self, capability: Any, binding: CapabilityBinding):
         if type(binding) is not CapabilityBinding:
@@ -727,12 +800,23 @@ class _PrivateNativeAdapter:
         if self._active_capability is not None or self._active_binding is not None:
             raise _PrivateAdapterRejected("active boundary transaction required")
         self._deferred_cleanup_task_ids = []
+        self._rollback_attachment_paths = []
         self._active_capability = capability
         self._active_binding = binding
         try:
             with _capability_scope(self._provider, self._conn, capability, binding):
-                with _kb.write_txn(self._conn):
-                    yield self._conn
+                try:
+                    with _kb.write_txn(self._conn):
+                        yield self._conn
+                except BaseException:
+                    rollback_paths = list(self._rollback_attachment_paths)
+                    for path in rollback_paths:
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                    raise
+                self._rollback_attachment_paths = []
                 for task_id in self._deferred_cleanup_task_ids:
                     try:
                         _kb._cleanup_workspace(self._conn, task_id)
@@ -742,3 +826,4 @@ class _PrivateNativeAdapter:
             self._active_capability = None
             self._active_binding = None
             self._deferred_cleanup_task_ids = []
+            self._rollback_attachment_paths = []

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import sqlite3
@@ -8,6 +10,7 @@ import uuid
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
+from .attachments import PreparedAttachment, prepare_url_attachment
 from .capability import CapabilityBinding
 from .diagnostics import (
     Boundary,
@@ -26,6 +29,7 @@ from .handoffs import (
     normalize_handoff_requirements,
     validate_candidate_metadata,
 )
+from .projections import attachments_projection, list_projection, show_projection
 
 # Public operation taxonomy. These sets are frozen by the ratified Canon
 # operation map and are consumed verbatim by every later S3 slice.
@@ -71,12 +75,19 @@ TOOL_SCHEMAS: dict[str, Any] = {
                     "type": "string",
                     "description": "Immutable identifier of the task to show.",
                 },
+                "initiative_id": {
+                    "type": "string",
+                    "description": "Immutable identifier of the initiative to show.",
+                },
                 "board": {
                     "type": "string",
                     "description": "Optional board scope for the read.",
                 },
             },
-            "required": ["task_id"],
+            "oneOf": [
+                {"required": ["task_id"]},
+                {"required": ["initiative_id"]},
+            ],
             "additionalProperties": False,
         },
     },
@@ -891,6 +902,241 @@ class _ModelToolRequestNormalizer:
                 operation,
                 _PUBLIC_REQUEST_NORMALIZATION_FAILED,
             )
+
+
+def _handle_show(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    allowed_fields = {"task_id", "initiative_id", "board"}
+    unknown = set(payload.keys()) - allowed_fields
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    task_id = payload.get("task_id")
+    initiative_id = payload.get("initiative_id")
+    board = payload.get("board")
+
+    if not isinstance(board, str) or not board.strip():
+        raise ValueError("board must be nonblank str")
+
+    has_task = isinstance(task_id, str) and task_id.strip()
+    has_initiative = isinstance(initiative_id, str) and initiative_id.strip()
+
+    if has_task and has_initiative:
+        raise ValueError("provide exactly one of task_id or initiative_id")
+    if not has_task and not has_initiative:
+        raise ValueError("provide exactly one of task_id or initiative_id")
+
+    if has_task:
+        return show_projection(context.connection, task_id.strip(), board.strip())
+    return show_projection(
+        context.connection,
+        None,
+        board.strip(),
+        initiative_id.strip(),
+    )
+
+
+def _handle_list(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    allowed_fields = {
+        "initiative_id", "assignee", "status", "tenant",
+        "include_archived", "limit", "board",
+    }
+    unknown = set(payload.keys()) - allowed_fields
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    for field in ("initiative_id", "assignee", "status", "tenant", "board"):
+        val = payload.get(field)
+        if val is not None and (not isinstance(val, str) or not val.strip()):
+            raise ValueError(f"{field} must be nonblank str or null")
+
+    include_archived = payload.get("include_archived")
+    if include_archived is not None and not isinstance(include_archived, bool):
+        raise ValueError("include_archived must be bool")
+
+    limit = payload.get("limit")
+    if limit is not None:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 500:
+            raise ValueError("limit must be int 1-500")
+
+    return list_projection(
+        context.connection,
+        board=payload.get("board"),
+        initiative_id=payload.get("initiative_id"),
+        assignee=payload.get("assignee"),
+        status=payload.get("status"),
+        tenant=payload.get("tenant"),
+        include_archived=include_archived,
+        limit=limit,
+    )
+
+
+def _handle_attachments(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    allowed_fields = {"task_id", "board"}
+    unknown = set(payload.keys()) - allowed_fields
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    task_id = payload.get("task_id")
+    board = payload.get("board")
+
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("task_id must be nonblank str")
+    if not isinstance(board, str) or not board.strip():
+        raise ValueError("board must be nonblank str")
+
+    return attachments_projection(
+        context.connection,
+        task_id.strip(),
+        board.strip(),
+    )
+
+
+def _handle_attach(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    allowed_fields = {
+        "task_id",
+        "filename",
+        "content_base64",
+        "content_type",
+        "board",
+    }
+    unknown = set(payload.keys()) - allowed_fields
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    task_id = payload.get("task_id")
+    filename = payload.get("filename")
+    content_base64 = payload.get("content_base64")
+    content_type = payload.get("content_type")
+    board = payload.get("board")
+
+    for field_name, value in (
+        ("task_id", task_id),
+        ("filename", filename),
+        ("content_base64", content_base64),
+    ):
+        if type(value) is not str or not value.strip():
+            raise ValueError(f"{field_name} must be a nonblank string")
+
+    if content_type is not None and (
+        type(content_type) is not str or not content_type.strip()
+    ):
+        raise ValueError("content_type must be None or a nonblank string")
+
+    if type(board) is not str or not board.strip():
+        raise ValueError("board must be a nonblank string")
+
+    task_id = task_id.strip()
+    filename = filename.strip()
+    content_base64 = content_base64.strip()
+    board = board.strip()
+    if content_type is not None:
+        content_type = content_type.strip()
+
+    try:
+        data = base64.b64decode(content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("content_base64 must be valid base64") from exc
+
+    _load_versioned_task(context, task_id, board)
+    attachment_id = context.mutation_executor._attach_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+        filename=filename,
+        data=data,
+        content_type=content_type,
+        board=board,
+    )
+    if type(attachment_id) is not int or attachment_id <= 0:
+        raise ValueError("invalid attachment id")
+    _advance_task_version(context, task_id, board)
+    return {
+        "task_id": task_id,
+        "attachment_id": attachment_id,
+        "filename": filename,
+        "size": len(data),
+    }
+
+
+def _validate_attach_url_payload(
+    payload: dict[str, Any],
+) -> tuple[str, str, str | None, str | None, str]:
+    allowed_fields = {"task_id", "url", "filename", "content_type", "board"}
+    unknown = set(payload.keys()) - allowed_fields
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    task_id = payload.get("task_id")
+    url = payload.get("url")
+    filename = payload.get("filename")
+    content_type = payload.get("content_type")
+    board = payload.get("board")
+    for field_name, value in (
+        ("task_id", task_id),
+        ("url", url),
+        ("board", board),
+    ):
+        if type(value) is not str or not value.strip():
+            raise ValueError(f"{field_name} must be a nonblank string")
+    for field_name, value in (
+        ("filename", filename),
+        ("content_type", content_type),
+    ):
+        if value is not None and (type(value) is not str or not value.strip()):
+            raise ValueError(f"{field_name} must be None or a nonblank string")
+    return (
+        task_id.strip(),
+        url.strip(),
+        filename.strip() if filename is not None else None,
+        content_type.strip() if content_type is not None else None,
+        board.strip(),
+    )
+
+
+def _prepare_attach_url_payload(payload: dict[str, Any]) -> PreparedAttachment:
+    _, url, filename, content_type, _ = _validate_attach_url_payload(payload)
+    return prepare_url_attachment(
+        url,
+        filename=filename,
+        content_type=content_type,
+    )
+
+
+def _handle_attach_url(context: Any) -> dict[str, Any]:
+    task_id, _, _, _, board = _validate_attach_url_payload(context.payload)
+    if type(context.prepared_attachment) is not PreparedAttachment:
+        raise ValueError("prepared_attachment must be a PreparedAttachment")
+    prepared = context.prepared_attachment
+
+    _load_versioned_task(context, task_id, board)
+    attachment_id = context.mutation_executor._attach_in_active_transaction(
+        context.capability,
+        context.binding,
+        task_id=task_id,
+        filename=prepared.filename,
+        data=prepared.data,
+        content_type=prepared.content_type,
+        board=board,
+    )
+    if type(attachment_id) is not int or attachment_id <= 0:
+        raise ValueError("invalid attachment id")
+    row = context.connection.execute(
+        "SELECT filename FROM task_attachments WHERE id = ? AND task_id = ?",
+        (attachment_id, task_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("attachment metadata not found")
+    _advance_task_version(context, task_id, board)
+    return {
+        "task_id": task_id,
+        "attachment_id": attachment_id,
+        "filename": row["filename"],
+        "size": len(prepared.data),
+    }
 
 
 def _handle_create(context: Any) -> dict[str, Any]:
@@ -2207,6 +2453,7 @@ class _CommandContext:
         binding: Any = None,
         mutation_executor: Any = None,
         known_profiles: frozenset[str] = frozenset(),
+        prepared_attachment: PreparedAttachment | None = None,
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -2216,6 +2463,7 @@ class _CommandContext:
         self.binding = binding
         self.mutation_executor = mutation_executor
         self.known_profiles = known_profiles
+        self.prepared_attachment = prepared_attachment
 
 
 class _CommandBoundary:
@@ -2395,6 +2643,10 @@ class _CommandBoundary:
                     raise _ConflictError()
                 return json.loads(row["response_json"])
 
+            prepared_attachment = None
+            if action == "kanban_attach_url":
+                prepared_attachment = _prepare_attach_url_payload(payload)
+
             if derive_expected_version:
                 if self._state_resolver is None:
                     raise TypeError("state_resolver is required")
@@ -2466,6 +2718,7 @@ class _CommandBoundary:
                     binding=binding,
                     mutation_executor=adapter,
                     known_profiles=self._known_profiles,
+                    prepared_attachment=prepared_attachment,
                 )
                 try:
                     result = handler(context)
@@ -2558,7 +2811,12 @@ __all__ = [
     "RECOGNIZED_OPERATIONS",
     "command_boundary",
     "_CommandBoundary",
+    "_handle_attach",
+    "_handle_attach_url",
     "_handle_block",
+    "_handle_show",
+    "_handle_list",
+    "_handle_attachments",
     "_handle_comment",
     "_handle_create",
     "_handle_heartbeat",

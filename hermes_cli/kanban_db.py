@@ -4833,6 +4833,7 @@ def store_attachment_bytes(
     uploaded_by: Optional[str] = None,
     board: Optional[str] = None,
     max_bytes: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> int:
     """Validate, size-check, persist a blob, and record its metadata row.
 
@@ -4851,6 +4852,8 @@ def store_attachment_bytes(
     after the blob is written (e.g. the task disappeared) the orphaned blob
     is removed before re-raising.
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if max_bytes is None:
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
     if len(data) > max_bytes:
@@ -4871,6 +4874,7 @@ def store_attachment_bytes(
             content_type=content_type,
             size=len(data),
             uploaded_by=uploaded_by,
+            _allow_nested=_allow_nested,
         )
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
@@ -4891,6 +4895,7 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    _allow_nested: bool = False,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -4898,12 +4903,14 @@ def add_attachment(
     first (under :func:`task_attachments_dir`); this only persists the
     metadata row and appends an ``attached`` event.
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if not filename or not filename.strip():
         raise ValueError("attachment filename is required")
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
