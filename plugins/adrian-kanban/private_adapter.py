@@ -196,6 +196,37 @@ class _RequestReviewArgs:
             raise _PrivateAdapterRejected("with_reason must be a bool")
 
 
+@dataclass(frozen=True)
+class _LaunchTaskArgs:
+    task_id: str
+    expected_assignee: str
+    board: Optional[str] = None
+    ttl_seconds: Optional[int] = None
+    failure_limit: int = _kb.DEFAULT_SPAWN_FAILURE_LIMIT
+
+    def __post_init__(self) -> None:
+        if not _is_nonblank_str(self.task_id):
+            raise _PrivateAdapterRejected("task_id must be a nonblank string")
+        if not _is_nonblank_str(self.expected_assignee):
+            raise _PrivateAdapterRejected(
+                "expected_assignee must be a nonblank string"
+            )
+        if self.board is not None and not (
+            _is_exact_str(self.board) and self.board.strip() != ""
+        ):
+            raise _PrivateAdapterRejected(
+                "board must be None or a nonblank string"
+            )
+        if not _is_optional_positive_int(self.ttl_seconds):
+            raise _PrivateAdapterRejected(
+                "ttl_seconds must be None or a positive integer"
+            )
+        if not _is_positive_int(self.failure_limit):
+            raise _PrivateAdapterRejected(
+                "failure_limit must be a positive integer"
+            )
+
+
 _OPERATION_ARGUMENT_TYPES = MappingProxyType(
     {
         "kanban_complete": _CompleteTaskArgs,
@@ -205,13 +236,18 @@ _OPERATION_ARGUMENT_TYPES = MappingProxyType(
         "kanban_heartbeat": _HeartbeatArgs,
         "kanban_request_changes": _RequestChangesArgs,
         "kanban_request_review": _RequestReviewArgs,
+        "kanban_launch": _LaunchTaskArgs,
     }
 )
 
 
 class _PrivateNativeAdapter:
     def __init__(
-        self, provider: AdrianKanbanAuthorityProvider, conn: sqlite3.Connection
+        self,
+        provider: AdrianKanbanAuthorityProvider,
+        conn: sqlite3.Connection,
+        *,
+        spawn_fn: Optional[Any] = None,
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise _PrivateAdapterRejected(
@@ -219,8 +255,11 @@ class _PrivateNativeAdapter:
             )
         if type(conn) is not sqlite3.Connection:
             raise _PrivateAdapterRejected("conn must be a sqlite3.Connection")
+        if spawn_fn is not None and not callable(spawn_fn):
+            raise _PrivateAdapterRejected("spawn_fn must be None or callable")
         self._provider = provider
         self._conn = conn
+        self._spawn_fn = spawn_fn
 
     def execute(
         self, capability: Any, binding: CapabilityBinding, arguments: Any
@@ -242,6 +281,24 @@ class _PrivateNativeAdapter:
             raise _PrivateAdapterRejected(
                 "binding.target does not match arguments.task_id"
             )
+
+        if operation == "kanban_launch":
+            with _capability_scope(
+                self._provider,
+                self._conn,
+                capability,
+                binding,
+                allow_multiple_writes=True,
+            ):
+                return _kb._launch_admitted_task(
+                    self._conn,
+                    arguments.task_id,
+                    expected_assignee=arguments.expected_assignee,
+                    spawn_fn=self._spawn_fn,
+                    ttl_seconds=arguments.ttl_seconds,
+                    failure_limit=arguments.failure_limit,
+                    board=arguments.board,
+                )
 
         with _capability_scope(
             self._provider, self._conn, capability, binding
@@ -299,5 +356,4 @@ class _PrivateNativeAdapter:
                     force=arguments.force,
                     with_reason=arguments.with_reason,
                 )
-
         raise _PrivateAdapterRejected("unreachable")

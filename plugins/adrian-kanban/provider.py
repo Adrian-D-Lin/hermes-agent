@@ -80,18 +80,23 @@ class AdrianKanbanAuthorityProvider:
 
 
 @contextlib.contextmanager
-def _capability_scope(provider, conn, capability, context):
+def _capability_scope(
+    provider, conn, capability, context, *, allow_multiple_writes: bool = False
+):
     if type(provider) is not AdrianKanbanAuthorityProvider:
         raise CapabilityRejected("provider type mismatch")
     if type(conn) is not sqlite3.Connection:
         raise CapabilityRejected("connection type mismatch")
     if not provider.is_healthy():
         raise CapabilityRejected("provider is unhealthy")
+    if type(allow_multiple_writes) is not bool:
+        raise CapabilityRejected("allow_multiple_writes must be a bool")
     with _kb._scoped_authority_capability(
         conn,
         capability,
         context,
         db_path=provider.database_path,
+        allow_multiple_writes=allow_multiple_writes,
     ) as scoped_conn:
         yield scoped_conn
 

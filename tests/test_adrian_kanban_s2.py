@@ -65,6 +65,7 @@ def provider_modules():
         "capability": importlib.import_module(f"{name}.capability"),
         "contracts": importlib.import_module(f"{name}.contracts"),
         "diagnostics": importlib.import_module(f"{name}.diagnostics"),
+        "dispatcher": importlib.import_module(f"{name}.dispatcher"),
         "journal": importlib.import_module(f"{name}.journal"),
         "lifecycle": importlib.import_module(f"{name}.lifecycle"),
         "policy": importlib.import_module(f"{name}.policy"),
@@ -820,6 +821,7 @@ def test_private_adapter_is_closed_typed_and_not_publicly_imported(provider_modu
         "kanban_heartbeat",
         "kanban_request_changes",
         "kanban_request_review",
+        "kanban_launch",
     }
     assert set(adapter_mod._OPERATION_ARGUMENT_TYPES) == expected
     assert adapter_mod.__all__ == ()
@@ -3022,25 +3024,25 @@ def test_h05_cold_hydration_rejects_noncanonical_or_extra_payload(
     conn.close()
 
 
-def _policy_snapshot(provider_modules, step="D2"):
+def _policy_snapshot(provider_modules, step="D2", initiative_id="I1"):
     contracts = provider_modules["contracts"]
     if step == "D2":
         return contracts.expand_contract(
             step=step,
-            initiative_id="I1",
+            initiative_id=initiative_id,
             baseline_refs=("baseline",),
             governing_source_refs=("canon",),
         )
     if step == "D4.1":
         return contracts.expand_contract(
             step=step,
-            initiative_id="I1",
+            initiative_id=initiative_id,
             baseline_refs=("baseline",),
             prior_record_refs=("record",),
         )
     return contracts.expand_contract(
         step=step,
-        initiative_id="I1",
+        initiative_id=initiative_id,
         baseline_refs=("baseline",),
         prior_record_refs=("record",),
         predecessor_ref="handoff:D4.1",
@@ -3373,6 +3375,472 @@ def test_policy_fact_types_are_frozen_strict_and_model_agnostic(provider_modules
     with pytest.raises(policy.PolicyInputRejected):
         policy.ExecutionLaunchDecision(True, record.task_id, "profile", object())
     assert "model_name" not in policy.ExecutionLaunchFacts.__annotations__
+
+
+def _staged_dispatch_database(provider_modules, tmp_path, monkeypatch):
+    """Create one shared native/plugin database before selecting plugin authority."""
+    database_path = (tmp_path / "authority" / "kanban.db").resolve()
+    database_path.parent.mkdir()
+    conn = sqlite3.connect(str(database_path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(kb.SCHEMA_SQL)
+    provider_modules["schema"].create_schema(conn)
+    conn.execute(
+        "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES (?)",
+        ("I1",),
+    )
+    initiative_card_id = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('initiative', 'I1', NULL, 'Initiative', 1)"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO initiative_transitions "
+        "(initiative_card_id, initiative_id, transition_id, to_phase, "
+        "actor_evidence, created_at) VALUES (?, 'I1', 1, 'D2', 'test', 2)",
+        (initiative_card_id,),
+    )
+    _select_plugin_authority(tmp_path, monkeypatch, database_path)
+    provider = provider_modules["provider"].AdrianKanbanAuthorityProvider(
+        str(database_path)
+    )
+    kb.clear_authority_providers()
+    provider_modules["provider"].register_provider(provider)
+    return conn, provider
+
+
+def _insert_dispatch_task(
+    provider_modules,
+    conn,
+    tmp_path,
+    *,
+    task_id,
+    status="ready",
+    assignee="independent-reviewer",
+    priority=0,
+    attach_contract=True,
+    initiative_id="I1",
+    step="D2",
+):
+    workspace = tmp_path / task_id.replace(":", "-")
+    workspace.mkdir()
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, assignee, status, priority, created_at, workspace_kind, "
+        "workspace_path) VALUES (?, ?, ?, ?, ?, 10, 'dir', ?)",
+        (task_id, task_id, assignee, status, priority, str(workspace)),
+    )
+    if not attach_contract:
+        return None
+    conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('task', ?, ?, ?, 10)",
+        (initiative_id, task_id, task_id),
+    )
+    record = provider_modules["lifecycle"].LifecycleContractRepository(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    attached = record.attach(
+        task_id=task_id,
+        snapshot=_policy_snapshot(
+            provider_modules, step=step, initiative_id=initiative_id
+        ),
+        skill=_skill_binding(provider_modules),
+        created_at=11,
+    )
+    conn.commit()
+    return attached
+
+
+def _dispatch_attempt(
+    provider_modules,
+    record,
+    *,
+    attempt_id="dispatch-1",
+    predecessor=None,
+):
+    dispatcher = provider_modules["dispatcher"]
+    return dispatcher._DispatchAttempt(
+        attempt_id=attempt_id,
+        task_id=record.task_id,
+        dispatcher_session_id="dispatcher-session-1",
+        compatibility=_compatibility(provider_modules, record),
+        predecessor=predecessor,
+        workspace=None,
+        board="default",
+    )
+
+
+def test_h11_dispatcher_launches_only_policy_selected_task_and_preserves_native_lineage(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:D2", priority=1
+    )
+    _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="legacy-higher-priority",
+        priority=999,
+        attach_contract=False,
+    )
+    spawned = []
+
+    def spawn(task, workspace, *, board=None, worker_session_id=None):
+        spawned.append((task.id, workspace, board, worker_session_id, task.current_run_id))
+        return 4242
+
+    try:
+        outcome = dispatcher._LifecycleDispatcher(
+            provider, conn, spawn_fn=spawn
+        ).dispatch(_dispatch_attempt(provider_modules, record))
+
+        assert outcome.decision.admitted is True
+        assert outcome.native.state == "launched"
+        assert spawned[0][0] == "task:D2"
+        assert spawned[0][2] == "default"
+        assert spawned[0][3]
+        assert type(spawned[0][4]) is int
+        selected = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = 'task:D2'"
+        ).fetchone()
+        untouched = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks "
+            "WHERE id = 'legacy-higher-priority'"
+        ).fetchone()
+        run = conn.execute(
+            "SELECT task_id, profile, status, worker_pid, worker_session_id "
+            "FROM task_runs WHERE id = ?",
+            (selected["current_run_id"],),
+        ).fetchone()
+        assert tuple(selected) == ("running", 4242, selected["current_run_id"])
+        assert tuple(untouched) == ("ready", None, None)
+        assert tuple(run[:4]) == (
+            "task:D2",
+            "independent-reviewer",
+            "running",
+            4242,
+        )
+        assert run["worker_session_id"] == spawned[0][3]
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u09_dispatcher_rejection_makes_no_native_claim_or_launch_state(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:D2"
+    )
+    conn.execute(
+        "UPDATE initiative_transitions SET to_phase = 'D1' WHERE initiative_id = 'I1'"
+    )
+    spawned = []
+
+    try:
+        outcome = dispatcher._LifecycleDispatcher(
+            provider, conn, spawn_fn=lambda *a, **k: spawned.append(a)
+        ).dispatch(_dispatch_attempt(provider_modules, record))
+
+        assert outcome.decision.admitted is False
+        assert outcome.native is None
+        assert _diagnostic_codes(outcome.decision)[0] == [
+            "INITIATIVE_PHASE_MISMATCH"
+        ]
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = 'task:D2'"
+        ).fetchone()
+        assert tuple(row) == ("ready", None, None)
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        assert spawned == []
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_f04_dispatcher_profile_lane_counts_only_active_lifecycle_contracts(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    first = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:first"
+    )
+    second = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:second"
+    )
+    _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="legacy-running",
+        status="running",
+        attach_contract=False,
+    )
+
+    try:
+        engine = dispatcher._LifecycleDispatcher(
+            provider, conn, spawn_fn=lambda *a, **k: 5151
+        )
+        first_outcome = engine.dispatch(
+            _dispatch_attempt(provider_modules, first, attempt_id="dispatch-first")
+        )
+        second_outcome = engine.dispatch(
+            _dispatch_attempt(provider_modules, second, attempt_id="dispatch-second")
+        )
+
+        assert first_outcome.decision.admitted is True
+        assert second_outcome.decision.admitted is False
+        assert _diagnostic_codes(second_outcome.decision)[0] == [
+            "PROFILE_LANE_OCCUPIED"
+        ]
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id = 'task:second'"
+        ).fetchone()[0] == "ready"
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_f04_concurrent_same_profile_dispatch_has_one_winner(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    first = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:race-first"
+    )
+    second = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:race-second"
+    )
+    attempts = (
+        _dispatch_attempt(provider_modules, first, attempt_id="race-first"),
+        _dispatch_attempt(provider_modules, second, attempt_id="race-second"),
+    )
+    original_policy = dispatcher.evaluate_execution_launch
+    policy_barrier = threading.Barrier(2)
+
+    def synchronized_policy(record, facts):
+        try:
+            policy_barrier.wait(timeout=0.25)
+        except threading.BrokenBarrierError:
+            pass
+        return original_policy(record, facts)
+
+    monkeypatch.setattr(
+        dispatcher, "evaluate_execution_launch", synchronized_policy
+    )
+    outcomes = []
+    errors = []
+
+    def run(attempt, pid):
+        thread_conn = sqlite3.connect(
+            str(provider.database_path), isolation_level=None
+        )
+        thread_conn.row_factory = sqlite3.Row
+        try:
+            engine = dispatcher._LifecycleDispatcher(
+                provider, thread_conn, spawn_fn=lambda *a, **k: pid
+            )
+            outcomes.append(engine.dispatch(attempt))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            thread_conn.close()
+
+    threads = [
+        threading.Thread(target=run, args=(attempts[0], 6101)),
+        threading.Thread(target=run, args=(attempts[1], 6102)),
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert sum(
+            outcome.native is not None and outcome.native.state == "launched"
+            for outcome in outcomes
+        ) == 1
+        assert all(type(exc) is dispatcher._DispatcherRejected for exc in errors)
+        states = conn.execute(
+            "SELECT status, COUNT(*) FROM tasks "
+            "WHERE id IN ('task:race-first', 'task:race-second') "
+            "GROUP BY status ORDER BY status"
+        ).fetchall()
+        assert [tuple(row) for row in states] == [("ready", 1), ("running", 1)]
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 1
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_f04_different_profiles_are_not_globally_serialized(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    policy = provider_modules["policy"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    first = _insert_dispatch_task(
+        provider_modules, conn, tmp_path, task_id="task:profile-a"
+    )
+
+    conn.execute(
+        "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES ('I2')"
+    )
+    initiative_card_id = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('initiative', 'I2', NULL, 'Initiative 2', 1)"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO initiative_transitions "
+        "(initiative_card_id, initiative_id, transition_id, to_phase, "
+        "actor_evidence, created_at) VALUES (?, 'I2', 1, 'D4', 'test', 2)",
+        (initiative_card_id,),
+    )
+    second = _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="task:profile-b",
+        assignee="test-authority-reviewer",
+        initiative_id="I2",
+        step="D4.2",
+    )
+    predecessor = policy.PredecessorEvidence(
+        reference="handoff:D4.1",
+        evidence_kind="accepted_handoff",
+        initiative_id="I2",
+        accepted=True,
+    )
+    attempts = (
+        _dispatch_attempt(provider_modules, first, attempt_id="profile-a"),
+        _dispatch_attempt(
+            provider_modules,
+            second,
+            attempt_id="profile-b",
+            predecessor=predecessor,
+        ),
+    )
+    spawn_barrier = threading.Barrier(2, timeout=3)
+    outcomes = []
+    errors = []
+
+    def spawn(task, workspace, *, board=None, worker_session_id=None):
+        spawn_barrier.wait()
+        return 7101 if task.id == "task:profile-a" else 7102
+
+    def run(attempt):
+        thread_conn = sqlite3.connect(
+            str(provider.database_path), isolation_level=None
+        )
+        thread_conn.row_factory = sqlite3.Row
+        try:
+            outcomes.append(
+                dispatcher._LifecycleDispatcher(
+                    provider, thread_conn, spawn_fn=spawn
+                ).dispatch(attempt)
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            thread_conn.close()
+
+    threads = [threading.Thread(target=run, args=(attempt,)) for attempt in attempts]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(outcomes) == 2
+        assert all(
+            outcome.native is not None and outcome.native.state == "launched"
+            for outcome in outcomes
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND id IN "
+            "('task:profile-a', 'task:profile-b')"
+        ).fetchone()[0] == 2
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u09_dispatcher_rejects_unassigned_task_before_capability_mint(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record = _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="task:unassigned",
+        assignee=None,
+    )
+    try:
+        with pytest.raises(dispatcher._DispatcherRejected, match="unassigned"):
+            dispatcher._LifecycleDispatcher(provider, conn).dispatch(
+                _dispatch_attempt(provider_modules, record)
+            )
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id = 'task:unassigned'"
+        ).fetchone()[0] == "ready"
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u04_raw_native_dispatch_remains_closed_under_plugin_authority(
+    provider_modules, tmp_path, monkeypatch
+):
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    _insert_dispatch_task(
+        provider_modules,
+        conn,
+        tmp_path,
+        task_id="legacy-ready",
+        attach_contract=False,
+    )
+    try:
+        with pytest.raises(kb.AuthorityAdmissionRejected, match="fails closed"):
+            kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 9191)
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = 'legacy-ready'"
+        ).fetchone()
+        assert tuple(row) == ("ready", None)
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+        assert provider.is_healthy() is True
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
 
 
 def test_h12_actor_adapter_validates_live_opaque_evidence_and_renders_durable_form(
