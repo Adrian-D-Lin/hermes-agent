@@ -30,6 +30,7 @@ from .handoffs import (
     validate_candidate_metadata,
 )
 from .initiative_mutations import (
+    _handle_close_initiative,
     _handle_create_initiative,
     _handle_transition_initiative,
     _handle_update_initiative,
@@ -2843,6 +2844,7 @@ __all__ = [
     "_handle_heartbeat",
     "_handle_link",
     "_handle_unblock",
+    "_handle_close_initiative",
     "_handle_create_initiative",
     "_handle_update_initiative",
     "_handle_transition_initiative",
