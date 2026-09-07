@@ -842,6 +842,141 @@ TOOL_SCHEMAS: dict[str, Any] = {
 TOOL_SCHEMAS = MappingProxyType(dict(TOOL_SCHEMAS))
 
 
+def _handle_create(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    allowed_fields = {
+        "task_id",
+        "initiative_id",
+        "title",
+        "assignee",
+        "body",
+        "parents",
+        "tenant",
+        "priority",
+        "workspace_kind",
+        "workspace_path",
+        "project",
+        "goal_mode",
+        "goal_max_turns",
+        "model",
+        "provider",
+        "board",
+    }
+    unknown = set(payload.keys()) - allowed_fields
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    task_id = payload.get("task_id")
+    initiative_id = payload.get("initiative_id")
+    title = payload.get("title")
+    assignee = payload.get("assignee")
+
+    for field_name, value in (
+        ("task_id", task_id),
+        ("initiative_id", initiative_id),
+        ("title", title),
+        ("assignee", assignee),
+    ):
+        if not (type(value) is str and value.strip()):
+            raise ValueError(f"{field_name} must be a nonblank string")
+
+    task_id = task_id.strip()
+    initiative_id = initiative_id.strip()
+    title = title.strip()
+    assignee = assignee.strip()
+
+    if "parents" not in payload:
+        parents: tuple[str, ...] = ()
+    else:
+        parents_raw = payload["parents"]
+        if parents_raw is None:
+            raise ValueError("parents must be a list")
+        if type(parents_raw) is not list:
+            raise ValueError("parents must be a list")
+        seen = set()
+        converted = []
+        for item in parents_raw:
+            if not (type(item) is str and item.strip()):
+                raise ValueError("parents must contain nonblank strings")
+            item = item.strip()
+            if item in seen:
+                raise ValueError("parents must not contain duplicates")
+            seen.add(item)
+            converted.append(item)
+        parents = tuple(converted)
+
+    for parent_id in parents:
+        parent_row = context.connection.execute(
+            "SELECT card_type, task_id, initiative_id FROM adrian_kanban_cards "
+            "WHERE task_id = ?",
+            (parent_id,),
+        ).fetchone()
+        if (
+            parent_row is None
+            or parent_row["card_type"] != "task"
+            or parent_row["task_id"] != parent_id
+        ):
+            raise ValueError(f"parent task card not found: {parent_id}")
+        parent_initiative_id = parent_row["initiative_id"]
+        parent_initiative_row = context.connection.execute(
+            "SELECT card_type, task_id FROM adrian_kanban_cards "
+            "WHERE initiative_id = ? AND task_id IS NULL",
+            (parent_initiative_id,),
+        ).fetchone()
+        if (
+            parent_initiative_row is None
+            or parent_initiative_row["card_type"] != "initiative"
+        ):
+            raise ValueError(
+                f"parent initiative card not found: {parent_initiative_id}"
+            )
+
+    row = context.connection.execute(
+        "SELECT card_type, task_id FROM adrian_kanban_cards "
+        "WHERE initiative_id = ? AND task_id IS NULL",
+        (initiative_id,),
+    ).fetchone()
+    if row is None or row["card_type"] != "initiative":
+        raise ValueError("initiative card not found")
+
+    kwargs: dict[str, Any] = {
+        "task_id": task_id,
+        "title": title,
+        "assignee": assignee,
+        "parents": parents,
+    }
+    for optional_field in (
+        "body",
+        "tenant",
+        "priority",
+        "workspace_kind",
+        "workspace_path",
+        "project",
+        "goal_mode",
+        "goal_max_turns",
+        "model",
+        "provider",
+        "board",
+    ):
+        if optional_field in payload:
+            kwargs[optional_field] = payload[optional_field]
+
+    context.mutation_executor._create_in_active_transaction(
+        context.capability,
+        context.binding,
+        **kwargs,
+    )
+
+    context.connection.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('task', ?, ?, ?, ?)",
+        (initiative_id, task_id, title, int(time.time())),
+    )
+
+    return {"initiative_id": initiative_id, "task_id": task_id}
+
+
 def _handle_link(context: Any) -> dict[str, Any]:
     parent_id = context.payload.get("parent_id")
     child_id = context.payload.get("child_id")
