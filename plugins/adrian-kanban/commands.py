@@ -12,6 +12,7 @@ from typing import Any
 
 from .attachments import PreparedAttachment, prepare_url_attachment
 from .capability import CapabilityBinding
+from .contracts import ContractSnapshot, expand_contract, template_for
 from .diagnostics import (
     Boundary,
     DiagnosticCollector,
@@ -35,7 +36,14 @@ from .initiative_mutations import (
     _handle_transition_initiative,
     _handle_update_initiative,
 )
+from .lifecycle import LifecycleContractRepository
 from .projections import attachments_projection, list_projection, show_projection
+from .skill_bundle import resolve_skill_binding, skill_contract, validate_skill_bundle
+from .task_inputs import (
+    PreparedManifest,
+    finalize_task_input_manifest,
+    validate_contract_input_coverage,
+)
 
 # Public operation taxonomy. These sets are frozen by the ratified Canon
 # operation map and are consumed verbatim by every later S3 slice.
@@ -1149,6 +1157,75 @@ def _handle_attach_url(context: Any) -> dict[str, Any]:
     }
 
 
+def _validate_lifecycle_predecessor(
+    connection: sqlite3.Connection,
+    initiative_card_id: int,
+    lifecycle_snapshot: ContractSnapshot,
+) -> None:
+    predecessor_ref = lifecycle_snapshot.predecessor_ref
+    if predecessor_ref is None:
+        raise ValueError("predecessor_ref is required")
+    if lifecycle_snapshot.sequence_ordinal is None:
+        raise ValueError("sequence is required")
+    template = template_for(lifecycle_snapshot.step)
+    if template.sequence is None or template.sequence.predecessor_step is None:
+        raise ValueError("expected predecessor_step is required")
+    expected_step = template.sequence.predecessor_step
+    release_condition = lifecycle_snapshot.release_condition
+    if release_condition == "accepted_completion":
+        row = connection.execute(
+            "SELECT 1 FROM task_reviewer_verdicts v "
+            "JOIN task_candidate_handoffs h ON h.candidate_id = v.candidate_id "
+            "AND h.task_card_id = v.task_card_id AND h.task_id = v.task_id "
+            "JOIN task_lifecycle_contracts c ON c.task_card_id = h.task_card_id "
+            "AND c.task_id = h.task_id "
+            "WHERE h.candidate_id = ? "
+            "AND h.task_card_id = c.task_card_id "
+            "AND h.task_id = c.task_id "
+            "AND c.initiative_card_id = ? "
+            "AND c.initiative_id = ? "
+            "AND c.segment_id IS ? "
+            "AND c.step = ? "
+            "AND v.verdict = 'accepted'",
+            (
+                predecessor_ref,
+                initiative_card_id,
+                lifecycle_snapshot.initiative_id,
+                lifecycle_snapshot.segment_id,
+                expected_step,
+            ),
+        ).fetchone()
+        if row is None:
+            raise ValueError("accepted_completion predecessor not found")
+    elif release_condition == "initiative_checkpoint":
+        row = connection.execute(
+            "SELECT canonical_payload FROM initiative_phase_results "
+            "WHERE result_id = ? "
+            "AND initiative_card_id = ? "
+            "AND initiative_id = ? "
+            "AND phase = ? "
+            "AND segment_id IS ? "
+            "AND accepted = 1",
+            (
+                predecessor_ref,
+                initiative_card_id,
+                lifecycle_snapshot.initiative_id,
+                lifecycle_snapshot.phase,
+                lifecycle_snapshot.segment_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise ValueError("initiative_checkpoint predecessor not found")
+        try:
+            payload = json.loads(row["canonical_payload"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("initiative_checkpoint payload is not valid JSON") from exc
+        if type(payload) is not dict or payload.get("step") != expected_step:
+            raise ValueError("initiative_checkpoint step mismatch")
+    else:
+        raise ValueError("unknown release condition")
+
+
 def _handle_create(context: Any) -> dict[str, Any]:
     payload = context.payload
     allowed_fields = {
@@ -1169,6 +1246,8 @@ def _handle_create(context: Any) -> dict[str, Any]:
         "model",
         "provider",
         "board",
+        "lifecycle_contract_v1",
+        "task_input_manifest_v1",
     }
     unknown = set(payload.keys()) - allowed_fields
     if unknown:
@@ -1180,6 +1259,7 @@ def _handle_create(context: Any) -> dict[str, Any]:
     assignee = payload.get("assignee")
     board = payload.get("board")
     raw_handoff_requirements = payload.get("handoff_requirements_v1")
+    raw_lifecycle_contract = payload.get("lifecycle_contract_v1")
 
     for field_name, value in (
         ("task_id", task_id),
@@ -1207,6 +1287,149 @@ def _handle_create(context: Any) -> dict[str, Any]:
         )
         if assignee not in context.known_profiles:
             raise ValueError("assignee must be a known execution profile")
+
+    lifecycle_snapshot = None
+    skill_binding = None
+    if raw_lifecycle_contract is not None:
+        if type(raw_lifecycle_contract) is not dict:
+            raise ValueError("lifecycle_contract_v1 must be a dict")
+
+        required_keys = {
+            "version",
+            "step",
+            "baseline_refs",
+            "governing_source_refs",
+            "prior_record_refs",
+        }
+        optional_keys = {"segment_id", "segment_workspace_id", "predecessor_ref"}
+        allowed_keys = required_keys | optional_keys
+
+        if set(raw_lifecycle_contract.keys()) - allowed_keys:
+            raise ValueError("lifecycle_contract_v1 has unknown keys")
+        if not required_keys.issubset(raw_lifecycle_contract.keys()):
+            raise ValueError("lifecycle_contract_v1 missing required keys")
+
+        version = raw_lifecycle_contract["version"]
+        if type(version) is not int or isinstance(version, bool) or version != 1:
+            raise ValueError("lifecycle_contract_v1 version must be int 1")
+
+        step = raw_lifecycle_contract["step"]
+        if type(step) is not str or not step.strip() or step != step.strip():
+            raise ValueError(
+                "lifecycle_contract_v1 step must be a nonblank string without "
+                "surrounding whitespace"
+            )
+
+        def _validate_ref_group(name: str, value: Any) -> tuple[str, ...]:
+            if type(value) is not list:
+                raise ValueError(f"lifecycle_contract_v1 {name} must be a list")
+            seen = set()
+            for item in value:
+                if (
+                    type(item) is not str
+                    or not item.strip()
+                    or item != item.strip()
+                ):
+                    raise ValueError(
+                        f"lifecycle_contract_v1 {name} items must be nonblank "
+                        "strings without surrounding whitespace"
+                    )
+                if item in seen:
+                    raise ValueError(
+                        f"lifecycle_contract_v1 {name} must contain unique items"
+                    )
+                seen.add(item)
+            return tuple(value)
+
+        baseline_refs = _validate_ref_group(
+            "baseline_refs", raw_lifecycle_contract["baseline_refs"]
+        )
+        governing_source_refs = _validate_ref_group(
+            "governing_source_refs", raw_lifecycle_contract["governing_source_refs"]
+        )
+        prior_record_refs = _validate_ref_group(
+            "prior_record_refs", raw_lifecycle_contract["prior_record_refs"]
+        )
+
+        segment_id = raw_lifecycle_contract.get("segment_id")
+        segment_workspace_id = raw_lifecycle_contract.get("segment_workspace_id")
+        predecessor_ref = raw_lifecycle_contract.get("predecessor_ref")
+
+        for opt_name, opt_val in (
+            ("segment_id", segment_id),
+            ("segment_workspace_id", segment_workspace_id),
+            ("predecessor_ref", predecessor_ref),
+        ):
+            if opt_val is not None and (
+                type(opt_val) is not str
+                or not opt_val.strip()
+                or opt_val != opt_val.strip()
+            ):
+                raise ValueError(
+                    f"lifecycle_contract_v1 {opt_name} must be None or a "
+                    "nonblank string without surrounding whitespace"
+                )
+
+        if (segment_id is None) != (segment_workspace_id is None):
+            raise ValueError(
+                "lifecycle_contract_v1 segment_id and segment_workspace_id must "
+                "both be set or both null"
+            )
+
+        try:
+            lifecycle_snapshot = expand_contract(
+                step=step,
+                initiative_id=initiative_id,
+                baseline_refs=baseline_refs,
+                governing_source_refs=governing_source_refs,
+                prior_record_refs=prior_record_refs,
+                segment_id=segment_id,
+                segment_workspace_id=segment_workspace_id,
+                predecessor_ref=predecessor_ref,
+            )
+        except Exception as exc:
+            raise ValueError(f"lifecycle contract expansion failed: {exc}") from exc
+
+        if payload.get("goal_mode") is not True:
+            raise ValueError("lifecycle-governed tasks require goal_mode to be true")
+        if handoff_requirements is None:
+            raise ValueError(
+                "lifecycle-governed tasks require handoff_requirements_v1"
+            )
+        if type(context.prepared_manifest) is not PreparedManifest:
+            raise ValueError("lifecycle-governed tasks require a prepared manifest")
+
+        try:
+            validate_contract_input_coverage(
+                lifecycle_snapshot, context.prepared_manifest
+            )
+        except ValueError as exc:
+            raise ValueError(f"lifecycle reference coverage failed: {exc}") from exc
+
+        if not validate_skill_bundle():
+            raise ValueError("skill bundle validation failed")
+
+        skill_binding = resolve_skill_binding(lifecycle_snapshot.phase)
+        expected_contract_id, expected_contract_version = skill_contract(
+            lifecycle_snapshot.phase
+        )
+        if lifecycle_snapshot.contract_id != expected_contract_id:
+            raise ValueError("skill contract ID mismatch")
+        if str(lifecycle_snapshot.contract_version) != expected_contract_version:
+            raise ValueError("skill contract version mismatch")
+
+        body = payload.get("body")
+        if type(body) is not str:
+            raise ValueError("lifecycle-governed tasks require a string body")
+
+        required_lines = [f"initiative_id: {initiative_id}", f"step: {step}"]
+        if segment_id is not None:
+            required_lines.append(f"segment_id: {segment_id}")
+
+        body_lines = set(body.splitlines())
+        for line in required_lines:
+            if line not in body_lines:
+                raise ValueError(f"body must contain exact line: {line}")
 
     if "parents" not in payload:
         parents: tuple[str, ...] = ()
@@ -1258,12 +1481,54 @@ def _handle_create(context: Any) -> dict[str, Any]:
             )
 
     row = context.connection.execute(
-        "SELECT card_type, task_id, board_slug FROM adrian_kanban_cards "
+        "SELECT id, card_type, task_id, board_slug FROM adrian_kanban_cards "
         "WHERE initiative_id = ? AND task_id IS NULL",
         (initiative_id,),
     ).fetchone()
     if row is None or row["card_type"] != "initiative" or row["board_slug"] != board:
         raise ValueError("initiative card not found")
+    initiative_card_id = row["id"]
+
+    if lifecycle_snapshot is not None:
+        if assignee != lifecycle_snapshot.execution_profile:
+            raise ValueError("assignee does not match lifecycle execution profile")
+
+        transition_row = context.connection.execute(
+            "SELECT to_phase, to_segment_id FROM initiative_transitions "
+            "WHERE initiative_card_id = ? ORDER BY transition_id DESC LIMIT 1",
+            (initiative_card_id,),
+        ).fetchone()
+        if transition_row is None:
+            raise ValueError("initiative has no transitions")
+        if transition_row["to_phase"] != lifecycle_snapshot.phase:
+            raise ValueError("initiative phase does not match lifecycle snapshot")
+        if transition_row["to_segment_id"] != lifecycle_snapshot.segment_id:
+            raise ValueError("initiative segment does not match lifecycle snapshot")
+
+        if lifecycle_snapshot.segment_id is not None:
+            workspace_row = context.connection.execute(
+                "SELECT workspace_id, initiative_card_id, initiative_id, "
+                "segment_id, active, lifecycle_state FROM segment_workspaces "
+                "WHERE workspace_id = ?",
+                (lifecycle_snapshot.segment_workspace_id,),
+            ).fetchone()
+            if workspace_row is None:
+                raise ValueError("segment workspace not found")
+            if workspace_row["initiative_card_id"] != initiative_card_id:
+                raise ValueError("segment workspace initiative card mismatch")
+            if workspace_row["initiative_id"] != initiative_id:
+                raise ValueError("segment workspace initiative mismatch")
+            if workspace_row["segment_id"] != lifecycle_snapshot.segment_id:
+                raise ValueError("segment workspace segment mismatch")
+            if workspace_row["active"] != 1:
+                raise ValueError("segment workspace is not active")
+            if workspace_row["lifecycle_state"] != "active":
+                raise ValueError("segment workspace lifecycle state is not active")
+
+        if lifecycle_snapshot.predecessor_ref is not None:
+            _validate_lifecycle_predecessor(
+                context.connection, initiative_card_id, lifecycle_snapshot
+            )
 
     kwargs: dict[str, Any] = {
         "task_id": task_id,
@@ -1300,11 +1565,11 @@ def _handle_create(context: Any) -> dict[str, Any]:
         "VALUES ('task', ?, ?, ?, ?, ?, 0)",
         (initiative_id, task_id, title, int(time.time()), board),
     )
+    task_card_id = int(inserted.lastrowid or 0)
+    if task_card_id <= 0:
+        raise ValueError("unified task card identity was not created")
 
     if handoff_requirements is not None:
-        task_card_id = int(inserted.lastrowid or 0)
-        if task_card_id <= 0:
-            raise ValueError("unified task card identity was not created")
         context.connection.execute(
             "INSERT INTO task_handoff_requirements "
             "(task_card_id, task_id, version, execution_profile, reviewer, "
@@ -1319,10 +1584,87 @@ def _handle_create(context: Any) -> dict[str, Any]:
             ),
         )
 
+    if context.prepared_manifest is not None:
+        snapshot_attachment_ids = {}
+        for entry in context.prepared_manifest.entries:
+            if entry.source_kind == "snapshot_attachment":
+                if (
+                    entry.snapshot_bytes is None
+                    or entry.filename is None
+                    or entry.content_type is None
+                ):
+                    raise ValueError("snapshot entry missing required fields")
+                attachment_id = (
+                    context.mutation_executor._attach_during_create_in_active_transaction(
+                        context.capability,
+                        context.binding,
+                        task_id=task_id,
+                        filename=entry.filename,
+                        data=entry.snapshot_bytes,
+                        content_type=entry.content_type,
+                        board=board,
+                    )
+                )
+                if type(attachment_id) is not int or attachment_id <= 0:
+                    raise ValueError("invalid attachment id")
+                snapshot_attachment_ids[entry.workspace_path] = attachment_id
+
+        finalized_manifest = finalize_task_input_manifest(
+            context.prepared_manifest,
+            snapshot_attachment_ids,
+        )
+
+        context.connection.execute(
+            "INSERT INTO task_input_manifests "
+            "(task_card_id, task_id, canonical_payload, "
+            "declared_inputs_accessible, created_at) VALUES (?, ?, ?, 1, ?)",
+            (
+                task_card_id,
+                task_id,
+                finalized_manifest.canonical_payload,
+                int(time.time()),
+            ),
+        )
+
+        for entry in finalized_manifest.entries:
+            context.connection.execute(
+                "INSERT INTO task_input_entries "
+                "(task_card_id, task_id, workspace_path, sha256, source_kind, "
+                "source_locator, context_guidance) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_card_id,
+                    task_id,
+                    entry.workspace_path,
+                    entry.sha256,
+                    entry.source_kind,
+                    entry.source_locator,
+                    entry.context_guidance,
+                ),
+            )
+
+    if lifecycle_snapshot is not None:
+        repo = LifecycleContractRepository(context.connection)
+        repo.attach(
+            task_id=task_id,
+            snapshot=lifecycle_snapshot,
+            skill=skill_binding,
+            created_at=int(time.time()),
+        )
+
     return {
         "initiative_id": initiative_id,
         "task_id": task_id,
         "handoff_governed": handoff_requirements is not None,
+        **(
+            {
+                "lifecycle_governed": True,
+                "contract_id": lifecycle_snapshot.contract_id,
+                "contract_version": lifecycle_snapshot.contract_version,
+                "step": lifecycle_snapshot.step,
+            }
+            if lifecycle_snapshot is not None
+            else {}
+        ),
     }
 
 
@@ -2465,6 +2807,7 @@ class _CommandContext:
         known_profiles: frozenset[str] = frozenset(),
         prepared_attachment: PreparedAttachment | None = None,
         idempotency_key: str | None = None,
+        prepared_manifest: PreparedManifest | None = None,
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -2476,6 +2819,7 @@ class _CommandContext:
         self.known_profiles = known_profiles
         self.prepared_attachment = prepared_attachment
         self.idempotency_key = idempotency_key
+        self.prepared_manifest = prepared_manifest
 
 
 class _CommandBoundary:
@@ -2487,6 +2831,7 @@ class _CommandBoundary:
         handlers: dict[str, Any],
         state_resolver: Any = None,
         known_profiles: Any = (),
+        task_input_preparer: Any = None,
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise TypeError("provider must be an AdrianKanbanAuthorityProvider")
@@ -2494,6 +2839,8 @@ class _CommandBoundary:
             raise ValueError("database_path must be a nonblank string")
         if state_resolver is not None and not callable(state_resolver):
             raise TypeError("state_resolver must be callable or None")
+        if task_input_preparer is not None and not callable(task_input_preparer):
+            raise TypeError("task_input_preparer must be callable or None")
         if type(known_profiles) not in {tuple, frozenset, set}:
             raise TypeError("known_profiles must be a tuple, frozenset, or set")
         normalized_profiles: list[str] = []
@@ -2508,6 +2855,7 @@ class _CommandBoundary:
         self._handlers = MappingProxyType(dict(handlers))
         self._state_resolver = state_resolver
         self._known_profiles = frozenset(normalized_profiles)
+        self._task_input_preparer = task_input_preparer
 
     def submit(self, action: str, **fields: Any) -> dict[str, Any]:
         attempt_id = _resolve_attempt_id(fields)
@@ -2655,6 +3003,14 @@ class _CommandBoundary:
                     raise _ConflictError()
                 return json.loads(row["response_json"])
 
+            prepared_manifest = None
+            if "task_input_manifest_v1" in payload:
+                if self._task_input_preparer is None:
+                    raise ValueError("task_input_preparer is required")
+                prepared_manifest = self._task_input_preparer(payload)
+                if type(prepared_manifest) is not PreparedManifest:
+                    raise ValueError("task_input_preparer must return PreparedManifest")
+
             prepared_attachment = None
             if action == "kanban_attach_url":
                 prepared_attachment = _prepare_attach_url_payload(payload)
@@ -2741,6 +3097,7 @@ class _CommandBoundary:
                     known_profiles=self._known_profiles,
                     prepared_attachment=prepared_attachment,
                     idempotency_key=idempotency_key,
+                    prepared_manifest=prepared_manifest,
                 )
                 try:
                     result = handler(context)

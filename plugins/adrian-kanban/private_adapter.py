@@ -793,6 +793,40 @@ class _PrivateNativeAdapter:
         )
         return self._execute_in_active_transaction(capability, binding, args)
 
+    def _attach_during_create_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        filename: str,
+        data: bytes,
+        content_type: Optional[str] = None,
+        board: Optional[str] = None,
+    ) -> int:
+        if (
+            self._active_capability is None
+            or self._active_binding is None
+            or not self._conn.in_transaction
+        ):
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if capability is not self._active_capability:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if binding is not self._active_binding:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if binding.operation != "kanban_create" or binding.target != task_id:
+            raise _PrivateAdapterRejected("binding must target the created task")
+        if _kb.get_task(self._conn, task_id) is None:
+            raise _PrivateAdapterRejected("task does not exist")
+        args = _AttachArgs(
+            task_id=task_id,
+            filename=filename,
+            data=data,
+            content_type=content_type,
+            board=board,
+        )
+        return self._dispatch_native("kanban_attach", binding, args, allow_nested=True)
+
     @contextlib.contextmanager
     def mutation_transaction(self, capability: Any, binding: CapabilityBinding):
         if type(binding) is not CapabilityBinding:
