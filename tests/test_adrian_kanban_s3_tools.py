@@ -65,9 +65,18 @@ class _RecordingBoundary:
                 "kanban_list",
                 "kanban_attachments",
             },
-            "attempt_id": fields.get("attempt_id", "generated"),
+            "attempt_id": fields.get("attempt_id") or "generated",
             "operation": operation,
             "value": {"delegated": True},
+        }
+
+    def _rejection_internal(self, attempt_id, operation, code):
+        return {
+            "result": "REJECTED",
+            "state_changed": False,
+            "attempt_id": attempt_id,
+            "operation": operation,
+            "failed_checks": [{"code": code}],
         }
 
 
@@ -321,29 +330,168 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
 ):
     context = _RecordingContext()
     boundary = _RecordingBoundary()
-    commands_module.register_public_tools(context, boundary)
+    board_calls = []
+    version_calls = []
+
+    def board_resolver(operation, args, runtime_fields):
+        board_calls.append((operation, args, runtime_fields))
+        return ("orchestrator", "workspace-1")
+
+    def version_resolver(operation, target, board):
+        version_calls.append((operation, target, board))
+        return 7
+
+    commands_module.register_public_tools(
+        context,
+        boundary,
+        board_resolver=board_resolver,
+        version_resolver=version_resolver,
+    )
 
     for item in context.registrations:
-        supplied = {
-            "attempt_id": f"attempt-{item['name']}",
-            "sentinel": {"nested": True},
-        }
-        before = {**supplied}
+        operation = item["name"]
+        supplied = {"board": "orchestrator"}
+        if operation in commands_module.INITIATIVE_OPERATIONS:
+            supplied["initiative_id"] = "initiative-1"
+        elif operation == "kanban_link":
+            supplied.update(parent_id="task-parent", child_id="task-child")
+        elif operation in commands_module.ORDINARY_TASK_OPERATIONS:
+            supplied["task_id"] = "task-1"
+        elif operation in {"kanban_show", "kanban_attachments"}:
+            supplied["task_id"] = "task-1"
+        if operation not in commands_module.READ_ONLY_OPERATIONS:
+            supplied["attempt_id"] = f"attempt-{operation}"
+            supplied["idempotency_key"] = f"idempotency-{operation}"
+        before = dict(supplied)
 
         rendered = item["handler"](
             supplied,
-            session_id="host-session-must-not-be-blindly-merged",
+            session_id="host-session-1",
+            task_id="host-top-level-task",
+            user_task="trusted host context",
         )
 
         assert supplied == before
-        assert boundary.calls[-1] == (item["name"], before)
+        delegated_operation, fields = boundary.calls[-1]
+        assert delegated_operation == operation
+        assert fields["attempt_id"] == (
+            None
+            if operation in commands_module.READ_ONLY_OPERATIONS
+            else f"attempt-{operation}"
+        )
+        assert fields["payload"] == {
+            key: value
+            for key, value in before.items()
+            if key not in {"attempt_id", "idempotency_key"}
+        }
+        assert fields["payload"]["board"] == "orchestrator"
+        if operation in commands_module.READ_ONLY_OPERATIONS:
+            assert set(fields) == {"attempt_id", "payload"}
+        else:
+            expected_target = (
+                "initiative-1"
+                if operation in commands_module.INITIATIVE_OPERATIONS
+                else "task-child"
+                if operation == "kanban_link"
+                else "task-1"
+            )
+            assert fields == {
+                "attempt_id": f"attempt-{operation}",
+                "idempotency_key": f"idempotency-{operation}",
+                "target": expected_target,
+                "expected_version": 7,
+                "session_id": "host-session-1",
+                "workspace_id": "workspace-1",
+                "execution_context": "model-tool",
+                "payload": fields["payload"],
+            }
         assert json.loads(rendered) == {
             "result": "ACCEPTED",
-            "state_changed": item["name"] not in commands_module.READ_ONLY_OPERATIONS,
-            "attempt_id": f"attempt-{item['name']}",
-            "operation": item["name"],
+            "state_changed": operation not in commands_module.READ_ONLY_OPERATIONS,
+            "attempt_id": (
+                "generated"
+                if operation in commands_module.READ_ONLY_OPERATIONS
+                else f"attempt-{operation}"
+            ),
+            "operation": operation,
             "value": {"delegated": True},
         }
+
+    assert len(board_calls) == len(commands_module.RECOGNIZED_OPERATIONS)
+    assert len(version_calls) == len(
+        commands_module.ORDINARY_TASK_OPERATIONS
+        | commands_module.INITIATIVE_OPERATIONS
+    )
+
+
+def test_model_tool_mutation_fails_closed_without_trusted_runtime_or_resolvers(
+    commands_module,
+):
+    context = _RecordingContext()
+    boundary = _RecordingBoundary()
+    commands_module.register_public_tools(context, boundary)
+    handler = next(
+        item["handler"]
+        for item in context.registrations
+        if item["name"] == "kanban_comment"
+    )
+
+    rendered = handler(
+        {
+            "task_id": "task-1",
+            "body": "evidence",
+            "idempotency_key": "key-1",
+            "attempt_id": "attempt-1",
+        }
+    )
+
+    result = json.loads(rendered)
+    assert result["result"] == "REJECTED"
+    assert result["attempt_id"] == "attempt-1"
+    assert result["failed_checks"] == [
+        {"code": "PUBLIC_REQUEST_NORMALIZATION_FAILED"}
+    ]
+    assert boundary.calls == []
+
+
+def test_model_tool_rejects_undeclared_authority_fields_and_board_conflicts(
+    commands_module,
+):
+    boundary = _RecordingBoundary()
+    normalizer = commands_module._ModelToolRequestNormalizer(
+        boundary,
+        board_resolver=lambda *_: ("orchestrator", "workspace-1"),
+        version_resolver=lambda *_: 0,
+    )
+
+    undeclared = normalizer.submit(
+        "kanban_comment",
+        {
+            "task_id": "task-1",
+            "body": "evidence",
+            "idempotency_key": "key-1",
+            "session_id": "model-forged",
+        },
+        {"session_id": "host-session"},
+    )
+    conflict = normalizer.submit(
+        "kanban_comment",
+        {
+            "task_id": "task-1",
+            "body": "evidence",
+            "idempotency_key": "key-2",
+            "board": "wrong-board",
+        },
+        {"session_id": "host-session"},
+    )
+
+    assert undeclared["failed_checks"] == [
+        {"code": "PUBLIC_REQUEST_NORMALIZATION_FAILED"}
+    ]
+    assert conflict["failed_checks"] == [
+        {"code": "PUBLIC_REQUEST_NORMALIZATION_FAILED"}
+    ]
+    assert boundary.calls == []
 
 
 def test_registration_requires_an_injected_boundary(commands_module):
