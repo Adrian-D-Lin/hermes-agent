@@ -1447,3 +1447,305 @@ def test_create_transport_rejects_noncanonical_typed_fields(
 
     with pytest.raises(adapter_module._PrivateAdapterRejected, match=message):
         adapter_module._CreateTaskArgs(**fields)
+
+
+def _seed_initiative_card(database_path, initiative_id="initiative-create"):
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            "INSERT INTO adrian_kanban_initiatives (initiative_id) VALUES (?)",
+            (initiative_id,),
+        )
+        conn.execute(
+            "INSERT INTO adrian_kanban_cards "
+            "(card_type, initiative_id, task_id, title, created_at) "
+            "VALUES ('initiative', ?, NULL, ?, 1)",
+            (initiative_id, f"Initiative {initiative_id}"),
+        )
+
+
+def _submit_create(boundary, *, task_id="task-create-public", **payload_overrides):
+    payload = {
+        "task_id": task_id,
+        "initiative_id": "initiative-create",
+        "title": "Public task creation",
+        "assignee": "builder",
+    }
+    payload.update(payload_overrides)
+    return boundary.submit(
+        "kanban_create",
+        attempt_id=f"attempt-{task_id}",
+        idempotency_key=f"idempotency-{task_id}",
+        target=task_id,
+        expected_version=0,
+        session_id="session-create-public",
+        workspace_id=None,
+        execution_context="run-create-public",
+        payload=payload,
+    )
+
+
+def test_create_handler_atomically_persists_native_and_unified_task_cards(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _seed_initiative_card(database_path)
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": commands_module._handle_create},
+    )
+
+    result = _submit_create(
+        boundary,
+        body="A bounded ordinary task",
+        priority=2,
+        parents=[],
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {
+        "initiative_id": "initiative-create",
+        "task_id": "task-create-public",
+    }
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        native = conn.execute(
+            "SELECT id, title, status, session_id FROM tasks WHERE id = ?",
+            ("task-create-public",),
+        ).fetchone()
+        assert dict(native) == {
+            "id": "task-create-public",
+            "title": "Public task creation",
+            "status": "ready",
+            "session_id": "session-create-public",
+        }
+        card = conn.execute(
+            "SELECT card_type, initiative_id, task_id, title "
+            "FROM adrian_kanban_cards WHERE task_id = ?",
+            ("task-create-public",),
+        ).fetchone()
+        assert dict(card) == {
+            "card_type": "task",
+            "initiative_id": "initiative-create",
+            "task_id": "task-create-public",
+            "title": "Public task creation",
+        }
+
+
+def test_create_handler_rejects_missing_canonical_initiative_without_native_task(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": commands_module._handle_create},
+    )
+
+    result = _submit_create(boundary)
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_create",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_cards"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
+
+
+def test_create_handler_rejects_native_only_parent_dependency_endpoint(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _seed_initiative_card(database_path)
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, assignee, status, created_at, workspace_kind) "
+            "VALUES ('native-only-parent', 'Legacy native parent', "
+            "'builder', 'done', 1, 'scratch')"
+        )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": commands_module._handle_create},
+    )
+
+    result = _submit_create(boundary, parents=["native-only-parent"])
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_create",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id = 'task-create-public'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE child_id = 'task-create-public'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_cards "
+            "WHERE task_id = 'task-create-public'"
+        ).fetchone()[0] == 0
+
+
+def test_create_handler_allows_cross_initiative_task_parent(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _seed_initiative_card(database_path)
+    _seed_initiative_card(database_path, "initiative-parent")
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, assignee, status, created_at, workspace_kind) "
+            "VALUES ('cross-parent', 'Cross parent', 'builder', "
+            "'done', 1, 'scratch')"
+        )
+        conn.execute(
+            "INSERT INTO adrian_kanban_cards "
+            "(card_type, initiative_id, task_id, title, created_at) "
+            "VALUES ('task', 'initiative-parent', 'cross-parent', "
+            "'Cross parent', 1)"
+        )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": commands_module._handle_create},
+    )
+
+    result = _submit_create(boundary, parents=["cross-parent"])
+
+    assert result["result"] == "ACCEPTED"
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links "
+            "WHERE parent_id = 'cross-parent' AND child_id = 'task-create-public'"
+        ).fetchone()[0] == 1
+
+
+def test_create_handler_rolls_back_both_identity_levels_on_unified_card_failure(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _seed_initiative_card(database_path)
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            "INSERT INTO adrian_kanban_cards "
+            "(card_type, initiative_id, task_id, title, created_at) "
+            "VALUES ('task', ?, 'task-duplicate-card', 'Existing', 1)",
+            ("initiative-create",),
+        )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": commands_module._handle_create},
+    )
+
+    result = _submit_create(boundary, task_id="task-duplicate-card")
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_create",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id = 'task-duplicate-card'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_cards "
+            "WHERE task_id = 'task-duplicate-card'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("override", "field"),
+    (
+        ({"initiative_id": None}, "initiative_id"),
+        ({"title": " "}, "title"),
+        ({"assignee": None}, "assignee"),
+        ({"parents": None}, "parents"),
+        ({"parents": ["parent", "parent"]}, "parents"),
+        ({"unexpected": "field"}, "unexpected"),
+    ),
+)
+def test_create_handler_rejects_invalid_or_unknown_payload_fields(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+    override,
+    field,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    _seed_initiative_card(database_path)
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": commands_module._handle_create},
+    )
+
+    result = _submit_create(boundary, **override)
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_create",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_cards WHERE card_type = 'task'"
+        ).fetchone()[0] == 0
+    assert field
