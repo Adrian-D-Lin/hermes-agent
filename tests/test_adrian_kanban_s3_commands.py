@@ -1393,6 +1393,8 @@ def test_active_transaction_operation_allowlist_matches_implemented_mutations(
         "kanban_request_changes",
         "kanban_request_review",
         "kanban_link",
+        "kanban_attach",
+        "kanban_attach_url",
     })
 
 
