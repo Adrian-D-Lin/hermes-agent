@@ -1310,9 +1310,11 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
-    # Retry once on the extremely unlikely id collision.
-    for attempt in range(2):
-        task_id = _new_task_id()
+    # Retry once on an extremely unlikely generated-id collision. An explicit
+    # private identity is never silently replaced with a generated one.
+    max_attempts = 1 if _task_id is not None else 2
+    for attempt in range(max_attempts):
+        task_id = _task_id or _new_task_id()
         try:
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
@@ -1382,7 +1384,7 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
-            if attempt == 1:
+            if _task_id is not None or attempt == max_attempts - 1:
                 raise
     raise RuntimeError("unreachable")
 

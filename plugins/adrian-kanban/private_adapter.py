@@ -27,8 +27,16 @@ def _is_optional_str(value: Any) -> bool:
     return value is None or _is_exact_str(value)
 
 
+def _is_optional_nonblank_str(value: Any) -> bool:
+    return value is None or _is_nonblank_str(value)
+
+
 def _is_positive_int(value: Any) -> bool:
     return type(value) is int and not isinstance(value, bool) and value > 0
+
+
+def _is_non_negative_int(value: Any) -> bool:
+    return type(value) is int and not isinstance(value, bool) and value >= 0
 
 
 def _is_optional_positive_int(value: Any) -> bool:
@@ -47,9 +55,7 @@ def _is_exact_bool(value: Any) -> bool:
     return type(value) is bool
 
 
-def _is_optional_tuple_of_unique_nonblank_strs(value: Any) -> bool:
-    if value is None:
-        return True
+def _is_tuple_of_unique_nonblank_strs(value: Any) -> bool:
     if type(value) is not tuple:
         return False
     seen = set()
@@ -60,6 +66,71 @@ def _is_optional_tuple_of_unique_nonblank_strs(value: Any) -> bool:
             return False
         seen.add(item)
     return True
+
+
+def _is_optional_tuple_of_unique_nonblank_strs(value: Any) -> bool:
+    return value is None or _is_tuple_of_unique_nonblank_strs(value)
+
+
+@dataclass(frozen=True)
+class _CreateTaskArgs:
+    task_id: str
+    title: str
+    assignee: str
+    body: Optional[str] = None
+    parents: tuple[str, ...] = ()
+    tenant: Optional[str] = None
+    priority: int = 0
+    workspace_kind: str = "scratch"
+    workspace_path: Optional[str] = None
+    project: Optional[str] = None
+    goal_mode: bool = False
+    goal_max_turns: Optional[int] = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    board: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not _is_nonblank_str(self.task_id):
+            raise _PrivateAdapterRejected("task_id must be a nonblank string")
+        if not _is_nonblank_str(self.title):
+            raise _PrivateAdapterRejected("title must be a nonblank string")
+        if not _is_nonblank_str(self.assignee):
+            raise _PrivateAdapterRejected("assignee must be a nonblank string")
+        if not _is_optional_nonblank_str(self.body):
+            raise _PrivateAdapterRejected("body must be None or a nonblank string")
+        if not _is_tuple_of_unique_nonblank_strs(self.parents):
+            raise _PrivateAdapterRejected(
+                "parents must be a tuple of unique nonblank strings"
+            )
+        if not _is_optional_nonblank_str(self.tenant):
+            raise _PrivateAdapterRejected("tenant must be None or a nonblank string")
+        if not _is_non_negative_int(self.priority):
+            raise _PrivateAdapterRejected("priority must be a non-negative integer")
+        if not _is_nonblank_str(self.workspace_kind):
+            raise _PrivateAdapterRejected("workspace_kind must be a nonblank string")
+        if not _is_optional_nonblank_str(self.workspace_path):
+            raise _PrivateAdapterRejected(
+                "workspace_path must be None or a nonblank string"
+            )
+        if not _is_optional_nonblank_str(self.project):
+            raise _PrivateAdapterRejected("project must be None or a nonblank string")
+        if not _is_exact_bool(self.goal_mode):
+            raise _PrivateAdapterRejected("goal_mode must be a bool")
+        if not _is_optional_positive_int(self.goal_max_turns):
+            raise _PrivateAdapterRejected(
+                "goal_max_turns must be None or a positive integer"
+            )
+        if not _is_optional_nonblank_str(self.model):
+            raise _PrivateAdapterRejected("model must be None or a nonblank string")
+        if not _is_optional_nonblank_str(self.provider):
+            raise _PrivateAdapterRejected(
+                "provider must be None or a nonblank string"
+            )
+        if self.provider is not None and self.model is None:
+            raise _PrivateAdapterRejected("provider requires a model")
+        if not _is_optional_nonblank_str(self.board):
+            raise _PrivateAdapterRejected("board must be None or a nonblank string")
 
 
 @dataclass(frozen=True)
@@ -242,6 +313,7 @@ class _LaunchTaskArgs:
 
 _OPERATION_ARGUMENT_TYPES = MappingProxyType(
     {
+        "kanban_create": _CreateTaskArgs,
         "kanban_complete": _CompleteTaskArgs,
         "kanban_block": _BlockTaskArgs,
         "kanban_unblock": _UnblockTaskArgs,
@@ -260,6 +332,7 @@ _OPERATION_ARGUMENT_TYPES = MappingProxyType(
 # other operation is rejected explicitly rather than falsely claimed safe.
 _ACTIVE_TRANSACTION_OPERATIONS = frozenset(
     {
+        "kanban_create",
         "kanban_complete",
         "kanban_block",
         "kanban_unblock",
@@ -330,7 +403,31 @@ class _PrivateNativeAdapter:
         *,
         allow_nested: bool = False,
     ) -> Any:
-        if operation == "kanban_complete":
+        if operation == "kanban_create":
+            with _kb._scoped_mutation_authority(
+                _kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+            ):
+                return _kb.create_task(
+                    self._conn,
+                    title=arguments.title,
+                    body=arguments.body,
+                    assignee=arguments.assignee,
+                    parents=arguments.parents,
+                    tenant=arguments.tenant,
+                    priority=arguments.priority,
+                    workspace_kind=arguments.workspace_kind,
+                    workspace_path=arguments.workspace_path,
+                    project_id=arguments.project,
+                    model_override=arguments.model,
+                    provider_override=arguments.provider,
+                    goal_mode=arguments.goal_mode,
+                    goal_max_turns=arguments.goal_max_turns,
+                    session_id=binding.session_id,
+                    board=arguments.board,
+                    created_by="adrian-kanban",
+                    _task_id=arguments.task_id,
+                )
+        elif operation == "kanban_complete":
             return _kb.complete_task(
                 self._conn,
                 arguments.task_id,
@@ -454,6 +551,46 @@ class _PrivateNativeAdapter:
         return self._dispatch_native(
             operation, binding, arguments, allow_nested=True
         )
+
+    def _create_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        title: str,
+        assignee: str,
+        body: Optional[str] = None,
+        parents: tuple[str, ...] = (),
+        tenant: Optional[str] = None,
+        priority: int = 0,
+        workspace_kind: str = "scratch",
+        workspace_path: Optional[str] = None,
+        project: Optional[str] = None,
+        goal_mode: bool = False,
+        goal_max_turns: Optional[int] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        board: Optional[str] = None,
+    ) -> Any:
+        args = _CreateTaskArgs(
+            task_id=task_id,
+            title=title,
+            assignee=assignee,
+            body=body,
+            parents=parents,
+            tenant=tenant,
+            priority=priority,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            project=project,
+            goal_mode=goal_mode,
+            goal_max_turns=goal_max_turns,
+            model=model,
+            provider=provider,
+            board=board,
+        )
+        return self._execute_in_active_transaction(capability, binding, args)
 
     def _link_in_active_transaction(
         self,
