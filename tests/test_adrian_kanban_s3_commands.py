@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import hashlib
+import json
+import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+
+from hermes_cli import kanban_db as kb
 
 
 @pytest.fixture(scope="module")
@@ -149,4 +154,227 @@ def test_missing_attempt_id_is_generated_but_never_blank(commands_module):
         result,
         operation="not-a-kanban-operation",
         code="UNRECOGNIZED_OPERATION",
+    )
+
+
+def _runtime_modules(commands_module):
+    package = commands_module.__package__
+    return {
+        "provider": importlib.import_module(f"{package}.provider"),
+        "private_adapter": importlib.import_module(f"{package}.private_adapter"),
+    }
+
+
+def _plugin_database(tmp_path, monkeypatch, provider_module):
+    database_path = (tmp_path / "kanban.sqlite3").resolve()
+
+    # Initialize native schema and the test-only probe while native remains the
+    # selected authority.  The S3 runtime is installed only after this setup.
+    with kb.connect_closing(database_path) as conn:
+        conn.execute(
+            "CREATE TABLE boundary_probe ("
+            "value TEXT PRIMARY KEY, audit TEXT NOT NULL)"
+        )
+        conn.commit()
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  mutation_authority: adrian-kanban\n"
+        f"  database_path: {database_path.as_posix()}\n",
+        encoding="utf-8",
+    )
+    provider = provider_module.AdrianKanbanAuthorityProvider(str(database_path))
+    provider_module.register_provider(provider)
+    return database_path, provider
+
+
+def test_read_handler_never_mints_or_consumes_a_mutation_capability(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+
+    def forbidden_mint(_binding):
+        raise AssertionError("a read operation must not mint a capability")
+
+    monkeypatch.setattr(provider, "_mint_after_admission", forbidden_mint)
+
+    def read_handler(context):
+        assert context.capability is None
+        assert context.binding is None
+        assert context.connection.in_transaction is False
+        return {"projection": "visible"}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_show": read_handler},
+    )
+
+    result = boundary.submit(
+        "kanban_show",
+        attempt_id="attempt-read",
+        payload={"task_id": "task-1"},
+    )
+
+    assert result == {
+        "result": "ACCEPTED",
+        "state_changed": False,
+        "attempt_id": "attempt-read",
+        "operation": "kanban_show",
+        "value": {"projection": "visible"},
+    }
+
+
+def test_mutation_uses_one_adapter_owned_transaction_and_consumes_exact_binding(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    observed = {}
+
+    def mutation_handler(context):
+        assert context.connection.in_transaction is True
+        assert type(context.mutation_executor) is modules["private_adapter"]._PrivateNativeAdapter
+        observed["binding"] = context.binding
+        observed["capability"] = context.capability
+        context.connection.execute(
+            "INSERT INTO boundary_probe (value, audit) VALUES (?, ?)",
+            ("committed", "same-transaction"),
+        )
+        return {"record_id": "committed"}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": mutation_handler},
+    )
+    payload = {"author": "worker", "body": "review evidence"}
+
+    result = boundary.submit(
+        "kanban_comment",
+        attempt_id="attempt-write",
+        target="task-1",
+        expected_version=7,
+        session_id="session-1",
+        workspace_id="workspace-1",
+        execution_context="run-1",
+        payload=payload,
+    )
+
+    assert result == {
+        "result": "ACCEPTED",
+        "state_changed": True,
+        "attempt_id": "attempt-write",
+        "operation": "kanban_comment",
+        "value": {"record_id": "committed"},
+    }
+    binding = observed["binding"]
+    assert binding.operation == "kanban_comment"
+    assert binding.target == "task-1"
+    assert binding.expected_version == 7
+    assert binding.session_id == "session-1"
+    assert binding.workspace_id == "workspace-1"
+    assert binding.execution_context == "run-1"
+    assert binding.canonical_digest == hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert provider.is_consumed(observed["capability"]) is True
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT value, audit FROM boundary_probe"
+        ).fetchall() == [("committed", "same-transaction")]
+
+
+def test_mutation_failure_rolls_back_and_returns_canonical_rejection(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+
+    def failing_handler(context):
+        context.connection.execute(
+            "INSERT INTO boundary_probe (value, audit) VALUES (?, ?)",
+            ("must-rollback", "partial"),
+        )
+        raise RuntimeError("deliberate handler failure")
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": failing_handler},
+    )
+
+    result = boundary.submit(
+        "kanban_comment",
+        attempt_id="attempt-rollback",
+        target="task-2",
+        expected_version=0,
+        session_id="session-2",
+        execution_context="run-2",
+        payload={"body": "partial"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_comment",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 0
+
+
+def test_recognized_but_unimplemented_operation_rejects_before_capability_mint(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+
+    def forbidden_mint(_binding):
+        raise AssertionError("unimplemented operation must not mint")
+
+    monkeypatch.setattr(provider, "_mint_after_admission", forbidden_mint)
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={},
+    )
+
+    result = boundary.submit(
+        "kanban_update_initiative",
+        attempt_id="attempt-unimplemented",
+        payload={},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_update_initiative",
+        code="OPERATION_NOT_IMPLEMENTED",
     )
