@@ -251,6 +251,37 @@ class _SegmentWorkspaceController:
         )
 
 
+@dataclass(frozen=True)
+class _MergeVerification:
+    repository_identity: str
+    target_path: str
+    source_head: str
+    merge_head: Optional[str]
+    remote_main_head: str
+    merge_commit: bool
+    source_contained: bool
+    remote_contained: bool
+    ready: bool
+    failures: Tuple[str, ...]
+
+    def __post_init__(self):
+        _validate_nonblank_str(self.repository_identity, "repository_identity")
+        _validate_nonblank_str(self.target_path, "target_path")
+        _validate_absolute_str(self.target_path, "target_path")
+        _validate_sha(self.source_head, "source_head")
+        if self.merge_head is not None:
+            _validate_sha(self.merge_head, "merge_head")
+        _validate_sha(self.remote_main_head, "remote_main_head")
+        _validate_bool(self.merge_commit, "merge_commit")
+        _validate_bool(self.source_contained, "source_contained")
+        _validate_bool(self.remote_contained, "remote_contained")
+        _validate_bool(self.ready, "ready")
+        if not isinstance(self.failures, tuple):
+            raise _WorkspaceRejected("failures must be a tuple")
+        for f in self.failures:
+            _validate_nonblank_str(f, "failure item")
+
+
 class _GitWorkspaceExecutor:
     def __init__(self, timeout: float = 30):
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
@@ -444,6 +475,216 @@ class _GitWorkspaceExecutor:
         return verification
 
 
+    def _remote_main_head(self, repository_root):
+        out = self._git(repository_root, 'ls-remote', '--heads', 'origin', 'refs/heads/main')
+        lines = [l for l in out.splitlines() if l.strip()]
+        if len(lines) != 1:
+            raise _WorkspaceRejected("expected exactly one line from ls-remote")
+        parts = lines[0].split()
+        if len(parts) != 2:
+            raise _WorkspaceRejected("malformed ls-remote output")
+        sha, ref = parts
+        if ref != 'refs/heads/main':
+            raise _WorkspaceRejected("unexpected ref in ls-remote output")
+        _validate_sha(sha, "ls-remote sha")
+        return sha
+
+    def _tracked_clean(self, cwd):
+        out = self._git(cwd, 'status', '--porcelain', '--untracked-files=no')
+        return out.strip() == ''
+
+    def _is_ancestor(self, cwd, ancestor, descendant):
+        proc = self._run(['git', 'merge-base', '--is-ancestor', ancestor, descendant], cwd)
+        if proc.returncode == 0:
+            return True
+        if proc.returncode == 1:
+            return False
+        raise _WorkspaceRejected(f"git merge-base --is-ancestor failed with rc={proc.returncode}")
+
+    def verify_merge(self, member, *, expected_main_sha, expected_source_head):
+        if not isinstance(member, _WorkspaceMember):
+            raise _WorkspaceRejected("invalid member type")
+        _validate_sha(expected_main_sha, "expected_main_sha")
+        _validate_sha(expected_source_head, "expected_source_head")
+
+        member_verification = self.verify(member)
+
+        failures = []
+        if not member_verification.ready or member_verification.observed_head != expected_source_head:
+            failures.append('source_mismatch')
+
+        branch = self._git(member.repository_root, 'symbolic-ref', '--quiet', '--short', 'HEAD').strip()
+        if branch != 'main':
+            failures.append('main_branch_mismatch')
+
+        if not self._tracked_clean(member.repository_root):
+            failures.append('main_dirty')
+
+        if failures:
+            return _MergeVerification(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                source_head=expected_source_head,
+                merge_head=None,
+                remote_main_head=self._remote_main_head(member.repository_root),
+                merge_commit=False,
+                source_contained=False,
+                remote_contained=False,
+                ready=False,
+                failures=tuple(failures),
+            )
+
+        local_head = self._git(member.repository_root, 'rev-parse', 'HEAD').strip()
+        remote_main = self._remote_main_head(member.repository_root)
+
+        if local_head == expected_main_sha:
+            if remote_main == expected_main_sha:
+                return _MergeVerification(
+                    repository_identity=member.repository_identity,
+                    target_path=member.target_path,
+                    source_head=expected_source_head,
+                    merge_head=None,
+                    remote_main_head=remote_main,
+                    merge_commit=False,
+                    source_contained=False,
+                    remote_contained=False,
+                    ready=False,
+                    failures=('merge_absent',),
+                )
+            else:
+                return _MergeVerification(
+                    repository_identity=member.repository_identity,
+                    target_path=member.target_path,
+                    source_head=expected_source_head,
+                    merge_head=None,
+                    remote_main_head=remote_main,
+                    merge_commit=False,
+                    source_contained=False,
+                    remote_contained=False,
+                    ready=False,
+                    failures=('remote_diverged',),
+                )
+
+        try:
+            parent1 = self._git(member.repository_root, 'rev-parse', 'HEAD^1').strip()
+            parent2 = self._git(member.repository_root, 'rev-parse', 'HEAD^2').strip()
+        except _WorkspaceRejected:
+            return _MergeVerification(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                source_head=expected_source_head,
+                merge_head=None,
+                remote_main_head=remote_main,
+                merge_commit=False,
+                source_contained=False,
+                remote_contained=False,
+                ready=False,
+                failures=('unsafe_main_state',),
+            )
+
+        qualifying = (parent1 == expected_main_sha and parent2 == expected_source_head and self._is_ancestor(member.repository_root, expected_source_head, local_head))
+
+        if not qualifying:
+            return _MergeVerification(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                source_head=expected_source_head,
+                merge_head=None,
+                remote_main_head=remote_main,
+                merge_commit=False,
+                source_contained=False,
+                remote_contained=False,
+                ready=False,
+                failures=('unsafe_main_state',),
+            )
+
+        merge_commit = True
+        source_contained = True
+        merge_head = local_head
+
+        if remote_main == local_head:
+            return _MergeVerification(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                source_head=expected_source_head,
+                merge_head=merge_head,
+                remote_main_head=remote_main,
+                merge_commit=merge_commit,
+                source_contained=source_contained,
+                remote_contained=True,
+                ready=True,
+                failures=(),
+            )
+        elif remote_main == expected_main_sha:
+            return _MergeVerification(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                source_head=expected_source_head,
+                merge_head=merge_head,
+                remote_main_head=remote_main,
+                merge_commit=merge_commit,
+                source_contained=source_contained,
+                remote_contained=False,
+                ready=False,
+                failures=('publish_pending',),
+            )
+        else:
+            return _MergeVerification(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                source_head=expected_source_head,
+                merge_head=merge_head,
+                remote_main_head=remote_main,
+                merge_commit=merge_commit,
+                source_contained=source_contained,
+                remote_contained=False,
+                ready=False,
+                failures=('remote_diverged',),
+            )
+
+    def merge_to_origin_main(self, member, *, expected_main_sha, expected_source_head):
+        verification = self.verify_merge(member, expected_main_sha=expected_main_sha, expected_source_head=expected_source_head)
+
+        if verification.ready:
+            return verification
+
+        if 'remote_diverged' in verification.failures:
+            raise _WorkspaceRejected("origin/main has diverged")
+
+        if 'publish_pending' in verification.failures:
+            proc = self._run(['git', 'push', 'origin', f"{verification.merge_head}:refs/heads/main"], member.repository_root)
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or '').strip()[:200]
+                raise _WorkspaceRejected(f"push failed: {err}")
+            final = self.verify_merge(member, expected_main_sha=expected_main_sha, expected_source_head=expected_source_head)
+            if final.ready:
+                return final
+            raise _WorkspaceRejected("final verification failed after push")
+
+        if 'merge_absent' in verification.failures:
+            msg = f"Merge {member.workspace_id}/{member.repository_identity}"
+            proc = self._run(['git', 'merge', '--no-ff', '--no-edit', '-m', msg, expected_source_head], member.repository_root)
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or '').strip()[:200]
+                raise _WorkspaceRejected(f"merge failed: {err}")
+
+            reverified = self.verify_merge(member, expected_main_sha=expected_main_sha, expected_source_head=expected_source_head)
+            if reverified.ready:
+                return reverified
+            if 'publish_pending' in reverified.failures:
+                proc = self._run(['git', 'push', 'origin', f"{reverified.merge_head}:refs/heads/main"], member.repository_root)
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout or '').strip()[:200]
+                    raise _WorkspaceRejected(f"push failed: {err}")
+                final = self.verify_merge(member, expected_main_sha=expected_main_sha, expected_source_head=expected_source_head)
+                if final.ready:
+                    return final
+                raise _WorkspaceRejected("final verification failed after push")
+            raise _WorkspaceRejected("unexpected state after merge")
+
+        raise _WorkspaceRejected("cannot merge in current state")
+
+
 class _JournaledWorkspaceOperations:
     def __init__(self, conn, journal, executor):
         if type(conn) is not sqlite3.Connection:
@@ -623,3 +864,208 @@ class _JournaledWorkspaceOperations:
                 raise _WorkspaceRejected("consume")
             return v
         return self._owned_transaction(_consume)
+    def _validate_merge_intent(self, intent, member, expected_main_sha, expected_source_head):
+        if type(member) is not _WorkspaceMember:
+            raise _WorkspaceRejected("member must be _WorkspaceMember")
+        if type(intent) is not JournalIntent:
+            raise _WorkspaceRejected("intent must be JournalIntent")
+        if intent.operation_kind != "workspace_merge":
+            raise _WorkspaceRejected("intent operation_kind must be workspace_merge")
+        if intent.member_target != member.repository_identity:
+            raise _WorkspaceRejected("intent member_target mismatch")
+        if intent.workspace_id != member.workspace_id:
+            raise _WorkspaceRejected("intent workspace_id mismatch")
+        if intent.repository_identity != member.repository_identity:
+            raise _WorkspaceRejected("intent repository_identity mismatch")
+        _validate_sha(expected_main_sha, "expected_main_sha")
+        _validate_sha(expected_source_head, "expected_source_head")
+        expected_git = (
+            f"base={expected_main_sha};source={expected_source_head};"
+            f"branch={member.branch}"
+        )
+        expected_fs = f"target={member.target_path};retain=true"
+        if intent.intended_git_evidence != expected_git:
+            raise _WorkspaceRejected("intent intended_git_evidence mismatch")
+        if intent.intended_filesystem_evidence != expected_fs:
+            raise _WorkspaceRejected("intent intended_filesystem_evidence mismatch")
+
+    def prepare_merge(self, intent, member, expected_main_sha, expected_source_head):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        self._validate_merge_intent(intent, member, expected_main_sha, expected_source_head)
+        def _append():
+            self._journal.append_prepared(intent)
+            return self._journal.head(intent.operation_id, intent.member_target)
+        return self._owned_transaction(_append)
+
+    def run_merge(self, intent, member, expected_main_sha, expected_source_head, *, outcome_at):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        if type(outcome_at) is not int or outcome_at <= 0:
+            raise _WorkspaceRejected("outcome_at must be positive exact int")
+        self._validate_merge_intent(intent, member, expected_main_sha, expected_source_head)
+        action = self._journal.recovery_action(intent.operation_id, intent.member_target)
+        if action == "prepare":
+            raise _WorkspaceRejected("must prepare first")
+        if action == "consume_verified":
+            return self._journal.verified_evidence(intent.operation_id, intent.member_target)
+        if action == "halt":
+            raise _WorkspaceRejected("halted")
+        if action == "resume":
+            def _append_resume():
+                self._journal.append_resume_prepared(
+                    operation_id=intent.operation_id,
+                    member_target=intent.member_target,
+                    actor_evidence=intent.actor_evidence,
+                    created_at=outcome_at,
+                )
+            self._owned_transaction(_append_resume)
+            action = "verify"
+        if action == "verify":
+            v = self._executor.verify_merge(
+                member,
+                expected_main_sha=expected_main_sha,
+                expected_source_head=expected_source_head,
+            )
+            if v.ready:
+                self._append_merge_verified(intent, member, expected_main_sha, expected_source_head, v, outcome_at)
+                return self._journal.verified_evidence(intent.operation_id, intent.member_target)
+            if v.failures == ('merge_absent',) or v.failures == ('publish_pending',):
+                try:
+                    self._executor.merge_to_origin_main(
+                        member,
+                        expected_main_sha=expected_main_sha,
+                        expected_source_head=expected_source_head,
+                    )
+                except _WorkspaceRejected:
+                    reverified = self._executor.verify_merge(
+                        member,
+                        expected_main_sha=expected_main_sha,
+                        expected_source_head=expected_source_head,
+                    )
+                    if reverified.ready:
+                        self._append_merge_verified(intent, member, expected_main_sha, expected_source_head, reverified, outcome_at)
+                        return self._journal.verified_evidence(intent.operation_id, intent.member_target)
+                    if reverified.failures == ('merge_absent',) or reverified.failures == ('publish_pending',):
+                        self._append_merge_failed(
+                            intent, member, expected_main_sha, expected_source_head, reverified, outcome_at,
+                            error_disposition='merge effect incomplete after verification',
+                            recovery_disposition='resume'
+                        )
+                        return self._journal.head(intent.operation_id, intent.member_target)
+                    self._append_merge_failed(
+                        intent, member, expected_main_sha, expected_source_head, reverified, outcome_at,
+                        error_disposition='unsafe merge state after verification',
+                        recovery_disposition='manual intervention required'
+                    )
+                    return self._journal.head(intent.operation_id, intent.member_target)
+                reverified = self._executor.verify_merge(
+                    member,
+                    expected_main_sha=expected_main_sha,
+                    expected_source_head=expected_source_head,
+                )
+                if reverified.ready:
+                    self._append_merge_verified(intent, member, expected_main_sha, expected_source_head, reverified, outcome_at)
+                    return self._journal.verified_evidence(intent.operation_id, intent.member_target)
+                if reverified.failures == ('merge_absent',) or reverified.failures == ('publish_pending',):
+                    self._append_merge_failed(
+                        intent, member, expected_main_sha, expected_source_head, reverified, outcome_at,
+                        error_disposition='merge effect incomplete after verification',
+                        recovery_disposition='resume'
+                    )
+                    return self._journal.head(intent.operation_id, intent.member_target)
+                self._append_merge_failed(
+                    intent, member, expected_main_sha, expected_source_head, reverified, outcome_at,
+                    error_disposition='unsafe merge state after verification',
+                    recovery_disposition='manual intervention required'
+                )
+                return self._journal.head(intent.operation_id, intent.member_target)
+            self._append_merge_failed(
+                intent, member, expected_main_sha, expected_source_head, v, outcome_at,
+                error_disposition='unsafe merge state after verification',
+                recovery_disposition='manual intervention required'
+            )
+            return self._journal.head(intent.operation_id, intent.member_target)
+        raise _WorkspaceRejected("unknown recovery action")
+
+    def consume_merge(self, intent, member, expected_main_sha, expected_source_head, *, consumed_at):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        if type(consumed_at) is not int or consumed_at <= 0:
+            raise _WorkspaceRejected("consumed_at must be positive exact int")
+        self._validate_merge_intent(intent, member, expected_main_sha, expected_source_head)
+        action = self._journal.recovery_action(intent.operation_id, intent.member_target)
+        if action != "consume_verified":
+            raise _WorkspaceRejected("verified")
+        called_evidence = self._journal.verified_evidence(intent.operation_id, intent.member_target)
+        if called_evidence is None:
+            raise _WorkspaceRejected("verified")
+        v = self._executor.verify_merge(
+            member,
+            expected_main_sha=expected_main_sha,
+            expected_source_head=expected_source_head,
+        )
+        if not v.ready:
+            raise _WorkspaceRejected("verified")
+        expected_git_ev, expected_fs_ev = self._merge_verified_evidence(member, expected_main_sha, expected_source_head, v)
+        if (
+            called_evidence.observed_git_evidence != expected_git_ev
+            or called_evidence.observed_filesystem_evidence != expected_fs_ev
+        ):
+            raise _WorkspaceRejected("verified")
+        def _consume():
+            row = self._conn.execute(
+                "SELECT observed_head, member_state, observed_at FROM segment_workspace_members WHERE workspace_id = ? AND repository_identity = ?",
+                (member.workspace_id, member.repository_identity),
+            ).fetchone()
+            if row and row[1] == "merged" and row[0] == v.source_head and row[2] == consumed_at:
+                return v
+            if not row or row[1] != "materialized" or row[0] != expected_source_head:
+                raise _WorkspaceRejected("consume")
+            cur = self._conn.execute(
+                "UPDATE segment_workspace_members SET observed_head = ?, member_state = 'merged', observed_at = ? WHERE workspace_id = ? AND repository_identity = ? AND member_state = 'materialized' AND observed_head = ?",
+                (v.source_head, consumed_at, member.workspace_id, member.repository_identity, expected_source_head),
+            )
+            if cur.rowcount != 1:
+                raise _WorkspaceRejected("consume")
+            return v
+        return self._owned_transaction(_consume)
+
+    def _merge_verified_evidence(self, member, expected_main_sha, expected_source_head, v):
+        return (
+            f"base={expected_main_sha};source={expected_source_head};merge={v.merge_head};"
+            f"remote={v.remote_main_head};merge_commit=true;source_contained=true;remote_contained=true",
+            f"retained=true;target={member.target_path}",
+        )
+
+    def _append_merge_verified(self, intent, member, expected_main_sha, expected_source_head, v, at):
+        git_ev, fs_ev = self._merge_verified_evidence(member, expected_main_sha, expected_source_head, v)
+        def _append():
+            return self._journal.append_verified(
+                operation_id=intent.operation_id,
+                member_target=intent.member_target,
+                observed_git_evidence=git_ev,
+                observed_filesystem_evidence=fs_ev,
+                actor_evidence=intent.actor_evidence,
+                created_at=at,
+            )
+        return self._owned_transaction(_append)
+
+    def _append_merge_failed(self, intent, member, expected_main_sha, expected_source_head, v, at, *, error_disposition, recovery_disposition):
+        git_ev = (
+            f"base={expected_main_sha};source={expected_source_head};"
+            f"merge={v.merge_head if v.merge_head else 'none'};remote={v.remote_main_head}"
+        )
+        fs_ev = f"retained=true;target={member.target_path}"
+        def _append():
+            return self._journal.append_failed(
+                operation_id=intent.operation_id,
+                member_target=intent.member_target,
+                observed_git_evidence=git_ev,
+                observed_filesystem_evidence=fs_ev,
+                actor_evidence=intent.actor_evidence,
+                created_at=at,
+                error_disposition=error_disposition,
+                recovery_disposition=recovery_disposition,
+            )
+        return self._owned_transaction(_append)
