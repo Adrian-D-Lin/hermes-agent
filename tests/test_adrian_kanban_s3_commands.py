@@ -965,6 +965,7 @@ def test_active_transaction_operation_allowlist_matches_implemented_mutations(
 
     assert adapter_module._ACTIVE_TRANSACTION_OPERATIONS == frozenset(
         {
+            "kanban_create",
             "kanban_complete",
             "kanban_block",
             "kanban_unblock",
@@ -1221,3 +1222,228 @@ def test_link_binding_target_must_be_the_child(
         assert conn.execute(
             "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
         ).fetchone()[0] == 0
+
+
+def test_create_adapter_uses_explicit_identity_and_ready_native_transport(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+
+    def handler(context):
+        task_id = context.mutation_executor._create_in_active_transaction(
+            context.capability,
+            context.binding,
+            task_id="task-explicit",
+            title="Explicit identity",
+            assignee="builder",
+            body="Bounded create transport",
+            parents=(),
+            tenant=None,
+            priority=4,
+            workspace_kind="scratch",
+            workspace_path=None,
+            project=None,
+            goal_mode=False,
+            goal_max_turns=None,
+            model=None,
+            provider=None,
+            board=None,
+        )
+        assert context.connection.in_transaction is True
+        return {"task_id": task_id}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": handler},
+    )
+    result = boundary.submit(
+        "kanban_create",
+        attempt_id="attempt-create-explicit",
+        idempotency_key="idempotency-create-explicit",
+        target="task-explicit",
+        expected_version=0,
+        session_id="session-create-explicit",
+        workspace_id=None,
+        execution_context="run-create-explicit",
+        payload={"task_id": "task-explicit"},
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {"task_id": "task-explicit"}
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, title, body, assignee, status, priority, session_id "
+            "FROM tasks "
+            "WHERE id = ?",
+            ("task-explicit",),
+        ).fetchone()
+        assert dict(row) == {
+            "id": "task-explicit",
+            "title": "Explicit identity",
+            "body": "Bounded create transport",
+            "assignee": "builder",
+            "status": "ready",
+            "priority": 4,
+            "session_id": "session-create-explicit",
+        }
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts "
+            "WHERE idempotency_key = ?",
+            ("idempotency-create-explicit",),
+        ).fetchone()[0] == 1
+
+
+def test_create_adapter_rolls_back_native_task_with_boundary_failure(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+
+    def handler(context):
+        context.mutation_executor._create_in_active_transaction(
+            context.capability,
+            context.binding,
+            task_id="task-create-rollback",
+            title="Must roll back",
+            assignee="builder",
+        )
+        raise RuntimeError("fail after native task creation")
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": handler},
+    )
+    result = boundary.submit(
+        "kanban_create",
+        attempt_id="attempt-create-rollback",
+        idempotency_key="idempotency-create-rollback",
+        target="task-create-rollback",
+        expected_version=0,
+        session_id="session-create-rollback",
+        workspace_id=None,
+        execution_context="run-create-rollback",
+        payload={"task_id": "task-create-rollback"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_create",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id = ?",
+            ("task-create-rollback",),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
+
+
+def test_create_adapter_binding_target_must_equal_explicit_task_id(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+
+    def handler(context):
+        context.mutation_executor._create_in_active_transaction(
+            context.capability,
+            context.binding,
+            task_id="task-create-target",
+            title="Target check",
+            assignee="builder",
+        )
+        return {"unexpected": True}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_create": handler},
+    )
+    result = boundary.submit(
+        "kanban_create",
+        attempt_id="attempt-create-target",
+        idempotency_key="idempotency-create-target",
+        target="different-task",
+        expected_version=0,
+        session_id="session-create-target",
+        workspace_id=None,
+        execution_context="run-create-target",
+        payload={"task_id": "task-create-target"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_create",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id = ?",
+            ("task-create-target",),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("invalid", (1, True, "", "   "))
+def test_native_explicit_task_identity_requires_an_exact_nonblank_string(invalid):
+    with sqlite3.connect(":memory:", isolation_level=None) as conn:
+        with pytest.raises(TypeError, match="_task_id must be a nonblank string"):
+            kb.create_task(conn, title="invalid explicit identity", _task_id=invalid)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    (
+        ({"body": ""}, "body"),
+        ({"parents": None}, "parents"),
+        ({"tenant": " "}, "tenant"),
+        ({"priority": -1}, "priority"),
+        ({"priority": True}, "priority"),
+        ({"workspace_kind": 1}, "workspace_kind"),
+        ({"workspace_path": ""}, "workspace_path"),
+        ({"project": " "}, "project"),
+        ({"goal_mode": 1}, "goal_mode"),
+        ({"goal_max_turns": 0}, "goal_max_turns"),
+        ({"model": ""}, "model"),
+        ({"provider": "provider-only"}, "provider requires a model"),
+        ({"board": " "}, "board"),
+    ),
+)
+def test_create_transport_rejects_noncanonical_typed_fields(
+    commands_module,
+    override,
+    message,
+):
+    adapter_module = _runtime_modules(commands_module)["private_adapter"]
+    fields = {
+        "task_id": "task-create-types",
+        "title": "Typed create",
+        "assignee": "builder",
+    }
+    fields.update(override)
+
+    with pytest.raises(adapter_module._PrivateAdapterRejected, match=message):
+        adapter_module._CreateTaskArgs(**fields)

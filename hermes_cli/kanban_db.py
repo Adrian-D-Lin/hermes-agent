@@ -3788,6 +3788,7 @@ def create_task(
     conn: sqlite3.Connection,
     *,
     title: str,
+    _task_id: Optional[str] = None,
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
@@ -3852,6 +3853,13 @@ def create_task(
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
     """
+    if type(_task_id) is not str and _task_id is not None:
+        raise TypeError("_task_id must be a nonblank string")
+    if _task_id is not None:
+        _task_id = _task_id.strip()
+        if not _task_id:
+            raise TypeError("_task_id must be a nonblank string")
+
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -4053,9 +4061,11 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
-    # Retry once on the extremely unlikely id collision.
-    for attempt in range(2):
-        task_id = _new_task_id()
+    # Retry once on an extremely unlikely generated-id collision. An explicit
+    # private identity is never silently replaced with a generated one.
+    max_attempts = 1 if _task_id is not None else 2
+    for attempt in range(max_attempts):
+        task_id = _task_id or _new_task_id()
         try:
             # ``allow_nested=True``: graph builders (kanban_swarm.create_swarm)
             # compose create_task calls under one outer commit so the
@@ -4200,7 +4210,7 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
-            if attempt == 1:
+            if _task_id is not None or attempt == max_attempts - 1:
                 raise
             # Retry with a fresh id.
             continue
