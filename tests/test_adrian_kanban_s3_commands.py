@@ -354,6 +354,100 @@ def test_mutation_failure_rolls_back_and_returns_canonical_rejection(
         assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 0
 
 
+def test_idempotent_replay_is_stable_when_host_derived_version_changes(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    state = {"version": 4}
+    resolver_calls = []
+    handler_calls = []
+
+    def state_resolver(conn, operation, target, payload):
+        assert conn.row_factory is sqlite3.Row
+        resolver_calls.append((operation, target, dict(payload)))
+        return state["version"]
+
+    def handler(_context):
+        handler_calls.append("called")
+        return {"accepted_version": state["version"]}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": handler},
+        state_resolver=state_resolver,
+    )
+    fields = {
+        "attempt_id": "attempt-derived",
+        "idempotency_key": "idempotency-derived",
+        "target": "task-derived",
+        "derive_expected_version": True,
+        "session_id": "session-derived",
+        "workspace_id": None,
+        "execution_context": "model-tool",
+        "payload": {"task_id": "task-derived", "body": "evidence"},
+    }
+
+    first = boundary.submit("kanban_comment", **fields)
+    state["version"] = 5
+    replay = boundary.submit("kanban_comment", **fields)
+
+    assert first["result"] == "ACCEPTED"
+    assert replay == first
+    assert handler_calls == ["called"]
+    assert len(resolver_calls) == 2
+
+
+def test_derived_state_is_revalidated_after_serialized_transaction_begins(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    versions = iter((4, 5))
+    handler_calls = []
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_comment": lambda _context: handler_calls.append("called")
+        },
+        state_resolver=lambda *_: next(versions),
+    )
+
+    result = boundary.submit(
+        "kanban_comment",
+        attempt_id="attempt-stale",
+        idempotency_key="idempotency-stale",
+        target="task-stale",
+        derive_expected_version=True,
+        session_id="session-stale",
+        workspace_id=None,
+        execution_context="model-tool",
+        payload={"task_id": "task-stale", "body": "evidence"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_comment",
+        code="STALE_DERIVED_STATE",
+    )
+    assert handler_calls == []
+
+
 def test_recognized_but_unimplemented_operation_rejects_before_capability_mint(
     commands_module,
     tmp_path,

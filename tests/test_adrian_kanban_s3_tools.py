@@ -331,21 +331,15 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
     context = _RecordingContext()
     boundary = _RecordingBoundary()
     board_calls = []
-    version_calls = []
 
     def board_resolver(operation, args, runtime_fields):
         board_calls.append((operation, args, runtime_fields))
         return ("orchestrator", "workspace-1")
 
-    def version_resolver(operation, target, board):
-        version_calls.append((operation, target, board))
-        return 7
-
     commands_module.register_public_tools(
         context,
         boundary,
         board_resolver=board_resolver,
-        version_resolver=version_resolver,
     )
 
     for item in context.registrations:
@@ -399,7 +393,7 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
                 "attempt_id": f"attempt-{operation}",
                 "idempotency_key": f"idempotency-{operation}",
                 "target": expected_target,
-                "expected_version": 7,
+                "derive_expected_version": True,
                 "session_id": "host-session-1",
                 "workspace_id": "workspace-1",
                 "execution_context": "model-tool",
@@ -418,10 +412,6 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
         }
 
     assert len(board_calls) == len(commands_module.RECOGNIZED_OPERATIONS)
-    assert len(version_calls) == len(
-        commands_module.ORDINARY_TASK_OPERATIONS
-        | commands_module.INITIATIVE_OPERATIONS
-    )
 
 
 def test_model_tool_mutation_fails_closed_without_trusted_runtime_or_resolvers(
@@ -461,7 +451,6 @@ def test_model_tool_rejects_undeclared_authority_fields_and_board_conflicts(
     normalizer = commands_module._ModelToolRequestNormalizer(
         boundary,
         board_resolver=lambda *_: ("orchestrator", "workspace-1"),
-        version_resolver=lambda *_: 0,
     )
 
     undeclared = normalizer.submit(
