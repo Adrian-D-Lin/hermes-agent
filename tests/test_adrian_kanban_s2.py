@@ -1683,6 +1683,289 @@ def test_materialization_consumption_requires_exact_verified_evidence(
     conn.close()
 
 
+def _commit_workspace_feature(member):
+    target = Path(member.target_path)
+    (target / "feature.txt").write_text("segment feature\n", encoding="utf-8")
+    _git(target, "add", "feature.txt")
+    _git(target, "commit", "-m", "segment feature")
+    return _git(target, "rev-parse", "HEAD")
+
+
+def test_workspace_merge_creates_merge_commit_and_proves_remote_containment(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+
+    absent = executor.verify_merge(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+    assert absent.ready is False
+    assert absent.failures == ("merge_absent",)
+
+    merged = executor.merge_to_origin_main(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+    assert merged.ready is True
+    assert merged.merge_commit is True
+    assert merged.source_contained is True
+    assert merged.remote_contained is True
+    assert merged.merge_head not in (base_sha, source_head)
+    assert len(_git(repository, "rev-list", "--parents", "-n", "1", merged.merge_head).split()) == 3
+    remote = Path(_git(repository, "remote", "get-url", "origin"))
+    assert _git(remote, "rev-parse", "refs/heads/main") == merged.remote_main_head
+    assert merged.merge_head == merged.remote_main_head
+    conn.close()
+
+
+def test_workspace_merge_recovers_publish_pending_without_second_merge_commit(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    original_run = executor._run
+
+    def fail_first_push(argv, cwd):
+        if argv[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(argv, 1, "", "injected push failure")
+        return original_run(argv, cwd)
+
+    monkeypatch.setattr(executor, "_run", fail_first_push)
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="push"):
+        executor.merge_to_origin_main(
+            member,
+            expected_main_sha=base_sha,
+            expected_source_head=source_head,
+        )
+    pending = executor.verify_merge(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+    assert pending.ready is False
+    assert pending.merge_commit is True
+    assert pending.failures == ("publish_pending",)
+    first_merge_head = pending.merge_head
+
+    monkeypatch.setattr(executor, "_run", original_run)
+    recovered = executor.merge_to_origin_main(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+    assert recovered.ready is True
+    assert recovered.merge_head == first_merge_head
+    assert _git(repository, "rev-list", "--count", f"{base_sha}..main") == "2"
+    conn.close()
+
+
+def test_workspace_merge_rejects_remote_divergence_before_local_effect(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    remote = Path(_git(repository, "remote", "get-url", "origin"))
+    other = tmp_path / "remote-writer"
+    subprocess.run(["git", "clone", str(remote), str(other)], check=True, capture_output=True)
+    _git(other, "config", "user.name", "Remote Writer")
+    _git(other, "config", "user.email", "remote@example.invalid")
+    _git(other, "checkout", "main")
+    (other / "remote.txt").write_text("remote advance\n", encoding="utf-8")
+    _git(other, "add", "remote.txt")
+    _git(other, "commit", "-m", "remote advance")
+    _git(other, "push", "origin", "main")
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="origin/main"):
+        executor.merge_to_origin_main(
+            member,
+            expected_main_sha=base_sha,
+            expected_source_head=source_head,
+        )
+    assert _git(repository, "rev-parse", "main") == base_sha
+    conn.close()
+
+
+def _workspace_merge_intent(journal_mod, member, base_sha, source_head, **changes):
+    values = {
+        "operation_id": "merge-1",
+        "idempotency_id": "merge-idempotency-1",
+        "member_target": member.repository_identity,
+        "operation_kind": "workspace_merge",
+        "workspace_id": member.workspace_id,
+        "repository_identity": member.repository_identity,
+        "intended_git_evidence": (
+            f"base={base_sha};source={source_head};branch={member.branch}"
+        ),
+        "intended_filesystem_evidence": f"target={member.target_path};retain=true",
+        "actor_evidence": "system:workspace-controller",
+        "created_at": 3_000,
+    }
+    values.update(changes)
+    return journal_mod.JournalIntent(**values)
+
+
+def test_journaled_merge_commits_prepare_before_git_and_consumes_verified_result(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    conn.execute(
+        "UPDATE segment_workspace_members SET observed_head = ?, member_state = 'materialized' "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (source_head, member.workspace_id, member.repository_identity),
+    )
+    intent = _workspace_merge_intent(
+        journal_mod, member, base_sha, source_head
+    )
+    original_merge = executor.merge_to_origin_main
+
+    def observe_committed_prepare(merge_member, **kwargs):
+        assert conn.in_transaction is False
+        assert journal.head(intent.operation_id, intent.member_target).state == "prepared"
+        return original_merge(merge_member, **kwargs)
+
+    monkeypatch.setattr(executor, "merge_to_origin_main", observe_committed_prepare)
+    operations.prepare_merge(intent, member, base_sha, source_head)
+    verified = operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_001
+    )
+    assert verified.state == "verified"
+    assert conn.execute(
+        "SELECT member_state FROM segment_workspace_members "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()[0] == "materialized"
+
+    consumed = operations.consume_merge(
+        intent, member, base_sha, source_head, consumed_at=3_002
+    )
+    assert consumed.ready is True
+    assert conn.execute(
+        "SELECT observed_head, member_state, observed_at "
+        "FROM segment_workspace_members WHERE workspace_id = ? AND repository_identity = ?",
+        (member.workspace_id, member.repository_identity),
+    ).fetchone()[:] == (source_head, "merged", 3_002)
+    assert Path(member.target_path).exists()
+    conn.close()
+
+
+def test_journaled_merge_recovers_completed_effect_without_replay(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    intent = _workspace_merge_intent(journal_mod, member, base_sha, source_head)
+    operations.prepare_merge(intent, member, base_sha, source_head)
+    completed = executor.merge_to_origin_main(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    )
+
+    monkeypatch.setattr(
+        executor,
+        "merge_to_origin_main",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("verified merge effect must not replay")
+        ),
+    )
+    verified = operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_001
+    )
+    assert verified.state == "verified"
+    assert verified.observed_git_evidence is not None
+    assert f"merge={completed.merge_head}" in verified.observed_git_evidence
+    assert operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_002
+    ) == verified
+    assert conn.execute(
+        "SELECT COUNT(*) FROM external_operation_journal"
+    ).fetchone()[0] == 2
+    conn.close()
+
+
+def test_journaled_merge_marks_safe_absence_resumable_after_effect_failure(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    journal = journal_mod.ExternalOperationJournal(conn)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    operations = workspace_mod._JournaledWorkspaceOperations(conn, journal, executor)
+    executor.materialize(member)
+    source_head = _commit_workspace_feature(member)
+    intent = _workspace_merge_intent(journal_mod, member, base_sha, source_head)
+    operations.prepare_merge(intent, member, base_sha, source_head)
+    original_merge = executor.merge_to_origin_main
+    monkeypatch.setattr(
+        executor,
+        "merge_to_origin_main",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            workspace_mod._WorkspaceRejected("injected pre-effect failure")
+        ),
+    )
+
+    failed = operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_001
+    )
+    assert failed.state == "failed"
+    assert failed.recovery_disposition == "resume"
+    assert executor.verify_merge(
+        member,
+        expected_main_sha=base_sha,
+        expected_source_head=source_head,
+    ).failures == ("merge_absent",)
+
+    monkeypatch.setattr(executor, "merge_to_origin_main", original_merge)
+    assert operations.run_merge(
+        intent, member, base_sha, source_head, outcome_at=3_002
+    ).state == "verified"
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT ordinal, state FROM external_operation_journal ORDER BY ordinal"
+        )
+    ] == [
+        (1, "prepared"),
+        (2, "failed"),
+        (3, "prepared"),
+        (4, "verified"),
+    ]
+    conn.close()
+
+
 def test_h16_rejection_envelope_preserves_every_failure_and_remediation(
     provider_modules,
 ):
