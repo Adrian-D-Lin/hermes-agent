@@ -167,10 +167,12 @@ def _runtime_modules(commands_module):
 
 def _plugin_database(tmp_path, monkeypatch, provider_module):
     database_path = (tmp_path / "kanban.sqlite3").resolve()
+    schema_module = importlib.import_module(f"{provider_module.__package__}.schema")
 
     # Initialize native schema and the test-only probe while native remains the
     # selected authority.  The S3 runtime is installed only after this setup.
     with kb.connect_closing(database_path) as conn:
+        schema_module.create_schema(conn)
         conn.execute(
             "CREATE TABLE boundary_probe ("
             "value TEXT PRIMARY KEY, audit TEXT NOT NULL)"
@@ -233,6 +235,10 @@ def test_read_handler_never_mints_or_consumes_a_mutation_capability(
         "operation": "kanban_show",
         "value": {"projection": "visible"},
     }
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
 
 
 def test_mutation_uses_one_adapter_owned_transaction_and_consumes_exact_binding(
@@ -269,6 +275,7 @@ def test_mutation_uses_one_adapter_owned_transaction_and_consumes_exact_binding(
     result = boundary.submit(
         "kanban_comment",
         attempt_id="attempt-write",
+        idempotency_key="idempotency-write",
         target="task-1",
         expected_version=7,
         session_id="session-1",
@@ -329,6 +336,7 @@ def test_mutation_failure_rolls_back_and_returns_canonical_rejection(
     result = boundary.submit(
         "kanban_comment",
         attempt_id="attempt-rollback",
+        idempotency_key="idempotency-rollback",
         target="task-2",
         expected_version=0,
         session_id="session-2",
@@ -378,3 +386,304 @@ def test_recognized_but_unimplemented_operation_rejects_before_capability_mint(
         operation="kanban_update_initiative",
         code="OPERATION_NOT_IMPLEMENTED",
     )
+
+
+def test_mutation_requires_idempotency_key_before_capability_mint_or_handler(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+
+    def forbidden_mint(_binding):
+        raise AssertionError("missing idempotency key must reject before mint")
+
+    def forbidden_handler(_context):
+        raise AssertionError("missing idempotency key must reject before handler")
+
+    monkeypatch.setattr(provider, "_mint_after_admission", forbidden_mint)
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": forbidden_handler},
+    )
+
+    result = boundary.submit(
+        "kanban_comment",
+        attempt_id="attempt-missing-key",
+        target="task-missing-key",
+        expected_version=0,
+        session_id="session-missing-key",
+        execution_context="run-missing-key",
+        payload={"body": "must reject"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_comment",
+        code="IDEMPOTENCY_KEY_REQUIRED",
+    )
+
+
+def test_exact_idempotent_replay_returns_original_response_without_handler(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    calls = []
+
+    def handler(context):
+        calls.append(context.attempt_id)
+        context.connection.execute(
+            "INSERT INTO boundary_probe (value, audit) VALUES (?, ?)",
+            ("replay-once", "first-attempt"),
+        )
+        return {"record_id": "replay-once"}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": handler},
+    )
+    fields = {
+        "idempotency_key": "idempotency-replay",
+        "target": "task-replay",
+        "expected_version": 3,
+        "session_id": "session-replay",
+        "workspace_id": "workspace-replay",
+        "execution_context": "run-replay",
+        "payload": {"author": "worker", "body": "only once"},
+    }
+
+    first = boundary.submit("kanban_comment", attempt_id="attempt-first", **fields)
+    second = boundary.submit("kanban_comment", attempt_id="attempt-retry", **fields)
+
+    assert first["result"] == "ACCEPTED"
+    assert second == first
+    assert second["attempt_id"] == "attempt-first"
+    assert calls == ["attempt-first"]
+
+    request_identity = {
+        "operation": "kanban_comment",
+        "target": "task-replay",
+        "expected_version": 3,
+        "payload": fields["payload"],
+        "session_id": "session-replay",
+        "workspace_id": "workspace-replay",
+        "plugin_version": modules["provider"].PLUGIN_VERSION,
+        "protocol_version": modules["provider"].PROTOCOL_VERSION,
+        "execution_context": "run-replay",
+    }
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            request_identity,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    with sqlite3.connect(database_path) as conn:
+        rows = conn.execute(
+            "SELECT idempotency_key, operation, target, request_digest, "
+            "response_json, created_at FROM adrian_kanban_command_receipts"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][:4] == (
+            "idempotency-replay",
+            "kanban_comment",
+            "task-replay",
+            expected_digest,
+        )
+        assert json.loads(rows[0][4]) == first
+        assert type(rows[0][5]) is int and rows[0][5] > 0
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("operation", "kanban_heartbeat"),
+        ("target", "task-other"),
+        ("expected_version", 8),
+        ("payload", {"body": "different"}),
+        ("session_id", "session-other"),
+        ("workspace_id", "workspace-other"),
+        ("execution_context", "run-other"),
+    ],
+)
+def test_same_idempotency_key_with_different_request_rejects_without_handler(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+    changed_field,
+    changed_value,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    calls = []
+
+    def handler(context):
+        calls.append(context.operation)
+        return {"accepted": len(calls)}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_comment": handler,
+            "kanban_heartbeat": handler,
+        },
+    )
+    base = {
+        "operation": "kanban_comment",
+        "attempt_id": "attempt-original",
+        "idempotency_key": "idempotency-conflict",
+        "target": "task-conflict",
+        "expected_version": 7,
+        "session_id": "session-conflict",
+        "workspace_id": "workspace-conflict",
+        "execution_context": "run-conflict",
+        "payload": {"body": "original"},
+    }
+    first_operation = base.pop("operation")
+    first = boundary.submit(first_operation, **base)
+    assert first["result"] == "ACCEPTED"
+
+    retry = dict(base)
+    retry["attempt_id"] = "attempt-conflict"
+    retry_operation = first_operation
+    if changed_field == "operation":
+        retry_operation = changed_value
+    else:
+        retry[changed_field] = changed_value
+    conflict = boundary.submit(retry_operation, **retry)
+
+    _assert_canonical_rejection(
+        conflict,
+        operation=retry_operation,
+        code="IDEMPOTENCY_CONFLICT",
+    )
+    assert len(calls) == 1
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 1
+
+
+def test_failed_attempt_leaves_no_receipt_and_same_key_can_retry(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+    attempts = []
+
+    def handler(context):
+        attempts.append(context.attempt_id)
+        context.connection.execute(
+            "INSERT INTO boundary_probe (value, audit) VALUES (?, ?)",
+            ("retry-result", context.attempt_id),
+        )
+        if len(attempts) == 1:
+            raise RuntimeError("first attempt fails")
+        return {"record_id": "retry-result"}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": handler},
+    )
+    fields = {
+        "idempotency_key": "idempotency-after-failure",
+        "target": "task-after-failure",
+        "expected_version": 0,
+        "session_id": "session-after-failure",
+        "execution_context": "run-after-failure",
+        "payload": {"body": "retry safely"},
+    }
+
+    failed = boundary.submit("kanban_comment", attempt_id="attempt-failed", **fields)
+    _assert_canonical_rejection(
+        failed,
+        operation="kanban_comment",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
+
+    accepted = boundary.submit("kanban_comment", attempt_id="attempt-success", **fields)
+    assert accepted["result"] == "ACCEPTED"
+    assert attempts == ["attempt-failed", "attempt-success"]
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 1
+
+
+def test_nonserializable_result_rolls_back_mutation_and_receipt(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path,
+        monkeypatch,
+        modules["provider"],
+    )
+
+    def handler(context):
+        context.connection.execute(
+            "INSERT INTO boundary_probe (value, audit) VALUES (?, ?)",
+            ("nonserializable", "must-rollback"),
+        )
+        return {"invalid": {"a-set"}}
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={"kanban_comment": handler},
+    )
+    result = boundary.submit(
+        "kanban_comment",
+        attempt_id="attempt-nonserializable",
+        idempotency_key="idempotency-nonserializable",
+        target="task-nonserializable",
+        expected_version=0,
+        session_id="session-nonserializable",
+        execution_context="run-nonserializable",
+        payload={"body": "invalid result"},
+    )
+
+    _assert_canonical_rejection(
+        result,
+        operation="kanban_comment",
+        code="COMMAND_EXECUTION_FAILED",
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0

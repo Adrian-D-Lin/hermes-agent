@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 import uuid
 from types import MappingProxyType
 from typing import Any
@@ -62,9 +63,13 @@ _UNRECOGNIZED_OPERATION = "UNRECOGNIZED_OPERATION"
 _COMMAND_BOUNDARY_UNAVAILABLE = "COMMAND_BOUNDARY_UNAVAILABLE"
 _OPERATION_NOT_IMPLEMENTED = "OPERATION_NOT_IMPLEMENTED"
 _COMMAND_EXECUTION_FAILED = "COMMAND_EXECUTION_FAILED"
+_IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+_IDEMPOTENCY_KEY_REQUIRED = "IDEMPOTENCY_KEY_REQUIRED"
 
 _BOUNDARY_SOURCE = "adrian-kanban"
 _BOUNDARY_DESTINATION = "adrian-kanban"
+
+_RECEIPT_TABLE = "adrian_kanban_command_receipts"
 
 
 def _resolve_attempt_id(fields: dict[str, Any]) -> str:
@@ -138,6 +143,37 @@ def command_boundary(action: str, **fields: Any) -> dict[str, Any]:
     if action not in RECOGNIZED_OPERATIONS:
         return _rejection(attempt_id, action, _UNRECOGNIZED_OPERATION)
     return _rejection(attempt_id, action, _COMMAND_BOUNDARY_UNAVAILABLE)
+
+
+def _request_digest(
+    operation: str,
+    target: str,
+    expected_version: int,
+    payload: dict[str, Any],
+    session_id: str,
+    workspace_id: str | None,
+    execution_context: str,
+) -> str:
+    identity = {
+        "operation": operation,
+        "target": target,
+        "expected_version": expected_version,
+        "payload": payload,
+        "session_id": session_id,
+        "workspace_id": workspace_id,
+        "plugin_version": PLUGIN_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "execution_context": execution_context,
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_digest(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 class _CommandContext:
@@ -240,6 +276,12 @@ class _CommandBoundary:
         attempt_id: str,
         fields: dict[str, Any],
     ) -> dict[str, Any]:
+        idempotency_key = fields.get("idempotency_key")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            return self._rejection_internal(
+                attempt_id, action, _IDEMPOTENCY_KEY_REQUIRED
+            )
+
         target = fields.get("target")
         session_id = fields.get("session_id")
         execution_context = fields.get("execution_context")
@@ -278,17 +320,21 @@ class _CommandBoundary:
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
             )
 
-        canonical_digest = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
-        ).hexdigest()
+        request_digest = _request_digest(
+            operation=action,
+            target=target,
+            expected_version=expected_version,
+            payload=payload,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            execution_context=execution_context,
+        )
 
         binding = CapabilityBinding(
             operation=action,
             target=target,
             expected_version=expected_version,
-            canonical_digest=canonical_digest,
+            canonical_digest=_canonical_digest(payload),
             session_id=session_id,
             workspace_id=workspace_id,
             plugin_version=PLUGIN_VERSION,
@@ -314,6 +360,16 @@ class _CommandBoundary:
         adapter = self._provider._create_mutation_executor(conn)
         try:
             with adapter.mutation_transaction(capability, binding):
+                row = conn.execute(
+                    f"SELECT request_digest, response_json FROM {_RECEIPT_TABLE} "
+                    "WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if row is not None:
+                    if row["request_digest"] != request_digest:
+                        raise _ConflictError()
+                    return json.loads(row["response_json"])
+
                 context = _CommandContext(
                     operation=action,
                     payload=payload,
@@ -326,13 +382,38 @@ class _CommandBoundary:
                 result = handler(context)
                 if not isinstance(result, dict):
                     raise TypeError("handler must return a dict")
-                return {
-                    "result": "ACCEPTED",
-                    "state_changed": True,
-                    "attempt_id": attempt_id,
-                    "operation": action,
-                    "value": result,
-                }
+                try:
+                    response_json = json.dumps(
+                        {
+                            "result": "ACCEPTED",
+                            "state_changed": True,
+                            "attempt_id": attempt_id,
+                            "operation": action,
+                            "value": result,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                except (TypeError, ValueError):
+                    raise TypeError("handler result is not JSON serializable")
+                conn.execute(
+                    f"INSERT INTO {_RECEIPT_TABLE} "
+                    "(idempotency_key, operation, target, request_digest, "
+                    "response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        action,
+                        target,
+                        request_digest,
+                        response_json,
+                        int(time.time()),
+                    ),
+                )
+                return json.loads(response_json)
+        except _ConflictError:
+            return self._rejection_internal(
+                attempt_id, action, _IDEMPOTENCY_CONFLICT
+            )
         except Exception:
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
@@ -364,6 +445,10 @@ class _CommandBoundary:
             )
         )
         return collector.rejection().as_dict()
+
+
+class _ConflictError(RuntimeError):
+    pass
 
 
 __all__ = [

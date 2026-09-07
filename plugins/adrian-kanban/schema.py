@@ -18,6 +18,10 @@ S2 adds the fixed internal policy and execution engine records:
 * ``segment_workspace_members`` (corrected S1 provisional name),
 * ``external_operation_journal`` (append-only external-effect event sequence).
 
+S3 adds the additive command-receipt table ``adrian_kanban_command_receipts``
+that makes accepted mutations durable and idempotent. Rejections are never
+stored in this table.
+
 These tables are **non-public** persistence primitives. They exist so the S1
 store can create and validate disposable foundational state and so the S2 engine
 can exercise lifecycle admission, transition policy, workspace operations, and
@@ -297,6 +301,21 @@ CREATE TABLE IF NOT EXISTS external_operation_journal (
     FOREIGN KEY (workspace_id) REFERENCES segment_workspaces (workspace_id),
     FOREIGN KEY (workspace_id, repository_identity)
         REFERENCES segment_workspace_members (workspace_id, repository_identity)
+);
+
+-- Command receipts: one row per accepted mutation, keyed by the authority-global
+-- idempotency key. The row records the operation, target, request digest, and
+-- the exact accepted response envelope. Its existence proves the accepted
+-- mutation and response committed. Rejections are never stored here, so a
+-- failed key remains eligible for retry. The primary key plus the adapter's
+-- outer BEGIN IMMEDIATE transaction serialize concurrent retries safely.
+CREATE TABLE IF NOT EXISTS adrian_kanban_command_receipts (
+    idempotency_key TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    target TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 """
 
