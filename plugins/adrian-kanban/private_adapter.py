@@ -552,6 +552,124 @@ class _PrivateNativeAdapter:
             operation, binding, arguments, allow_nested=True
         )
 
+    def _complete_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        result: Optional[str] = None,
+        summary: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        created_cards: Optional[tuple[str, ...]] = None,
+        expected_run_id: Optional[int] = None,
+    ) -> Any:
+        args = _CompleteTaskArgs(
+            task_id=task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+            created_cards=created_cards,
+            expected_run_id=expected_run_id,
+        )
+        return self._execute_in_active_transaction(capability, binding, args)
+
+    def _block_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        reason: Optional[str] = None,
+        kind: Optional[str] = None,
+        expected_run_id: Optional[int] = None,
+    ) -> Any:
+        args = _BlockTaskArgs(
+            task_id=task_id,
+            reason=reason,
+            kind=kind,
+            expected_run_id=expected_run_id,
+        )
+        return self._execute_in_active_transaction(capability, binding, args)
+
+    def _unblock_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+    ) -> Any:
+        args = _UnblockTaskArgs(task_id=task_id)
+        return self._execute_in_active_transaction(capability, binding, args)
+
+    def _comment_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        author: str,
+        body: str,
+    ) -> Any:
+        args = _CommentArgs(task_id=task_id, author=author, body=body)
+        return self._execute_in_active_transaction(capability, binding, args)
+
+    def _heartbeat_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        note: Optional[str] = None,
+        expected_run_id: Optional[int] = None,
+    ) -> Any:
+        args = _HeartbeatArgs(
+            task_id=task_id,
+            note=note,
+            expected_run_id=expected_run_id,
+        )
+        return self._execute_in_active_transaction(capability, binding, args)
+
+    def _request_changes_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        reason: str,
+        expected_run_id: Optional[int] = None,
+    ) -> Any:
+        args = _RequestChangesArgs(
+            task_id=task_id,
+            reason=reason,
+            expected_run_id=expected_run_id,
+        )
+        return self._execute_in_active_transaction(capability, binding, args)
+
+    def _request_review_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        summary: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        reviewer: Optional[str] = None,
+        expected_run_id: Optional[int] = None,
+        force: bool = False,
+        with_reason: bool = False,
+    ) -> Any:
+        args = _RequestReviewArgs(
+            task_id=task_id,
+            summary=summary,
+            metadata=metadata,
+            reviewer=reviewer,
+            expected_run_id=expected_run_id,
+            force=force,
+            with_reason=with_reason,
+        )
+        return self._execute_in_active_transaction(capability, binding, args)
+
     def _create_in_active_transaction(
         self,
         capability: Any,

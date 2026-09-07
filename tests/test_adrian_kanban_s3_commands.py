@@ -979,6 +979,115 @@ def test_active_transaction_operation_allowlist_matches_implemented_mutations(
 
 
 @pytest.mark.parametrize(
+    ("method_name", "expected_type_name", "kwargs"),
+    (
+        (
+            "_complete_in_active_transaction",
+            "_CompleteTaskArgs",
+            {
+                "task_id": "task-wrapper",
+                "result": "done",
+                "summary": "summary",
+                "metadata": {"quality": "accepted"},
+                "created_cards": ("task-child",),
+                "expected_run_id": 4,
+            },
+        ),
+        (
+            "_block_in_active_transaction",
+            "_BlockTaskArgs",
+            {
+                "task_id": "task-wrapper",
+                "reason": "waiting",
+                "kind": "dependency",
+                "expected_run_id": 4,
+            },
+        ),
+        (
+            "_unblock_in_active_transaction",
+            "_UnblockTaskArgs",
+            {"task_id": "task-wrapper"},
+        ),
+        (
+            "_comment_in_active_transaction",
+            "_CommentArgs",
+            {
+                "task_id": "task-wrapper",
+                "author": "session-wrapper",
+                "body": "evidence",
+            },
+        ),
+        (
+            "_heartbeat_in_active_transaction",
+            "_HeartbeatArgs",
+            {
+                "task_id": "task-wrapper",
+                "note": "alive",
+                "expected_run_id": 4,
+            },
+        ),
+        (
+            "_request_changes_in_active_transaction",
+            "_RequestChangesArgs",
+            {
+                "task_id": "task-wrapper",
+                "reason": "revise",
+                "expected_run_id": 4,
+            },
+        ),
+        (
+            "_request_review_in_active_transaction",
+            "_RequestReviewArgs",
+            {
+                "task_id": "task-wrapper",
+                "summary": "ready",
+                "metadata": {"handoff": "valid"},
+                "reviewer": "reviewer",
+                "expected_run_id": 4,
+                "force": False,
+                "with_reason": False,
+            },
+        ),
+    ),
+)
+def test_private_adapter_exposes_narrow_typed_boundary_methods(
+    commands_module,
+    monkeypatch,
+    method_name,
+    expected_type_name,
+    kwargs,
+):
+    adapter_module = _runtime_modules(commands_module)["private_adapter"]
+    observed = {}
+
+    def execute_spy(self, capability, binding, arguments):
+        observed["self"] = self
+        observed["capability"] = capability
+        observed["binding"] = binding
+        observed["arguments"] = arguments
+        return "transport-result"
+
+    monkeypatch.setattr(
+        adapter_module._PrivateNativeAdapter,
+        "_execute_in_active_transaction",
+        execute_spy,
+    )
+    adapter = object.__new__(adapter_module._PrivateNativeAdapter)
+    capability = object()
+    binding = object()
+
+    result = getattr(adapter, method_name)(capability, binding, **kwargs)
+
+    assert result == "transport-result"
+    assert observed["self"] is adapter
+    assert observed["capability"] is capability
+    assert observed["binding"] is binding
+    assert type(observed["arguments"]).__name__ == expected_type_name
+    for field, value in kwargs.items():
+        assert getattr(observed["arguments"], field) == value
+
+
+@pytest.mark.parametrize(
     "operation",
     (
         "kanban_complete",
