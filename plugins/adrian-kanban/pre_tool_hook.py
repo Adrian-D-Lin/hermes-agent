@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from writegate import registry as _writegate
 
+from .published_git import read_published_blob
 from .segment_manifest import PreparedSegmentManifest, prepare_segment_manifest
 from .task_inputs import (
     PreparedManifest,
@@ -122,28 +123,7 @@ class GitSegmentManifestPreparer:
             resolved = Path(worktree_path).expanduser().resolve()
             if not resolved.is_dir():
                 raise ValueError("worktree_path is not a directory")
-            try:
-                result = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(resolved),
-                        "cat-file",
-                        "blob",
-                        f"{commit}:{path}",
-                    ],
-                    capture_output=True,
-                    timeout=_GIT_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired:
-                raise ValueError("git operation timed out") from None
-            except FileNotFoundError:
-                raise ValueError("git executable not found") from None
-            except OSError:
-                raise ValueError("git operation failed") from None
-            if result.returncode != 0:
-                raise ValueError("failed to read git object")
-            return result.stdout
+            return read_published_blob(str(resolved), commit, path)
 
         return prepare_segment_manifest(
             update,

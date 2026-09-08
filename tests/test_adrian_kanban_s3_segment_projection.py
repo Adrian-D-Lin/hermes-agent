@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,8 @@ def plugin_modules():
             "schema",
             "segment_manifest",
             "workspace",
+            "pre_tool_hook",
+            "task_inputs",
         )
     }
     yield modules
@@ -205,9 +208,7 @@ def test_preparer_reads_one_pinned_git_blob_and_derives_all_operational_fields(
             "repository",
         ),
         (
-            lambda m: m["segments"][0].update(
-                segment_workspace_id="caller-selected"
-            ),
+            lambda m: m["segments"][0].update(segment_workspace_id="caller-selected"),
             "workspace",
         ),
         (
@@ -518,7 +519,9 @@ def test_projection_admission_is_atomic_and_preassigns_every_workspace_member(
     payload = _payload()
     _approve(database_path, payload)
 
-    result = _submit(_boundary(plugin_modules, database_path, provider, prepared), payload)
+    result = _submit(
+        _boundary(plugin_modules, database_path, provider, prepared), payload
+    )
 
     assert result["result"] == "ACCEPTED"
     assert result["value"] == {
@@ -538,9 +541,14 @@ def test_projection_admission_is_atomic_and_preassigns_every_workspace_member(
         assert projection["initiative_id"] == "initiative-1"
         assert projection["manifest_path"] == _request()["manifest_path"]
         assert projection["manifest_sha"] == _request()["manifest_sha"]
-        assert projection["content_digest"] == hashlib.sha256(manifest_bytes).hexdigest()
+        assert (
+            projection["content_digest"] == hashlib.sha256(manifest_bytes).hexdigest()
+        )
         assert projection["validation_result"] == "accepted"
-        assert json.loads(projection["parsed_segment_definitions"])[1]["segment_id"] == "S2"
+        assert (
+            json.loads(projection["parsed_segment_definitions"])[1]["segment_id"]
+            == "S2"
+        )
         assert json.loads(projection["readiness_refs"]) == {
             "S1": "2-design/dev1/readiness.md#s1",
             "S2": "2-design/dev1/readiness.md#s2",
@@ -626,9 +634,10 @@ def test_projection_admission_is_atomic_and_preassigns_every_workspace_member(
         ]
         assert json.loads(phase_result["actor_evidence"])["actor_profile"] == "default"
         assert phase_result["accepted"] == 1
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals"
-        ).fetchone()[0] == "consumed"
+        assert (
+            conn.execute("SELECT state FROM write_gate_kanban_approvals").fetchone()[0]
+            == "consumed"
+        )
 
 
 def test_projection_rejection_does_not_consume_approval_or_leave_partial_rows(
@@ -653,20 +662,30 @@ def test_projection_rejection_does_not_consume_approval_or_leave_partial_rows(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals"
-        ).fetchone()[0] == "approved"
-        assert conn.execute(
-            "SELECT COUNT(*) FROM initiative_segment_projections"
-        ).fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM segment_workspaces").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM segment_workspace_members"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards "
-            "WHERE card_type='initiative'"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT state FROM write_gate_kanban_approvals").fetchone()[0]
+            == "approved"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM initiative_segment_projections"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM segment_workspaces").fetchone()[0] == 0
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM segment_workspace_members").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards "
+                "WHERE card_type='initiative'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(
@@ -689,16 +708,22 @@ def test_projection_rejects_manifest_task_identity_mismatch_before_consumption(
     payload = _payload()
     _approve(database_path, payload)
 
-    result = _submit(_boundary(plugin_modules, database_path, provider, prepared), payload)
+    result = _submit(
+        _boundary(plugin_modules, database_path, provider, prepared), payload
+    )
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals"
-        ).fetchone()[0] == "approved"
-        assert conn.execute(
-            "SELECT COUNT(*) FROM initiative_segment_projections"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT state FROM write_gate_kanban_approvals").fetchone()[0]
+            == "approved"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM initiative_segment_projections"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_projection_rejects_wrong_dev1_checkpoint_before_consumption(
@@ -722,13 +747,16 @@ def test_projection_rejects_wrong_dev1_checkpoint_before_consumption(
     payload = _payload()
     _approve(database_path, payload)
 
-    result = _submit(_boundary(plugin_modules, database_path, provider, prepared), payload)
+    result = _submit(
+        _boundary(plugin_modules, database_path, provider, prepared), payload
+    )
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals"
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT state FROM write_gate_kanban_approvals").fetchone()[0]
+            == "approved"
+        )
 
 
 def test_projection_rejects_prepared_request_identity_mismatch(
@@ -746,13 +774,16 @@ def test_projection_rejects_prepared_request_identity_mismatch(
     payload["update"]["manifest_sha"] = "9" * 40
     _approve(database_path, payload)
 
-    result = _submit(_boundary(plugin_modules, database_path, provider, prepared), payload)
+    result = _submit(
+        _boundary(plugin_modules, database_path, provider, prepared), payload
+    )
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals"
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT state FROM write_gate_kanban_approvals").fetchone()[0]
+            == "approved"
+        )
 
 
 def test_projection_receipt_replay_does_not_prepare_or_mutate_twice(
@@ -777,20 +808,27 @@ def test_projection_receipt_replay_does_not_prepare_or_mutate_twice(
     assert replay == first
     assert calls == [("segment_manifest_projection", "session-projection")]
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM initiative_segment_projections"
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards "
-            "WHERE card_type = 'initiative'"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM initiative_segment_projections"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards "
+                "WHERE card_type = 'initiative'"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_schema_allows_unknown_base_only_for_planned_member(plugin_modules):
     conn = sqlite3.connect(":memory:")
     plugin_modules["schema"].create_schema(conn)
     columns = {
-        row[1]: row for row in conn.execute("PRAGMA table_info(segment_workspace_members)")
+        row[1]: row
+        for row in conn.execute("PRAGMA table_info(segment_workspace_members)")
     }
     assert columns["required_base_sha"][3] == 0
     conn.close()
@@ -828,6 +866,186 @@ def _disposable_repository(tmp_path: Path) -> tuple[Path, str]:
     return repository.resolve(), _git(repository, "rev-parse", "HEAD")
 
 
+def _committed_segment_manifest(repository):
+    request = _request()
+    path = repository / request["manifest_path"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = _canonical_bytes(_manifest())
+    path.write_bytes(content)
+    _git(repository, "add", "--", request["manifest_path"])
+    _git(repository, "commit", "-m", "segment manifest")
+    request["manifest_sha"] = _git(repository, "rev-parse", "HEAD")
+    return request, content
+
+
+def _prepare_published_manifest(modules, repository, request):
+    registry = SimpleNamespace(
+        get_active_binding=lambda session_id: (
+            SimpleNamespace(worktree_path=str(repository))
+            if session_id == "publication-session"
+            else None
+        )
+    )
+    preparer = modules["pre_tool_hook"].GitSegmentManifestPreparer(
+        lambda: frozenset({"repo-1", "repo-2"}), lambda: registry
+    )
+    return preparer(
+        {
+            "initiative_id": "initiative-1",
+            "update_kind": "segment_manifest_projection",
+            "update": request,
+        },
+        modules["task_inputs"].TaskInputPreparationContext(
+            session_id="publication-session",
+            execution_context="model-tool",
+            workspace_id=None,
+            actor_profile="default",
+        ),
+    )
+
+
+@pytest.mark.parametrize("publication", ["unpushed", "feature_only", "rewound_main"])
+def test_segment_projection_requires_actual_remote_main_containment(
+    plugin_modules, tmp_path, publication
+):
+    repository, base = _disposable_repository(tmp_path)
+    request, _ = _committed_segment_manifest(repository)
+    if publication == "feature_only":
+        _git(repository, "push", "origin", "HEAD:refs/heads/feature")
+    elif publication == "rewound_main":
+        _git(repository, "push", "origin", "main")
+        # Remote maintenance bypasses this checkout's stale tracking reference.
+        _git(tmp_path / "origin.git", "update-ref", "refs/heads/main", base)
+        assert _git(repository, "rev-parse", "origin/main") == request["manifest_sha"]
+    before = _git(repository, "show-ref")
+    with pytest.raises(ValueError, match="origin/main"):
+        _prepare_published_manifest(plugin_modules, repository, request)
+    assert _git(repository, "show-ref") == before
+
+
+def test_segment_projection_accepts_published_ancestor_despite_stale_tracking_ref(
+    plugin_modules, tmp_path
+):
+    repository, base = _disposable_repository(tmp_path)
+    request, content = _committed_segment_manifest(repository)
+    _git(repository, "commit", "--allow-empty", "-m", "later main commit")
+    _git(repository, "push", "origin", "main")
+    _git(repository, "update-ref", "refs/remotes/origin/main", base)
+    (repository / request["manifest_path"]).write_text("dirty local data")
+    before = _git(repository, "show-ref")
+    prepared = _prepare_published_manifest(plugin_modules, repository, request)
+    assert prepared.content_digest == hashlib.sha256(content).hexdigest()
+    assert _git(repository, "show-ref") == before
+    assert (repository / request["manifest_path"]).read_text() == "dirty local data"
+
+
+def test_segment_projection_does_not_fetch_missing_remote_tip_objects(
+    plugin_modules, tmp_path
+):
+    repository, _ = _disposable_repository(tmp_path)
+    request, _ = _committed_segment_manifest(repository)
+    _git(repository, "push", "origin", "main")
+    peer = tmp_path / "peer"
+    _git(tmp_path, "clone", "--branch", "main", str(tmp_path / "origin.git"), str(peer))
+    _git(peer, "config", "user.name", "Peer")
+    _git(peer, "config", "user.email", "peer@example.invalid")
+    _git(peer, "commit", "--allow-empty", "-m", "remote advance")
+    _git(peer, "push", "origin", "main")
+    tip = _git(peer, "rev-parse", "HEAD")
+    before = _git(repository, "show-ref")
+    with pytest.raises(ValueError, match="[Ff]etch"):
+        _prepare_published_manifest(plugin_modules, repository, request)
+    assert _git(repository, "show-ref") == before
+    assert (
+        subprocess.run(
+            ["git", "cat-file", "-e", tip], cwd=repository, capture_output=True
+        ).returncode
+        != 0
+    )
+
+
+def test_segment_projection_rejects_absent_remote_main(plugin_modules, tmp_path):
+    repository, _ = _disposable_repository(tmp_path)
+    request, _ = _committed_segment_manifest(repository)
+    _git(tmp_path / "origin.git", "update-ref", "-d", "refs/heads/main")
+    with pytest.raises(ValueError, match="origin/main"):
+        _prepare_published_manifest(plugin_modules, repository, request)
+
+
+def test_segment_projection_ignores_local_git_replacement_objects(
+    plugin_modules, tmp_path
+):
+    repository, _ = _disposable_repository(tmp_path)
+    request, content = _committed_segment_manifest(repository)
+    _git(repository, "push", "origin", "main")
+    replacement = _manifest()
+    replacement["initiative_title"] = "locally replaced title"
+    (repository / request["manifest_path"]).write_bytes(_canonical_bytes(replacement))
+    _git(repository, "add", "--", request["manifest_path"])
+    _git(repository, "commit", "-m", "replacement content")
+    replacement_sha = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "replace", request["manifest_sha"], replacement_sha)
+    prepared = _prepare_published_manifest(plugin_modules, repository, request)
+    assert prepared.content_digest == hashlib.sha256(content).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "remote_result",
+    [
+        b"",
+        b"invalid-secret-remote-url\n",
+        b"a" * 40 + b" refs/heads/feature\n",
+        (b"a" * 40 + b" refs/heads/main\n") * 2,
+        b"\xff refs/heads/main\n",
+    ],
+)
+def test_segment_projection_rejects_malformed_remote_response_without_echo(
+    plugin_modules, tmp_path, monkeypatch, remote_result
+):
+    repository, _ = _disposable_repository(tmp_path)
+    request, _ = _committed_segment_manifest(repository)
+    real_run = subprocess.run
+
+    def run(args, **kwargs):
+        if "ls-remote" in args:
+            return subprocess.CompletedProcess(
+                args, 0, remote_result, b"private stderr"
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(ValueError, match="origin/main") as failure:
+        _prepare_published_manifest(plugin_modules, repository, request)
+    assert "secret" not in str(failure.value)
+    assert "private" not in str(failure.value)
+
+
+@pytest.mark.parametrize("failure_kind", ["timeout", "nonzero", "oserror"])
+def test_segment_projection_remote_failures_are_safe_and_actionable(
+    plugin_modules, tmp_path, monkeypatch, failure_kind
+):
+    repository, _ = _disposable_repository(tmp_path)
+    request, _ = _committed_segment_manifest(repository)
+    real_run = subprocess.run
+
+    def run(args, **kwargs):
+        if "ls-remote" not in args:
+            return real_run(args, **kwargs)
+        if failure_kind == "timeout":
+            raise subprocess.TimeoutExpired(args, 30, stderr=b"private token")
+        if failure_kind == "oserror":
+            raise OSError("private token")
+        return subprocess.CompletedProcess(args, 128, b"", b"private token")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(ValueError) as failure:
+        _prepare_published_manifest(plugin_modules, repository, request)
+    assert "private" not in str(failure.value)
+    assert any(
+        word in str(failure.value).lower() for word in ("retry", "check", "verify")
+    )
+
+
 def test_planned_member_base_is_trusted_late_bound_and_idempotent(
     plugin_modules, tmp_path, monkeypatch
 ):
@@ -841,29 +1059,32 @@ def test_planned_member_base_is_trusted_late_bound_and_idempotent(
     )
     payload = _payload()
     _approve(database_path, payload)
-    assert _submit(
-        _boundary(plugin_modules, database_path, provider, prepared), payload
-    )["result"] == "ACCEPTED"
+    assert (
+        _submit(_boundary(plugin_modules, database_path, provider, prepared), payload)[
+            "result"
+        ]
+        == "ACCEPTED"
+    )
     repository, expected_sha = _disposable_repository(tmp_path)
     workspace = plugin_modules["workspace"]
-    registry = workspace._TrustedRepositoryRegistry(
-        (
-            workspace._RepositoryRegistration(
-                repository_identity="repo-1",
-                repository_root=str(repository),
-                controlled_worktree_root=str(repository / ".segment-worktrees"),
-            ),
-        )
-    )
+    registry = workspace._TrustedRepositoryRegistry((
+        workspace._RepositoryRegistration(
+            repository_identity="repo-1",
+            repository_root=str(repository),
+            controlled_worktree_root=str(repository / ".segment-worktrees"),
+        ),
+    ))
     conn = sqlite3.connect(database_path, isolation_level=None)
     controller = workspace._SegmentWorkspaceController(conn, registry)
 
-    assert controller.pin_planned_member_base(
-        "initiative-1:S1", "repo-1", pinned_at=10
-    ) == expected_sha
-    assert controller.pin_planned_member_base(
-        "initiative-1:S1", "repo-1", pinned_at=11
-    ) == expected_sha
+    assert (
+        controller.pin_planned_member_base("initiative-1:S1", "repo-1", pinned_at=10)
+        == expected_sha
+    )
+    assert (
+        controller.pin_planned_member_base("initiative-1:S1", "repo-1", pinned_at=11)
+        == expected_sha
+    )
     assert conn.execute(
         "SELECT required_base_sha, observed_head, member_state, observed_at "
         "FROM segment_workspace_members WHERE workspace_id = 'initiative-1:S1' "
@@ -872,9 +1093,7 @@ def test_planned_member_base_is_trusted_late_bound_and_idempotent(
 
     monkeypatch.setattr(controller, "_resolve_origin_main", lambda _root: "9" * 40)
     with pytest.raises(workspace._WorkspaceRejected, match="base mismatch"):
-        controller.pin_planned_member_base(
-            "initiative-1:S1", "repo-1", pinned_at=12
-        )
+        controller.pin_planned_member_base("initiative-1:S1", "repo-1", pinned_at=12)
     conn.close()
 
 

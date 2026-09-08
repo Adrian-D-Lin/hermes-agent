@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,9 +39,7 @@ def commands_module():
 
 
 def _database(tmp_path, monkeypatch, commands_module):
-    provider_module = importlib.import_module(
-        f"{commands_module.__package__}.provider"
-    )
+    provider_module = importlib.import_module(f"{commands_module.__package__}.provider")
     schema_module = importlib.import_module(f"{commands_module.__package__}.schema")
     database_path = (tmp_path / "kanban.sqlite3").resolve()
     with kb.connect_closing(database_path) as conn:
@@ -95,7 +94,9 @@ Continue the active implementation.
 
 
 def _approval_digest(payload: dict) -> str:
-    approved_payload = {key: value for key, value in payload.items() if key != "approval_id"}
+    approved_payload = {
+        key: value for key, value in payload.items() if key != "approval_id"
+    }
     return hashlib.sha256(
         json.dumps(
             approved_payload,
@@ -243,13 +244,16 @@ def test_create_initiative_consumes_exact_approval_and_initializes_d1(
         assert transition["previous_transition_id"] is None
         assert transition["to_phase"] == "D1"
         assert transition["to_segment_id"] is None
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
-            ("approval-create",),
-        ).fetchone()[0] == "consumed"
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_cards"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
+                ("approval-create",),
+            ).fetchone()[0]
+            == "consumed"
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM adrian_kanban_cards").fetchone()[0] == 1
+        )
 
 
 def test_wrong_approval_digest_rejects_without_spending_or_creating(
@@ -292,20 +296,21 @@ def test_wrong_approval_digest_rejects_without_spending_or_creating(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM adrian_kanban_cards"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
-            ("approval-create",),
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM adrian_kanban_cards").fetchone()[0] == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
+                ("approval-create",),
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 def _seed_initiative(database_path: Path):
     with sqlite3.connect(database_path) as conn:
-        conn.execute(
-            "INSERT INTO adrian_kanban_initiatives VALUES ('initiative-1')"
-        )
+        conn.execute("INSERT INTO adrian_kanban_initiatives VALUES ('initiative-1')")
         card_id = conn.execute(
             "INSERT INTO adrian_kanban_cards "
             "(card_type, initiative_id, task_id, title, body, created_at, "
@@ -443,17 +448,21 @@ def test_transition_supports_approved_non_linear_route_with_reconciliation(
         ).fetchall()
         assert [row["transition_id"] for row in rows] == [1, 2]
         assert rows[1]["previous_transition_id"] == 1
-        assert rows[1]["repository_reconciliation_ref"] == payload[
-            "reconciliation_ref"
-        ]
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards "
-            "WHERE initiative_id = 'initiative-1'"
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals "
-            "WHERE approval_id = 'approval-transition'"
-        ).fetchone()[0] == "consumed"
+        assert rows[1]["repository_reconciliation_ref"] == payload["reconciliation_ref"]
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards "
+                "WHERE initiative_id = 'initiative-1'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals "
+                "WHERE approval_id = 'approval-transition'"
+            ).fetchone()[0]
+            == "consumed"
+        )
 
 
 def test_transition_reports_independent_shape_failures_without_spending_approval(
@@ -462,66 +471,119 @@ def test_transition_reports_independent_shape_failures_without_spending_approval
     database_path, provider = _database(tmp_path, monkeypatch, commands_module)
     _seed_initiative(database_path)
     payload = {
-        "initiative_id": "initiative-1", "board": "orchestrator",
-        "to_phase": "unrecognized-private-value", "to_segment_id": 123,
-        "approval_id": "approval-transition", "reconciliation_ref": "",
+        "initiative_id": "initiative-1",
+        "board": "orchestrator",
+        "to_phase": "unrecognized-private-value",
+        "to_segment_id": 123,
+        "approval_id": "approval-transition",
+        "reconciliation_ref": "",
         "sensitive-unknown-key": "sensitive-value",
     }
     _approve(
-        database_path, approval_id="approval-transition", attempt_id="attempt-shape",
-        operation="kanban_transition_initiative", target="initiative-1",
-        expected_version=0, payload=payload,
+        database_path,
+        approval_id="approval-transition",
+        attempt_id="attempt-shape",
+        operation="kanban_transition_initiative",
+        target="initiative-1",
+        expected_version=0,
+        payload=payload,
     )
     boundary = commands_module._CommandBoundary(
-        database_path=str(database_path), provider=provider,
-        handlers={"kanban_transition_initiative": commands_module._handle_transition_initiative},
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_transition_initiative": commands_module._handle_transition_initiative
+        },
     )
     result = _submit(
-        boundary, "kanban_transition_initiative", attempt_id="attempt-shape",
-        key="key-shape", target="initiative-1", version=0, payload=payload,
+        boundary,
+        "kanban_transition_initiative",
+        attempt_id="attempt-shape",
+        key="key-shape",
+        target="initiative-1",
+        version=0,
+        payload=payload,
     )
     assert result["result"] == "REJECTED"
     findings = {check["code"]: check for check in result["failed_checks"]}
     assert set(findings) == {
-        "TRANSITION_UNKNOWN_FIELDS", "TRANSITION_PHASE_UNKNOWN",
+        "TRANSITION_UNKNOWN_FIELDS",
+        "TRANSITION_PHASE_UNKNOWN",
         "TRANSITION_FIELD_INVALID:reconciliation_ref",
         "TRANSITION_FIELD_INVALID:to_segment_id",
     }
-    assert result["not_evaluated_checks"] == [{
-        "code": "TRANSITION_SEGMENT_PHASE_COMPATIBILITY",
-        "requires": ["TRANSITION_PHASE_UNKNOWN", "TRANSITION_FIELD_INVALID:to_segment_id"],
-    }]
+    assert result["not_evaluated_checks"] == [
+        {
+            "code": "TRANSITION_SEGMENT_PHASE_COMPATIBILITY",
+            "requires": [
+                "TRANSITION_PHASE_UNKNOWN",
+                "TRANSITION_FIELD_INVALID:to_segment_id",
+            ],
+        }
+    ]
     for check in findings.values():
         assert check["accepted_format"]
         assert check["remediation"]
         assert check["responsible_actor"] == "orchestrator"
     serialized = json.dumps(result)
-    for secret in ("sensitive-unknown-key", "sensitive-value", "unrecognized-private-value"):
+    for secret in (
+        "sensitive-unknown-key",
+        "sensitive-value",
+        "unrecognized-private-value",
+    ):
         assert secret not in serialized
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM initiative_transitions").fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = 'approval-transition'"
-        ).fetchone()[0] == "approved"
-        assert conn.execute("SELECT COUNT(*) FROM adrian_kanban_command_receipts").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_transitions").fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = 'approval-transition'"
+            ).fetchone()[0]
+            == "approved"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+            ).fetchone()[0]
+            == 0
+        )
 
 
-@pytest.mark.parametrize("phase,segment,accepted", [
-    ("DEV2", "S1", True), ("DEV3", "S1", True), ("DEV4", "S1", True),
-    ("D1", None, True), ("D2", None, True), ("D3", None, True),
-    ("D4", None, True), ("DEV1", None, True), ("PC1", None, True),
-    ("DEV2", None, False), ("DEV3", None, False), ("DEV4", None, False),
-    ("D1", "S1", False), ("PC1", "S1", False),
-])
+@pytest.mark.parametrize(
+    "phase,segment,accepted",
+    [
+        ("DEV2", "S1", True),
+        ("DEV3", "S1", True),
+        ("DEV4", "S1", True),
+        ("D1", None, True),
+        ("D2", None, True),
+        ("D3", None, True),
+        ("D4", None, True),
+        ("DEV1", None, True),
+        ("PC1", None, True),
+        ("DEV2", None, False),
+        ("DEV3", None, False),
+        ("DEV4", None, False),
+        ("D1", "S1", False),
+        ("PC1", "S1", False),
+    ],
+)
 def test_transition_shape_keeps_explicit_phase_segment_contract(
     commands_module, phase, segment, accepted
 ):
-    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    mutations = importlib.import_module(
+        f"{commands_module.__package__}.initiative_mutations"
+    )
     diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
     payload = {
-        "initiative_id": " initiative-1 ", "to_phase": phase,
-        "to_segment_id": segment, "reconciliation_ref": " reconciliation-1 ",
-        "approval_id": "approval-1", "board": "orchestrator",
+        "initiative_id": " initiative-1 ",
+        "to_phase": phase,
+        "to_segment_id": segment,
+        "reconciliation_ref": " reconciliation-1 ",
+        "approval_id": "approval-1",
+        "board": "orchestrator",
     }
     original = payload.copy()
     if accepted:
@@ -540,34 +602,59 @@ def test_transition_shape_keeps_explicit_phase_segment_contract(
 
 
 def test_transition_missing_fields_are_reported_together(commands_module):
-    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    mutations = importlib.import_module(
+        f"{commands_module.__package__}.initiative_mutations"
+    )
     diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
     with pytest.raises(diagnostics.CommandRejected) as caught:
         mutations._validate_transition_payload({})
     assert {check.target for check in caught.value.failed_checks} == {
-        "initiative_id", "to_phase", "reconciliation_ref", "approval_id", "board"
+        "initiative_id",
+        "to_phase",
+        "reconciliation_ref",
+        "approval_id",
+        "board",
     }
-    assert caught.value.not_evaluated_checks[0].requires == ("TRANSITION_FIELD_INVALID:to_phase",)
+    assert caught.value.not_evaluated_checks[0].requires == (
+        "TRANSITION_FIELD_INVALID:to_phase",
+    )
 
 
 @pytest.mark.parametrize("phase", [[], {}, False, 1, "", "  "])
-def test_transition_bad_phase_is_diagnostic_not_internal_exception(commands_module, phase):
-    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+def test_transition_bad_phase_is_diagnostic_not_internal_exception(
+    commands_module, phase
+):
+    mutations = importlib.import_module(
+        f"{commands_module.__package__}.initiative_mutations"
+    )
     diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
     with pytest.raises(diagnostics.CommandRejected) as caught:
         mutations._validate_transition_payload({
-            "initiative_id": "initiative-1", "to_phase": phase,
-            "reconciliation_ref": "ref-1", "approval_id": "approval-1", "board": "orchestrator",
+            "initiative_id": "initiative-1",
+            "to_phase": phase,
+            "reconciliation_ref": "ref-1",
+            "approval_id": "approval-1",
+            "board": "orchestrator",
         })
-    assert [check.code for check in caught.value.failed_checks] == ["TRANSITION_FIELD_INVALID:to_phase"]
-    assert caught.value.not_evaluated_checks[0].requires == ("TRANSITION_FIELD_INVALID:to_phase",)
+    assert [check.code for check in caught.value.failed_checks] == [
+        "TRANSITION_FIELD_INVALID:to_phase"
+    ]
+    assert caught.value.not_evaluated_checks[0].requires == (
+        "TRANSITION_FIELD_INVALID:to_phase",
+    )
 
 
 def test_transition_shape_normalizes_phase_before_enum_check(commands_module):
-    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    mutations = importlib.import_module(
+        f"{commands_module.__package__}.initiative_mutations"
+    )
     normalized = mutations._validate_transition_payload({
-        "initiative_id": "initiative-1", "to_phase": " DEV2 ", "to_segment_id": " S1 ",
-        "reconciliation_ref": "ref-1", "approval_id": "approval-1", "board": "orchestrator",
+        "initiative_id": "initiative-1",
+        "to_phase": " DEV2 ",
+        "to_segment_id": " S1 ",
+        "reconciliation_ref": "ref-1",
+        "approval_id": "approval-1",
+        "board": "orchestrator",
     })
     assert normalized["to_phase"] == "DEV2"
     assert normalized["to_segment_id"] == "S1"
@@ -614,21 +701,28 @@ def test_transition_rejects_missing_reconciliation_without_spending_approval(
 
     assert result["result"] == "REJECTED"
     assert result["failed_checks"][0]["code"] == "RECONCILIATION_NOT_FOUND"
-    assert result["not_evaluated_checks"] == [{
-        "code": "RECONCILIATION_CONTENT", "requires": ["RECONCILIATION_NOT_FOUND"]
-    }]
+    assert result["not_evaluated_checks"] == [
+        {"code": "RECONCILIATION_CONTENT", "requires": ["RECONCILIATION_NOT_FOUND"]}
+    ]
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM initiative_transitions"
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards "
-            "WHERE initiative_id = 'initiative-1'"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals "
-            "WHERE approval_id = 'approval-transition'"
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_transitions").fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards "
+                "WHERE initiative_id = 'initiative-1'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals "
+                "WHERE approval_id = 'approval-transition'"
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 @pytest.mark.parametrize("malformed", [False, True])
@@ -637,13 +731,19 @@ def test_reconciliation_reports_independent_stored_evidence_failures(
 ):
     database_path, _provider = _database(tmp_path, monkeypatch, commands_module)
     _seed_initiative(database_path)
-    _seed_reconciliation(database_path, result_id="bad-ref", from_phase="D1", to_phase="DEV1")
-    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    _seed_reconciliation(
+        database_path, result_id="bad-ref", from_phase="D1", to_phase="DEV1"
+    )
+    mutations = importlib.import_module(
+        f"{commands_module.__package__}.initiative_mutations"
+    )
     diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
     with sqlite3.connect(database_path) as conn:
         # Disposable historical/corrupt-state fixture: no production record is edited.
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM initiative_phase_results WHERE result_id='bad-ref'").fetchone()
+        row = conn.execute(
+            "SELECT * FROM initiative_phase_results WHERE result_id='bad-ref'"
+        ).fetchone()
         route = json.loads(row["canonical_payload"])
         route["to_phase"] = "secret-wrong-phase"
         route["previous_transition_id"] = 88
@@ -653,28 +753,49 @@ def test_reconciliation_reports_independent_stored_evidence_failures(
         conn.execute(
             "UPDATE initiative_phase_results SET accepted=0, phase='D2', "
             "actor_evidence=?, canonical_payload=? WHERE result_id='bad-ref'",
-            ("[secret malformed" if malformed else '{"actor_profile":"private-profile"}',
-             "[secret malformed" if malformed else json.dumps(route)),
+            (
+                "[secret malformed"
+                if malformed
+                else '{"actor_profile":"private-profile"}',
+                "[secret malformed" if malformed else json.dumps(route),
+            ),
         )
         conn.commit()
         with pytest.raises(diagnostics.CommandRejected) as caught:
             mutations._validate_reconciliation(
-                conn, row["initiative_card_id"], "initiative-1", "orchestrator", "bad-ref",
-                1, "D1", None, "DEV1", None,
+                conn,
+                row["initiative_card_id"],
+                "initiative-1",
+                "orchestrator",
+                "bad-ref",
+                1,
+                "D1",
+                None,
+                "DEV1",
+                None,
             )
         checks = {check.code: check for check in caught.value.failed_checks}
-        expected = {"RECONCILIATION_ROW_MISMATCH:accepted", "RECONCILIATION_ROW_MISMATCH:phase"}
+        expected = {
+            "RECONCILIATION_ROW_MISMATCH:accepted",
+            "RECONCILIATION_ROW_MISMATCH:phase",
+        }
         if malformed:
-            expected |= {"RECONCILIATION_ACTOR_INVALID", "RECONCILIATION_PAYLOAD_INVALID"}
+            expected |= {
+                "RECONCILIATION_ACTOR_INVALID",
+                "RECONCILIATION_PAYLOAD_INVALID",
+            }
             assert {c.code for c in caught.value.not_evaluated_checks} == {
-                "RECONCILIATION_ACTOR_PROFILE", "RECONCILIATION_ROUTE_FIELDS"
+                "RECONCILIATION_ACTOR_PROFILE",
+                "RECONCILIATION_ROUTE_FIELDS",
             }
         else:
             expected |= {
-                "RECONCILIATION_ACTOR_PROFILE", "RECONCILIATION_FIELD_MISMATCH:to_phase",
+                "RECONCILIATION_ACTOR_PROFILE",
+                "RECONCILIATION_FIELD_MISMATCH:to_phase",
                 "RECONCILIATION_FIELD_MISMATCH:previous_transition_id",
                 "RECONCILIATION_FIELD_MISMATCH:from_segment_id",
-                "RECONCILIATION_FIELD_INVALID:canon_route", "RECONCILIATION_FIELD_INVALID:exit_gate_ref",
+                "RECONCILIATION_FIELD_INVALID:canon_route",
+                "RECONCILIATION_FIELD_INVALID:exit_gate_ref",
             }
             assert caught.value.not_evaluated_checks == ()
         assert set(checks) == expected
@@ -749,13 +870,17 @@ def test_repository_reconciliation_result_requires_default_orchestrator(
 
     assert rejected["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM initiative_phase_results"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals "
-            "WHERE approval_id = 'approval-reconciliation'"
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals "
+                "WHERE approval_id = 'approval-reconciliation'"
+            ).fetchone()[0]
+            == "approved"
+        )
 
     accepted = _submit(
         boundary,
@@ -847,13 +972,17 @@ def test_segment_transition_requires_manifest_defined_segment(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM initiative_transitions"
-        ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals "
-            "WHERE approval_id = 'approval-transition'"
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_transitions").fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals "
+                "WHERE approval_id = 'approval-transition'"
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 def test_body_update_preserves_structural_contract_and_phase_result_is_append_only(
@@ -959,6 +1088,205 @@ def test_body_update_preserves_structural_contract_and_phase_result_is_append_on
         )
 
 
+def _phase_scope_payload():
+    return {
+        "initiative_id": "initiative-1",
+        "update_kind": "phase_result",
+        "update": {
+            "result_id": "scope-result",
+            "phase": "D1",
+            "segment_id": None,
+            "iteration": 1,
+            "result_kind": "phase_close",
+            "contract_id": "adrian-kanban.lifecycle.d1",
+            "contract_version": "1",
+            "result": {"conclusion": "ready", "next_route": "D2"},
+            "accepted_task_refs": [],
+            "accepted_checkpoint_refs": [],
+        },
+        "approval_id": "scope-approval",
+        "board": "orchestrator",
+    }
+
+
+@pytest.mark.parametrize(
+    "changes, actor, missing_transition, expected_codes",
+    [
+        (
+            {"result_kind": "orchestration_checkpoint"},
+            "default",
+            False,
+            {"PHASE_RESULT_KIND"},
+        ),
+        (
+            {"result_kind": "segment_manifest_projection"},
+            "default",
+            False,
+            {"PHASE_RESULT_KIND"},
+        ),
+        (
+            {"result_kind": "unknown-secret-kind"},
+            "default",
+            False,
+            {"PHASE_RESULT_KIND"},
+        ),
+        (
+            {"phase": "D2", "contract_id": "adrian-kanban.lifecycle.d2"},
+            "default",
+            False,
+            {"PHASE_RESULT_PHASE"},
+        ),
+        ({"segment_id": "S1"}, "default", False, {"PHASE_RESULT_SEGMENT"}),
+        (
+            {"contract_id": "caller-defined", "contract_version": "999"},
+            "default",
+            False,
+            {"PHASE_RESULT_CONTRACT_ID", "PHASE_RESULT_CONTRACT_VERSION"},
+        ),
+        ({}, "builder-tester", False, {"PHASE_RESULT_ACTOR"}),
+        ({}, "default", True, {"PHASE_RESULT_TRANSITION_MISSING"}),
+        (
+            {
+                "phase": "D2",
+                "segment_id": "S1",
+                "contract_id": "caller-defined",
+                "contract_version": "999",
+                "result_kind": "orchestration_checkpoint",
+            },
+            "builder-tester",
+            False,
+            {
+                "PHASE_RESULT_PHASE",
+                "PHASE_RESULT_SEGMENT",
+                "PHASE_RESULT_CONTRACT_ID",
+                "PHASE_RESULT_CONTRACT_VERSION",
+                "PHASE_RESULT_KIND",
+                "PHASE_RESULT_ACTOR",
+            },
+        ),
+    ],
+)
+def test_phase_result_scope_rejections_do_not_append_or_spend_approval(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+    changes,
+    actor,
+    missing_transition,
+    expected_codes,
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(database_path)
+    if missing_transition:
+        with sqlite3.connect(database_path) as conn:
+            conn.execute("DELETE FROM initiative_transitions")
+    payload = _phase_scope_payload()
+    payload["update"].update(changes)
+    _approve(
+        database_path,
+        approval_id="scope-approval",
+        attempt_id="scope-attempt",
+        operation="kanban_update_initiative",
+        target="initiative-1",
+        expected_version=0,
+        payload=payload,
+    )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_update_initiative": commands_module._handle_update_initiative
+        },
+    )
+    result = _submit(
+        boundary,
+        "kanban_update_initiative",
+        attempt_id="scope-attempt",
+        key="scope-key",
+        target="initiative-1",
+        version=0,
+        payload=payload,
+        actor_profile=actor,
+    )
+    assert result["result"] == "REJECTED"
+    assert {check["code"] for check in result["failed_checks"]} == expected_codes
+    assert "unknown-secret-kind" not in json.dumps(result)
+    if missing_transition:
+        assert result["not_evaluated_checks"] == [
+            {
+                "code": "PHASE_RESULT_POSITION",
+                "requires": ["PHASE_RESULT_TRANSITION_MISSING"],
+            }
+        ]
+    if changes.get("result_kind") in {
+        "orchestration_checkpoint",
+        "segment_manifest_projection",
+    }:
+        check = next(
+            check
+            for check in result["failed_checks"]
+            if check["code"] == "PHASE_RESULT_KIND"
+        )
+        assert "update_kind" in check["remediation"]
+        assert changes["result_kind"] in check["remediation"]
+    with sqlite3.connect(database_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE initiative_id='initiative-1'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id='scope-approval'"
+            ).fetchone()[0]
+            == "approved"
+        )
+
+
+@pytest.mark.parametrize(
+    "phase", ["D1", "D2", "D3", "D4", "DEV1", "DEV2", "DEV3", "DEV4", "PC1"]
+)
+@pytest.mark.parametrize(
+    "kind", ["phase_close", "repository_reconciliation", "initiative_closure"]
+)
+def test_phase_result_scope_accepts_matching_position_without_imposing_routing(
+    commands_module, tmp_path, monkeypatch, phase, kind
+):
+    database_path, _ = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(database_path)
+    segment = "S2" if phase in {"DEV2", "DEV3", "DEV4"} else None
+    module = importlib.import_module(
+        f"{commands_module.__package__}.phase_result_scope"
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        # Position matching is not an automatic linear lifecycle routing policy.
+        conn.execute(
+            "UPDATE initiative_transitions SET to_phase=?,to_segment_id=?",
+            (phase, segment),
+        )
+        context = SimpleNamespace(
+            connection=conn, binding=SimpleNamespace(actor_profile="default")
+        )
+        update = _phase_scope_payload()["update"]
+        update.update(
+            phase=phase,
+            segment_id=segment,
+            result_kind=kind,
+            contract_id=f"adrian-kanban.lifecycle.{phase.lower()}",
+        )
+        before = conn.total_changes
+        assert (
+            module.validate_phase_result_scope(context, "initiative-1", update) is None
+        )
+        assert conn.total_changes == before
+
+
 def test_malformed_body_update_is_atomic_and_leaves_approval_reusable(
     commands_module, tmp_path, monkeypatch
 ):
@@ -999,10 +1327,16 @@ def test_malformed_body_update_is_atomic_and_leaves_approval_reusable(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT body FROM adrian_kanban_cards WHERE initiative_id = 'initiative-1'"
-        ).fetchone()[0] == _BODY
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals "
-            "WHERE approval_id = 'approval-body'"
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute(
+                "SELECT body FROM adrian_kanban_cards WHERE initiative_id = 'initiative-1'"
+            ).fetchone()[0]
+            == _BODY
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals "
+                "WHERE approval_id = 'approval-body'"
+            ).fetchone()[0]
+            == "approved"
+        )
