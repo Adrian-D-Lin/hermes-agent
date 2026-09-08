@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,9 +39,7 @@ def commands_module():
 
 
 def _database(tmp_path, monkeypatch, commands_module):
-    provider_module = importlib.import_module(
-        f"{commands_module.__package__}.provider"
-    )
+    provider_module = importlib.import_module(f"{commands_module.__package__}.provider")
     schema_module = importlib.import_module(f"{commands_module.__package__}.schema")
     database_path = (tmp_path / "kanban.sqlite3").resolve()
     with kb.connect_closing(database_path) as conn:
@@ -180,6 +179,482 @@ def _seed_accepted_handoff(
         conn.commit()
 
 
+def _d2_evidence_fixture(
+    commands_module, tmp_path, monkeypatch, *, baseline="2-design/draft.md"
+):
+    database_path, _ = _database(tmp_path, monkeypatch, commands_module)
+    card_id = _seed_initiative(database_path, "D2")
+    _seed_accepted_handoff(
+        database_path, card_id, step="D2", candidate_id="review-candidate", sequence=1
+    )
+    prefix = commands_module.__package__
+    lifecycle = importlib.import_module(f"{prefix}.lifecycle")
+    contracts = importlib.import_module(f"{prefix}.contracts")
+    skills = importlib.import_module(f"{prefix}.skill_bundle")
+    artifacts = importlib.import_module(f"{prefix}.published_artifact")
+    draft = artifacts.VerifiedArtifact("2-design/draft.md", "a" * 40, "b" * 64)
+    metadata = {
+        "review_pass_log": ["Complete eight-angle review"],
+        "angle_coverage": [
+            "principle_alignment",
+            "design_integration",
+            "documentation_silence",
+            "contradiction",
+            "completeness_internal_coherence",
+            "dependencies_downstream_impact",
+            "new_principle_candidate",
+            "alternative_design",
+        ],
+        "findings": [
+            {
+                "citation": "draft section1",
+                "materiality": "material",
+                "impact": "delivery",
+                "route": "D1",
+            }
+        ]
+        * 2,
+        "conclusion": "NOT_DRY",
+    }
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("DELETE FROM task_lifecycle_contracts WHERE task_id='task:D2'")
+        lifecycle.LifecycleContractRepository(conn).attach(
+            task_id="task:D2",
+            snapshot=contracts.expand_contract(
+                step="D2",
+                initiative_id="initiative-1",
+                baseline_refs=(baseline,),
+                governing_source_refs=("Canon/policy.md",),
+            ),
+            skill=skills.resolve_skill_binding("D2"),
+            created_at=1,
+        )
+        task_card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE task_id='task:D2'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO task_input_manifests VALUES (?,'task:D2','{}',1,1)",
+            (task_card_id,),
+        )
+        conn.execute(
+            "INSERT INTO task_input_entries VALUES (?,'task:D2',?,?,'git_commit',?,'Review this draft')",
+            (task_card_id, draft.path, draft.sha256, draft.commit),
+        )
+        conn.execute(
+            "UPDATE task_candidate_handoffs SET metadata_json=? WHERE candidate_id='review-candidate'",
+            (json.dumps(metadata),),
+        )
+    return database_path, card_id, draft
+
+
+def test_d2_inventory_keeps_equal_content_findings_distinct_and_is_read_only(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, card_id, draft = _d2_evidence_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d2_evidence")
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        before = conn.total_changes
+        result = module.load_d2_review(
+            conn, card_id, "initiative-1", "review-candidate", draft
+        )
+        assert result.finding_refs == (
+            "review-candidate#/findings/0",
+            "review-candidate#/findings/1",
+        )
+        assert result.conclusion == "NOT_DRY"
+        assert result.candidate_ref == "review-candidate"
+        assert conn.total_changes == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE task_input_entries SET workspace_path='different.md'",
+        "UPDATE task_input_entries SET source_locator='different-commit'",
+        "UPDATE task_input_entries SET sha256='different-hash'",
+        "UPDATE task_input_entries SET source_kind='snapshot_attachment'",
+        "UPDATE task_input_manifests SET declared_inputs_accessible=0",
+        "DELETE FROM task_reviewer_verdicts",
+        "UPDATE task_candidate_handoffs SET metadata_json='{}'",
+        "UPDATE task_candidate_handoffs SET metadata_json='not json'",
+        "UPDATE task_lifecycle_contracts SET execution_profile='default'",
+    ],
+)
+def test_d2_inventory_rejects_wrong_or_unaccepted_evidence(
+    commands_module, tmp_path, monkeypatch, mutation
+):
+    database_path, card_id, draft = _d2_evidence_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d2_evidence")
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(mutation)
+        before = conn.total_changes
+        with pytest.raises(ValueError):
+            module.load_d2_review(
+                conn, card_id, "initiative-1", "review-candidate", draft
+            )
+        assert conn.total_changes == before
+
+
+def test_d2_inventory_requires_explicit_baseline_not_merely_available_input(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, card_id, draft = _d2_evidence_fixture(
+        commands_module, tmp_path, monkeypatch, baseline="other-baseline.md"
+    )
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d2_evidence")
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        with pytest.raises(ValueError, match="baseline"):
+            module.load_d2_review(
+                conn, card_id, "initiative-1", "review-candidate", draft
+            )
+
+
+def test_d2_inventory_rejects_cross_initiative_evidence(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, card_id, draft = _d2_evidence_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d2_evidence")
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        with pytest.raises(ValueError):
+            module.load_d2_review(conn, card_id, "other", "review-candidate", draft)
+        with pytest.raises(ValueError):
+            module.load_d2_review(
+                conn, card_id + 100, "initiative-1", "review-candidate", draft
+            )
+
+
+def test_d2_history_retains_reviews_not_on_current_baseline(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, card_id, _ = _d2_evidence_fixture(
+        commands_module, tmp_path, monkeypatch, baseline="older-draft.md"
+    )
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d2_evidence")
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        before = conn.total_changes
+        history = module.load_d2_history(conn, card_id, "initiative-1")
+        assert [item.candidate_ref for item in history] == ["review-candidate"]
+        assert history[0].finding_refs == (
+            "review-candidate#/findings/0",
+            "review-candidate#/findings/1",
+        )
+        assert module.load_d2_history(conn, card_id, "other") == ()
+        assert conn.total_changes == before
+
+
+def test_d2_empty_findings_remains_an_accepted_review(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, card_id, draft = _d2_evidence_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d2_evidence")
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        metadata = json.loads(
+            conn.execute(
+                "SELECT metadata_json FROM task_candidate_handoffs"
+            ).fetchone()[0]
+        )
+        metadata.update(findings=[], conclusion="DRY")
+        conn.execute(
+            "UPDATE task_candidate_handoffs SET metadata_json=?",
+            (json.dumps(metadata),),
+        )
+        review = module.load_d2_review(
+            conn, card_id, "initiative-1", "review-candidate", draft
+        )
+        assert review.finding_refs == ()
+        assert review.conclusion == "DRY"
+        assert len(module.load_d2_history(conn, card_id, "initiative-1")) == 1
+
+
+def _d2_close_fixture(commands_module, tmp_path, monkeypatch):
+    database_path, card_id, draft = _d2_evidence_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d2")
+    digest = hashlib.sha256(b"draft").hexdigest()
+    with sqlite3.connect(database_path) as conn:
+        conn.execute("UPDATE task_input_entries SET sha256=?", (digest,))
+    update = {
+        "result_id": "d2-close",
+        "phase": "D2",
+        "segment_id": None,
+        "iteration": 1,
+        "result_kind": "phase_close",
+        "contract_id": "adrian-kanban.lifecycle.d2",
+        "contract_version": "1",
+        "accepted_task_refs": ["review-candidate"],
+        "accepted_checkpoint_refs": [],
+        "result": {
+            "draft_ref": {"path": draft.path, "commit": draft.commit, "sha256": digest},
+            "review_ref": {
+                "path": "2-design/review.md",
+                "commit": "c" * 40,
+                "sha256": hashlib.sha256(b"review").hexdigest(),
+            },
+            "current_review_ref": "review-candidate",
+            "prior_d2_result_ref": None,
+            "finding_dispositions": [
+                {
+                    "finding_ref": f"review-candidate#/findings/{i}",
+                    "classification": "novel_material",
+                    "disposition": "revise draft",
+                    "rationale": "material gap recorded",
+                }
+                for i in range(2)
+            ],
+            "conclusion": "NOT_DRY",
+            "next_route": "D1",
+        },
+    }
+    return database_path, card_id, module, update
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [None, "missing_finding", "wrong_baseline", "missing_preparer", "wrong_proof"],
+)
+def test_d2_command_admission_is_atomic_and_replayable(
+    commands_module, tmp_path, monkeypatch, gap
+):
+    database_path, _, module, update = _d2_close_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    provider_module = importlib.import_module(f"{commands_module.__package__}.provider")
+    provider = provider_module.AdrianKanbanAuthorityProvider(str(database_path))
+    provider_module.register_provider(provider)
+    if gap == "missing_finding":
+        update["result"]["finding_dispositions"].pop()
+    elif gap == "wrong_baseline":
+        update["result"]["draft_ref"]["commit"] = "d" * 40
+    calls = []
+
+    def preparer(payload, preparation_context):
+        calls.append(preparation_context.session_id)
+        with sqlite3.connect(database_path, timeout=0) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.rollback()
+        return module.prepare_d2_result(
+            payload["initiative_id"],
+            payload["update"],
+            lambda *_: b"draft",
+            lambda *_: b"review",
+        )
+
+    if gap == "missing_preparer":
+        preparer = None
+    elif gap == "wrong_proof":
+        preparer = lambda *_: object()
+    payload = {
+        "initiative_id": "initiative-1",
+        "board": "orchestrator",
+        "update_kind": "phase_result",
+        "update": update,
+        "approval_id": "approval-d2-close",
+    }
+    _approve(database_path, payload)
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_update_initiative": commands_module._handle_update_initiative
+        },
+        phase_result_preparer=preparer,
+    )
+    result = _submit(boundary, payload)
+    assert result["result"] == ("ACCEPTED" if gap is None else "REJECTED"), result
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[
+            0
+        ] == (1 if gap is None else 0)
+        assert conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id=?",
+            (payload["approval_id"],),
+        ).fetchone()[0] == ("consumed" if gap is None else "approved")
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards WHERE card_type='initiative'"
+        ).fetchone()[0] == (1 if gap is None else 0)
+    if gap is None:
+        assert _submit(boundary, payload) == result
+        assert calls == ["session-checkpoint"]
+    else:
+        assert result["failed_checks"][0]["code"] == (
+            "PHASE_RESULT_PREPARER"
+            if gap in {"missing_preparer", "wrong_proof"}
+            else "PHASE_RESULT_EVIDENCE"
+        )
+
+
+@pytest.mark.parametrize("zero_findings", [False, True])
+def test_d2_close_accepts_complete_not_dry_or_zero_finding_dry_evidence(
+    commands_module, tmp_path, monkeypatch, zero_findings
+):
+    database_path, card_id, module, update = _d2_close_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if zero_findings:
+            metadata = json.loads(
+                conn.execute(
+                    "SELECT metadata_json FROM task_candidate_handoffs"
+                ).fetchone()[0]
+            )
+            metadata.update(findings=[], conclusion="DRY")
+            conn.execute(
+                "UPDATE task_candidate_handoffs SET metadata_json=?",
+                (json.dumps(metadata),),
+            )
+            update["result"].update(
+                finding_dispositions=[], conclusion="DRY", next_route="D3"
+            )
+        prepared = module.prepare_d2_result(
+            "initiative-1", update, lambda *_: b"draft", lambda *_: b"review"
+        )
+        before = conn.total_changes
+        assert (
+            module.admit_d2_result(
+                SimpleNamespace(connection=conn),
+                card_id,
+                "initiative-1",
+                update,
+                prepared,
+            )
+            is None
+        )
+        assert conn.total_changes == before
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        "missing_finding",
+        "invented_finding",
+        "missing_candidate",
+        "extra_candidate",
+        "wrong_current",
+        "checkpoint",
+        "wrong_baseline",
+        "stale_prior",
+    ],
+)
+def test_d2_close_rejects_incomplete_or_misaligned_evidence(
+    commands_module, tmp_path, monkeypatch, gap
+):
+    database_path, card_id, module, update = _d2_close_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    if gap == "missing_finding":
+        update["result"]["finding_dispositions"].pop()
+    elif gap == "invented_finding":
+        update["result"]["finding_dispositions"][0]["finding_ref"] = (
+            "invented#/findings/0"
+        )
+    elif gap == "missing_candidate":
+        update["accepted_task_refs"] = []
+    elif gap == "extra_candidate":
+        update["accepted_task_refs"].append("unaccepted")
+    elif gap == "wrong_current":
+        update["result"]["current_review_ref"] = "not-a-current-review"
+    elif gap == "checkpoint":
+        update["accepted_checkpoint_refs"] = ["not-a-D2-checkpoint"]
+    elif gap == "wrong_baseline":
+        update["result"]["draft_ref"]["commit"] = "d" * 40
+    elif gap == "stale_prior":
+        update["result"]["prior_d2_result_ref"] = "nonexistent-prior"
+    prepared = module.prepare_d2_result(
+        "initiative-1", update, lambda *_: b"draft", lambda *_: b"review"
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        before = conn.total_changes
+        with pytest.raises(ValueError):
+            module.admit_d2_result(
+                SimpleNamespace(connection=conn),
+                card_id,
+                "initiative-1",
+                update,
+                prepared,
+            )
+        assert conn.total_changes == before
+
+
+def test_d2_close_cannot_omit_a_historical_review_without_prior_closing_record(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, card_id, module, update = _d2_close_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        # Second accepted pass on the same immutable task baseline, distinct candidate evidence.
+        conn.execute(
+            "INSERT INTO task_candidate_handoffs SELECT 'older-candidate',task_card_id,task_id,2,reviewer,summary,metadata_json,submitted_by,0 FROM task_candidate_handoffs WHERE candidate_id='review-candidate'"
+        )
+        conn.execute(
+            "INSERT INTO task_reviewer_verdicts SELECT 'older-verdict',task_card_id,task_id,'older-candidate',1002,reviewer,verdict,summary,0 FROM task_reviewer_verdicts WHERE candidate_id='review-candidate'"
+        )
+        prepared = module.prepare_d2_result(
+            "initiative-1", update, lambda *_: b"draft", lambda *_: b"review"
+        )
+        with pytest.raises(ValueError, match="historical"):
+            module.admit_d2_result(
+                SimpleNamespace(connection=conn),
+                card_id,
+                "initiative-1",
+                update,
+                prepared,
+            )
+        update["accepted_task_refs"].append("older-candidate")
+        prepared = module.prepare_d2_result(
+            "initiative-1", update, lambda *_: b"draft", lambda *_: b"review"
+        )
+        with pytest.raises(ValueError, match="historical findings"):
+            module.admit_d2_result(
+                SimpleNamespace(connection=conn),
+                card_id,
+                "initiative-1",
+                update,
+                prepared,
+            )
+        update["result"]["finding_dispositions"].extend([
+            {
+                "finding_ref": f"older-candidate#/findings/{i}",
+                "classification": "coverage",
+                "disposition": "retained in accumulated review",
+                "rationale": "earlier accepted pass",
+            }
+            for i in range(2)
+        ])
+        prepared = module.prepare_d2_result(
+            "initiative-1", update, lambda *_: b"draft", lambda *_: b"review"
+        )
+        assert (
+            module.admit_d2_result(
+                SimpleNamespace(connection=conn),
+                card_id,
+                "initiative-1",
+                update,
+                prepared,
+            )
+            is None
+        )
+
+
 def _boundary(commands_module, database_path, provider):
     return commands_module._CommandBoundary(
         database_path=str(database_path),
@@ -190,7 +665,9 @@ def _boundary(commands_module, database_path, provider):
     )
 
 
-def _submit(boundary, payload: dict, *, actor_profile: str = "default", version: int = 0):
+def _submit(
+    boundary, payload: dict, *, actor_profile: str = "default", version: int = 0
+):
     return boundary.submit(
         "kanban_update_initiative",
         attempt_id=f"attempt:{payload['approval_id']}",
@@ -210,43 +687,35 @@ def _checkpoint_payload(step: str, accepted_task_refs: list[str]) -> dict:
     contract = f"adrian-kanban.lifecycle.{phase.lower()}"
     result: dict = {"step": step}
     if step == "D4.3":
-        result.update(
-            {
-                "write_gate_approval_ref": "write-gate:change-set:1",
-                "approved_change_set_digest": "a" * 64,
-                "current_document_refs": ["Canon/design.md@" + "b" * 40],
-            }
-        )
+        result.update({
+            "write_gate_approval_ref": "write-gate:change-set:1",
+            "approved_change_set_digest": "a" * 64,
+            "current_document_refs": ["Canon/design.md@" + "b" * 40],
+        })
     elif step == "D4.4":
-        result.update(
-            {
-                "write_gate_approval_ref": "write-gate:change-set:1",
-                "approval_lease_ref": "write-gate:lease:1",
-                "approved_change_set_digest": "a" * 64,
-                "execution_result": "applied",
-                "post_write_documents": [
-                    {"path": "Canon/design.md", "sha": "c" * 40}
-                ],
-                "item_determinations": [
-                    {"item_id": "change-1", "determination": "applied"}
-                ],
-            }
-        )
+        result.update({
+            "write_gate_approval_ref": "write-gate:change-set:1",
+            "approval_lease_ref": "write-gate:lease:1",
+            "approved_change_set_digest": "a" * 64,
+            "execution_result": "applied",
+            "post_write_documents": [{"path": "Canon/design.md", "sha": "c" * 40}],
+            "item_determinations": [
+                {"item_id": "change-1", "determination": "applied"}
+            ],
+        })
     elif step == "DEV1.2":
-        result.update(
-            {
-                "cumulative_record_ref": "2-design/dev1.2.md@" + "d" * 40,
-                "source_angles": [
-                    {
-                        "step": f"DEV1.1{letter}",
-                        "candidate_ref": f"candidate:DEV1.1{letter}",
-                        "item_count": index,
-                    }
-                    for index, letter in enumerate("abcde", start=1)
-                ],
-                "total_item_count": 15,
-            }
-        )
+        result.update({
+            "cumulative_record_ref": "2-design/dev1.2.md@" + "d" * 40,
+            "source_angles": [
+                {
+                    "step": f"DEV1.1{letter}",
+                    "candidate_ref": f"candidate:DEV1.1{letter}",
+                    "item_count": index,
+                }
+                for index, letter in enumerate("abcde", start=1)
+            ],
+            "total_item_count": 15,
+        })
     return {
         "initiative_id": "initiative-1",
         "update_kind": "orchestration_checkpoint",
@@ -305,10 +774,13 @@ def test_d4_3_checkpoint_pins_exact_accepted_predecessors_and_replays(
             "candidate:D4.1",
             "candidate:D4.2",
         ]
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
-            (payload["approval_id"],),
-        ).fetchone()[0] == "consumed"
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
+                (payload["approval_id"],),
+            ).fetchone()[0]
+            == "consumed"
+        )
 
 
 @pytest.mark.parametrize(
@@ -341,15 +813,24 @@ def test_d4_3_rejects_wrong_phase_incomplete_predecessors_or_wrong_actor_atomica
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT record_version FROM adrian_kanban_cards "
-            "WHERE initiative_id = 'initiative-1'"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
-            (payload["approval_id"],),
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards "
+                "WHERE initiative_id = 'initiative-1'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
+                (payload["approval_id"],),
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 def test_d4_4_requires_matching_d4_3_checkpoint_and_change_set_digest(
@@ -450,11 +931,17 @@ def test_unknown_checkpoint_step_rejects_without_spending_approval(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
-            (payload["approval_id"],),
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
+                (payload["approval_id"],),
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 def test_d4_3_rejects_unexpected_checkpoint_predecessor(
@@ -476,11 +963,17 @@ def test_d4_3_rejects_unexpected_checkpoint_predecessor(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
-            (payload["approval_id"],),
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
+                (payload["approval_id"],),
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 def test_checkpoint_rejects_candidate_whose_unified_card_identity_is_corrupt(
@@ -507,7 +1000,10 @@ def test_checkpoint_rejects_candidate_whose_unified_card_identity_is_corrupt(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0]
+            == 0
+        )
 
 
 def _seed_checkpoint(
@@ -521,9 +1017,7 @@ def _seed_checkpoint(
 ) -> None:
     canonical_payload = {"step": step}
     if step == "DEV1.2":
-        canonical_payload["cumulative_record_ref"] = (
-            "2-design/dev1.2.md@" + "a" * 40
-        )
+        canonical_payload["cumulative_record_ref"] = "2-design/dev1.2.md@" + "a" * 40
     with sqlite3.connect(database_path) as conn:
         conn.execute(
             "INSERT INTO initiative_phase_results "
@@ -563,8 +1057,7 @@ def _dev1_3_payload(*, dry: bool = True) -> dict:
         "updated_cumulative_record_ref": "2-design/dev1.3.md@" + "b" * 40,
         "follow_up_task_refs": [],
         "no_new_material_declarations": [
-            {"step": f"DEV1.1{letter}", "no_new_material": True}
-            for letter in "abcde"
+            {"step": f"DEV1.1{letter}", "no_new_material": True} for letter in "abcde"
         ],
         "dry": dry,
     }
@@ -623,14 +1116,20 @@ def test_dev1_3_dry_rejects_any_angle_with_new_material(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM initiative_phase_results "
-            "WHERE result_id = 'checkpoint:DEV1.3'"
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
-            (payload["approval_id"],),
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM initiative_phase_results "
+                "WHERE result_id = 'checkpoint:DEV1.3'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
+                (payload["approval_id"],),
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 def test_d4_4_rejects_corrupt_d4_3_payload_even_when_missing_values_match(
@@ -662,10 +1161,13 @@ def test_d4_4_rejects_corrupt_d4_3_payload_even_when_missing_values_match(
 
     assert result["result"] == "REJECTED"
     with sqlite3.connect(database_path) as conn:
-        assert conn.execute(
-            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
-            (payload["approval_id"],),
-        ).fetchone()[0] == "approved"
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = ?",
+                (payload["approval_id"],),
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 def test_dev1_2_rejects_boolean_total_even_when_equal_to_numeric_sum(

@@ -12,6 +12,7 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 from .attachments import PreparedAttachment, prepare_url_attachment
+from .phase_admission import prepare_phase_result
 from .purge_cleanup import execute_cleanup
 from .rejection_audit import record_rejection
 from .capability import CapabilityBinding
@@ -2856,6 +2857,7 @@ class _CommandContext:
         prepared_manifest: PreparedManifest | None = None,
         prepared_segment_manifest: PreparedSegmentManifest | None = None,
         prepared_successor_manifest: PreparedManifest | None = None,
+        prepared_phase_result: Any = None,
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -2870,6 +2872,7 @@ class _CommandContext:
         self.prepared_manifest = prepared_manifest
         self.prepared_segment_manifest = prepared_segment_manifest
         self.prepared_successor_manifest = prepared_successor_manifest
+        self.prepared_phase_result = prepared_phase_result
 
 
 class _CommandBoundary:
@@ -2883,6 +2886,7 @@ class _CommandBoundary:
         known_profiles: Any = (),
         task_input_preparer: Any = None,
         segment_manifest_preparer: Any = None,
+        phase_result_preparer: Any = None,
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise TypeError("provider must be an AdrianKanbanAuthorityProvider")
@@ -2896,6 +2900,8 @@ class _CommandBoundary:
             segment_manifest_preparer
         ):
             raise TypeError("segment_manifest_preparer must be callable or None")
+        if phase_result_preparer is not None and not callable(phase_result_preparer):
+            raise TypeError("phase_result_preparer must be callable or None")
         if type(known_profiles) not in {tuple, frozenset, set}:
             raise TypeError("known_profiles must be a tuple, frozenset, or set")
         normalized_profiles: list[str] = []
@@ -2912,6 +2918,7 @@ class _CommandBoundary:
         self._known_profiles = frozenset(normalized_profiles)
         self._task_input_preparer = task_input_preparer
         self._segment_manifest_preparer = segment_manifest_preparer
+        self._phase_result_preparer = phase_result_preparer
 
     def submit(self, action: str, **fields: Any) -> dict[str, Any]:
         return self._finish_response(self._submit_without_audit(action, **fields))
@@ -3168,6 +3175,18 @@ class _CommandBoundary:
                     )
 
             prepared_attachment = None
+            prepared_phase_result = None
+            if action == "kanban_update_initiative":
+                prepared_phase_result = prepare_phase_result(
+                    payload,
+                    TaskInputPreparationContext(
+                        session_id=session_id.strip(),
+                        execution_context=execution_context.strip(),
+                        workspace_id=(workspace_id.strip() if workspace_id is not None else None),
+                        actor_profile=(actor_profile.strip() if actor_profile is not None else None),
+                    ),
+                    self._phase_result_preparer,
+                )
             if action == "kanban_attach_url":
                 prepared_attachment = _prepare_attach_url_payload(payload)
 
@@ -3256,6 +3275,7 @@ class _CommandBoundary:
                     prepared_manifest=prepared_manifest,
                     prepared_segment_manifest=prepared_segment_manifest,
                     prepared_successor_manifest=prepared_successor_manifest,
+                    prepared_phase_result=prepared_phase_result,
                 )
                 try:
                     result = handler(context)

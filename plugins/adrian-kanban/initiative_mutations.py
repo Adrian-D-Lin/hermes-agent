@@ -22,6 +22,7 @@ from .initiative_checkpoints import admit_orchestration_checkpoint
 from .diagnostics import CommandRejected, FailedCheck, NotEvaluatedCheck
 from .segment_manifest import PreparedSegmentManifest
 from .phase_result_scope import validate_phase_result_scope
+from .phase_admission import admit_phase_result
 from .segment_projection import admit_segment_projection, persist_segment_projection
 
 INITIATIVE_PHASES = frozenset(
@@ -667,6 +668,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
         if len(accepted_checkpoint_refs) != len(set(accepted_checkpoint_refs)):
             raise ValueError("accepted_checkpoint_refs must be unique")
         validate_phase_result_scope(context, initiative_id, update)
+        admit_phase_result(context, card_id, initiative_id, update)
         if result_kind == "repository_reconciliation":
             _validate_reconciliation_result_candidate(
                 context,

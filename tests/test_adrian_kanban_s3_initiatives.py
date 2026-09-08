@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import json
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1013,6 +1014,7 @@ def test_body_update_preserves_structural_contract_and_phase_result_is_append_on
         handlers={
             "kanban_update_initiative": commands_module._handle_update_initiative
         },
+        phase_result_preparer=_prepare_d1(commands_module),
     )
     body_result = _submit(
         boundary,
@@ -1036,13 +1038,7 @@ def test_body_update_preserves_structural_contract_and_phase_result_is_append_on
             "result_kind": "phase_close",
             "contract_id": "adrian-kanban.lifecycle.d1",
             "contract_version": "1",
-            "result": {
-                "baseline_refs": ["git:abc"],
-                "artifact_refs": ["2-design/kanban.md@abc"],
-                "conclusion": "ready",
-                "dispositions": [],
-                "next_route": "D2",
-            },
+            "result": _d1_result(),
             "accepted_task_refs": [],
             "accepted_checkpoint_refs": [],
         },
@@ -1100,13 +1096,243 @@ def _phase_scope_payload():
             "result_kind": "phase_close",
             "contract_id": "adrian-kanban.lifecycle.d1",
             "contract_version": "1",
-            "result": {"conclusion": "ready", "next_route": "D2"},
+            "result": _d1_result(),
             "accepted_task_refs": [],
             "accepted_checkpoint_refs": [],
         },
         "approval_id": "scope-approval",
         "board": "orchestrator",
     }
+
+
+def _d1_result():
+    return {
+        "draft_ref": {
+            "path": "2-design/draft.md",
+            "commit": "a" * 40,
+            "sha256": hashlib.sha256(b"draft").hexdigest(),
+        },
+        "open_questions": [],
+        "revision_findings": [],
+        "prior_d2_result_ref": None,
+        "next_route": "D2",
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "unpublished",
+        "hash",
+        "missing_preparer",
+        "wrong_proof",
+        "provider_error",
+        "stale_prior",
+    ],
+)
+def test_d1_command_checks_real_git_and_preserves_approval_on_failure(
+    commands_module, tmp_path, monkeypatch, failure
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(database_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    remote = tmp_path / "origin.git"
+
+    def git(where, *args):
+        return subprocess.run(
+            ["git", "-C", str(where), *args], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(root, "init", "-b", "main")
+    git(root, "config", "user.name", "Test")
+    git(root, "config", "user.email", "test@example.invalid")
+    (root / "2-design").mkdir()
+    (root / "2-design/draft.md").write_bytes(b"draft")
+    git(root, "add", ".")
+    git(root, "commit", "-m", "draft")
+    sha = git(root, "rev-parse", "HEAD")
+    git(root, "remote", "add", "origin", str(remote))
+    git(root, "push", "origin", "main")
+    payload = _phase_scope_payload()
+    payload["update"]["result"]["draft_ref"]["commit"] = sha
+    if failure == "unpublished":
+        (root / "other.txt").write_text("local only")
+        git(root, "add", ".")
+        git(root, "commit", "-m", "unpublished")
+        payload["update"]["result"]["draft_ref"]["commit"] = git(
+            root, "rev-parse", "HEAD"
+        )
+    elif failure == "hash":
+        payload["update"]["result"]["draft_ref"]["sha256"] = "0" * 64
+    elif failure == "stale_prior":
+        payload["update"]["result"]["prior_d2_result_ref"] = "nonexistent"
+    module = importlib.import_module(f"{commands_module.__package__}.phase_preparer")
+    calls = []
+
+    def binding(session):
+        calls.append(session)
+        # Preparation must not own the write lock: a separate connection can
+        # obtain it and roll back without changing any business state.
+        with sqlite3.connect(database_path, timeout=0) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.rollback()
+        return SimpleNamespace(worktree_path=str(root))
+
+    preparer = module.GitPhaseResultPreparer(
+        lambda: SimpleNamespace(get_active_binding=binding)
+    )
+    if failure == "missing_preparer":
+        preparer = None
+    elif failure == "wrong_proof":
+        preparer = lambda *_: object()
+    elif failure == "provider_error":
+
+        def preparer(*_):
+            raise ValueError("private provider diagnostic must not escape")
+
+    _approve(
+        database_path,
+        approval_id="scope-approval",
+        attempt_id="scope-attempt",
+        operation="kanban_update_initiative",
+        target="initiative-1",
+        expected_version=0,
+        payload=payload,
+    )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_update_initiative": commands_module._handle_update_initiative
+        },
+        phase_result_preparer=preparer,
+    )
+    result = _submit(
+        boundary,
+        "kanban_update_initiative",
+        attempt_id="scope-attempt",
+        key="scope-key",
+        target="initiative-1",
+        version=0,
+        payload=payload,
+    )
+    assert result["result"] == ("ACCEPTED" if failure is None else "REJECTED"), result
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[
+            0
+        ] == (1 if failure is None else 0)
+        state = conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id='scope-approval'"
+        ).fetchone()[0]
+        assert state == ("consumed" if failure is None else "approved")
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards WHERE initiative_id='initiative-1'"
+        ).fetchone()[0] == (1 if failure is None else 0)
+    if failure:
+        expected = (
+            "PHASE_RESULT_PREPARER"
+            if failure in {"missing_preparer", "wrong_proof"}
+            else "PHASE_RESULT_EVIDENCE"
+            if failure == "stale_prior"
+            else "PHASE_RESULT_PREPARATION"
+        )
+        assert result["failed_checks"][0]["code"] == expected
+        assert result["failed_checks"][0]["remediation"]
+        assert "private provider diagnostic" not in json.dumps(result)
+    else:
+        assert calls == ["session-initiative"]
+        replay = _submit(
+            boundary,
+            "kanban_update_initiative",
+            attempt_id="scope-attempt",
+            key="scope-key",
+            target="initiative-1",
+            version=0,
+            payload=payload,
+        )
+        assert replay == result
+        assert calls == ["session-initiative"]
+
+
+def _prepare_d1(commands_module):
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d1")
+    return lambda payload, _: module.prepare_d1_result(
+        payload["initiative_id"], payload["update"], lambda *_: b"draft"
+    )
+
+
+@pytest.mark.parametrize(
+    "missing", ["phase", "result_kind", "result", "prior_d2_result_ref"]
+)
+def test_phase_command_missing_fields_cannot_bypass_admission(
+    commands_module, tmp_path, monkeypatch, missing
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(database_path)
+    payload = _phase_scope_payload()
+    if missing == "prior_d2_result_ref":
+        payload["prior_d2_result_ref"] = payload["update"]["result"].pop(missing)
+    else:
+        payload["update"].pop(missing)
+    _approve(
+        database_path,
+        approval_id="scope-approval",
+        attempt_id="scope-attempt",
+        operation="kanban_update_initiative",
+        target="initiative-1",
+        expected_version=0,
+        payload=payload,
+    )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_update_initiative": commands_module._handle_update_initiative
+        },
+        phase_result_preparer=_prepare_d1(commands_module),
+    )
+    result = _submit(
+        boundary,
+        "kanban_update_initiative",
+        attempt_id="scope-attempt",
+        key="scope-key",
+        target="initiative-1",
+        version=0,
+        payload=payload,
+    )
+    assert result["result"] == "REJECTED"
+    with sqlite3.connect(database_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM initiative_phase_results").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id='scope-approval'"
+            ).fetchone()[0]
+            == "approved"
+        )
+
+
+def _scope_proof(commands_module):
+    # Isolate scope rejection tests from Git/content validation, which have their
+    # own real-repository and database-backed tests. No accepted mutation uses this.
+    d1 = importlib.import_module(f"{commands_module.__package__}.phase_d1")
+    d2 = importlib.import_module(f"{commands_module.__package__}.phase_d2")
+    artifact = importlib.import_module(
+        f"{commands_module.__package__}.published_artifact"
+    )
+    ref = artifact.VerifiedArtifact("2-design/draft.md", "a" * 40, "b" * 64)
+
+    def prepare(payload, _):
+        if payload["update"]["phase"] == "D1":
+            return d1.PreparedD1Result("initiative-1", "unused", ref, None)
+        return d2.PreparedD2Result("initiative-1", "unused", ref, ref)
+
+    return prepare
 
 
 @pytest.mark.parametrize(
@@ -1197,6 +1423,7 @@ def test_phase_result_scope_rejections_do_not_append_or_spend_approval(
         handlers={
             "kanban_update_initiative": commands_module._handle_update_initiative
         },
+        phase_result_preparer=_scope_proof(commands_module),
     )
     result = _submit(
         boundary,
