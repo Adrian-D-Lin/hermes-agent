@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-ALLOWED_ACTORS = frozenset(
-    {"session_agent", "orchestrator", "reviewer", "adrian", "system_operator"}
-)
-ALLOWED_RETRIES = frozenset(
-    {"same_operation", "return_route", "human_decision", "not_retryable"}
-)
+ALLOWED_ACTORS = frozenset({
+    "session_agent",
+    "orchestrator",
+    "reviewer",
+    "adrian",
+    "system_operator",
+})
+ALLOWED_RETRIES = frozenset({
+    "same_operation",
+    "return_route",
+    "human_decision",
+    "not_retryable",
+})
 
 
 def _nonblank(value: object, field_name: str) -> str:
@@ -159,26 +166,66 @@ class RejectionEnvelope:
             f"attempt_id: {self.attempt_id}",
         ]
         for check in self.failed_checks:
-            lines.extend(
-                (
-                    f"failed: {check.code}",
-                    f"  target: {check.target}",
-                    f"  expected: {check.expected}",
-                    f"  observed: {check.observed}",
-                    f"  accepted_format: {check.accepted_format}",
-                    f"  remediation: {check.remediation}",
-                    f"  responsible_actor: {check.responsible_actor}",
-                    f"  retry: {check.retry}",
-                )
-            )
+            lines.extend((
+                f"failed: {check.code}",
+                f"  target: {check.target}",
+                f"  expected: {check.expected}",
+                f"  observed: {check.observed}",
+                f"  accepted_format: {check.accepted_format}",
+                f"  remediation: {check.remediation}",
+                f"  responsible_actor: {check.responsible_actor}",
+                f"  retry: {check.retry}",
+            ))
         for check in self.not_evaluated_checks:
-            lines.extend(
-                (
-                    f"not_evaluated: {check.code}",
-                    f"  requires: {', '.join(check.requires)}",
-                )
-            )
+            lines.extend((
+                f"not_evaluated: {check.code}",
+                f"  requires: {', '.join(check.requires)}",
+            ))
         return "\n".join(lines)
+
+
+class CommandRejected(Exception):
+    def __init__(
+        self,
+        *,
+        failed_checks: tuple[FailedCheck, ...] = (),
+        not_evaluated_checks: tuple[NotEvaluatedCheck, ...] = (),
+    ) -> None:
+        if type(failed_checks) is not tuple:
+            raise TypeError("failed_checks must be a tuple")
+        if type(not_evaluated_checks) is not tuple:
+            raise TypeError("not_evaluated_checks must be a tuple")
+        if len(failed_checks) == 0 and len(not_evaluated_checks) == 0:
+            raise ValueError("at least one check is required")
+        for check in failed_checks:
+            if type(check) is not FailedCheck:
+                raise TypeError("failed_checks elements must be FailedCheck")
+        for check in not_evaluated_checks:
+            if type(check) is not NotEvaluatedCheck:
+                raise TypeError(
+                    "not_evaluated_checks elements must be NotEvaluatedCheck"
+                )
+        all_codes = [check.code for check in failed_checks] + [
+            check.code for check in not_evaluated_checks
+        ]
+        if len(all_codes) != len(set(all_codes)):
+            raise ValueError("check codes must be unique")
+        resolved = {check.code for check in failed_checks}
+        pending = {check.code: check.requires for check in not_evaluated_checks}
+        while pending:
+            progress = False
+            for code in list(pending):
+                if all(prereq in resolved for prereq in pending[code]):
+                    resolved.add(code)
+                    del pending[code]
+                    progress = True
+            if not progress:
+                raise ValueError(
+                    "not-evaluated checks are not grounded in failed checks"
+                )
+        self.failed_checks = failed_checks
+        self.not_evaluated_checks = not_evaluated_checks
+        super().__init__("command validation rejected")
 
 
 class DiagnosticCollector:
@@ -234,4 +281,5 @@ __all__ = [
     "NotEvaluatedCheck",
     "RejectionEnvelope",
     "DiagnosticCollector",
+    "CommandRejected",
 ]

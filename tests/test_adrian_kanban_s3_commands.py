@@ -466,6 +466,107 @@ def test_mutation_uses_one_adapter_owned_transaction_and_consumes_exact_binding(
         ]
 
 
+def _prescriptive_checks(commands_module):
+    diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
+    failed = tuple(
+        diagnostics.FailedCheck(
+            code=f"FIELD_REQUIRED:{field}",
+            target=field,
+            expected="a committed artifact reference",
+            observed="missing",
+            accepted_format="repository-relative path at an immutable commit",
+            remediation=f"Supply {field} from the approved lifecycle artifact and retry.",
+            responsible_actor="orchestrator",
+            retry="same_operation",
+        )
+        for field in ("brief_ref", "review_ref")
+    )
+    pending = (
+        diagnostics.NotEvaluatedCheck(
+            code="ARTIFACT_DIGEST:brief_ref", requires=("FIELD_REQUIRED:brief_ref",)
+        ),
+    )
+    return diagnostics, failed, pending
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_prescriptive_rejection_preserves_all_findings_and_rolls_back(
+    commands_module, tmp_path, monkeypatch, read_only
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(tmp_path, monkeypatch, modules["provider"])
+    diagnostics, failed, pending = _prescriptive_checks(commands_module)
+
+    def handler(context):
+        if not read_only:
+            context.connection.execute(
+                "INSERT INTO boundary_probe (value, audit) VALUES ('discard', 'discard')"
+            )
+        raise diagnostics.CommandRejected(
+            failed_checks=failed, not_evaluated_checks=pending
+        )
+
+    operation = "kanban_show" if read_only else "kanban_comment"
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path), provider=provider, handlers={operation: handler}
+    )
+    result = boundary.submit(
+        operation, attempt_id="diagnostic-attempt", idempotency_key="diagnostic-retry",
+        target="task-1", expected_version=0, session_id="session-1",
+        execution_context="run-1", payload={"task_id": "task-1"},
+    )
+    assert result["result"] == "REJECTED"
+    assert result["state_changed"] is False
+    assert result["attempt_id"] == "diagnostic-attempt"
+    assert result["failed_checks"] == [check.as_dict() for check in failed]
+    assert result["not_evaluated_checks"] == [check.as_dict() for check in pending]
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM adrian_kanban_command_receipts"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("invalid", ["empty", "list", "unknown", "self", "cycle", "duplicate"])
+def test_prescriptive_rejection_rejects_invalid_diagnostic_graph(commands_module, invalid):
+    diagnostics, failed, pending = _prescriptive_checks(commands_module)
+    if invalid == "empty":
+        failed, pending = (), ()
+    elif invalid == "list":
+        failed = list(failed)
+    elif invalid == "unknown":
+        pending = (diagnostics.NotEvaluatedCheck(code="A", requires=("absent",)),)
+    elif invalid == "self":
+        pending = (diagnostics.NotEvaluatedCheck(code="A", requires=("A",)),)
+    elif invalid == "cycle":
+        pending = (
+            diagnostics.NotEvaluatedCheck(code="A", requires=("B",)),
+            diagnostics.NotEvaluatedCheck(code="B", requires=("A",)),
+        )
+    elif invalid == "duplicate":
+        failed = (failed[0], failed[0])
+    with pytest.raises((TypeError, ValueError)):
+        diagnostics.CommandRejected(failed_checks=failed, not_evaluated_checks=pending)
+
+
+def test_prescriptive_exception_text_does_not_dump_diagnostic_content(commands_module):
+    diagnostics, failed, pending = _prescriptive_checks(commands_module)
+    exc = diagnostics.CommandRejected(failed_checks=failed, not_evaluated_checks=pending)
+    assert str(exc) == "command validation rejected"
+    assert exc.failed_checks == failed
+    assert exc.not_evaluated_checks == pending
+
+
+def test_prescriptive_dependency_chain_is_order_independent(commands_module):
+    diagnostics, failed, pending = _prescriptive_checks(commands_module)
+    chain = (
+        diagnostics.NotEvaluatedCheck(code="REVIEW_CONTENT", requires=(pending[0].code,)),
+        pending[0],
+    )
+    exc = diagnostics.CommandRejected(failed_checks=failed, not_evaluated_checks=chain)
+    assert exc.not_evaluated_checks == chain
+
+
 def test_mutation_failure_rolls_back_and_returns_canonical_rejection(
     commands_module,
     tmp_path,

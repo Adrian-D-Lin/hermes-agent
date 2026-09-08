@@ -19,6 +19,7 @@ from writegate.kanban_approvals import (
 )
 
 from .initiative_checkpoints import admit_orchestration_checkpoint
+from .diagnostics import CommandRejected, FailedCheck, NotEvaluatedCheck
 from .segment_manifest import PreparedSegmentManifest
 from .segment_projection import admit_segment_projection, persist_segment_projection
 
@@ -295,6 +296,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
         "phase_result",
         "segment_manifest_projection",
         "orchestration_checkpoint",
+        "purge_replace_task",
     }:
         raise ValueError("unsupported update_kind")
 
@@ -311,6 +313,119 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
     expected_version = context.binding.expected_version
     if current_version != expected_version:
         raise ValueError("stale initiative version")
+
+    if update_kind == "purge_replace_task":
+        from .commands import _CommandContext, _handle_create
+        from .purge_replace import admit_purge_replacement, finalize_purge_replacement
+
+        successor_payload = update.get("successor_payload")
+        if not isinstance(successor_payload, dict):
+            raise ValueError("successor_payload must be an object")
+
+        disposition = update.get("repository_worktree_disposition")
+        if not isinstance(disposition, dict):
+            raise ValueError("repository_worktree_disposition must be an object")
+        disposition_action = disposition.get("action")
+        if not (type(disposition_action) is str and disposition_action.strip()):
+            raise ValueError("repository_worktree_disposition action must be a nonblank string")
+        cleanup_required = disposition_action == "cleanup_after_commit"
+
+        admission = admit_purge_replacement(
+            context.connection,
+            initiative_card_id=card_id,
+            initiative_id=initiative_id,
+            board=board,
+            actor_profile=context.binding.actor_profile,
+            session_id=context.binding.session_id,
+            approval_id=approval_id,
+            update=update,
+            known_profiles=context.known_profiles,
+        )
+        successor_payload = admission.successor_payload
+        successor_task_id = successor_payload.get("task_id")
+        if not (type(successor_task_id) is str and successor_task_id.strip()):
+            raise ValueError("successor task_id must be a nonblank string")
+        successor_task_id = successor_task_id.strip()
+
+        _consume_approval(
+            context.connection,
+            context,
+            approval_id,
+            "kanban_update_initiative",
+            expected_version,
+            payload,
+            initiative_id,
+            None,
+        )
+
+        class _PurgeSuccessorBridge:
+            def __init__(self, adapter: Any, initiative_id: str, successor_task_id: str) -> None:
+                self._adapter = adapter
+                self._initiative_id = initiative_id
+                self._successor_task_id = successor_task_id
+
+            def _create_in_active_transaction(self, *args: Any, **kwargs: Any) -> Any:
+                return self._adapter._create_for_purge_in_active_transaction(
+                    *args,
+                    initiative_id=self._initiative_id,
+                    **kwargs,
+                )
+
+            def _attach_during_create_in_active_transaction(
+                self, *args: Any, **kwargs: Any
+            ) -> Any:
+                return self._adapter._attach_for_purge_in_active_transaction(
+                    *args,
+                    initiative_id=self._initiative_id,
+                    expected_successor_task_id=self._successor_task_id,
+                    **kwargs,
+                )
+
+        bridge = _PurgeSuccessorBridge(
+            context.mutation_executor,
+            initiative_id=initiative_id,
+            successor_task_id=successor_task_id,
+        )
+        child_context = _CommandContext(
+            operation="kanban_create",
+            payload=successor_payload,
+            connection=context.connection,
+            attempt_id=context.attempt_id,
+            capability=context.capability,
+            binding=context.binding,
+            mutation_executor=bridge,
+            known_profiles=context.known_profiles,
+            prepared_manifest=context.prepared_successor_manifest,
+        )
+        _handle_create(child_context)
+
+        successor_card_row = context.connection.execute(
+            "SELECT id FROM adrian_kanban_cards "
+            "WHERE task_id = ? AND board_slug = ? AND card_type = 'task'",
+            (successor_task_id, board),
+        ).fetchone()
+        if successor_card_row is None:
+            raise ValueError("successor task card not found")
+        successor_task_card_id = int(successor_card_row["id"])
+
+        finalize_purge_replacement(
+            context.connection,
+            admission,
+            successor_task_card_id=successor_task_card_id,
+            created_at=int(time.time()),
+        )
+        record_version = _advance_initiative_version(
+            context.connection, context, initiative_id, expected_version
+        )
+        return {
+            "initiative_id": initiative_id,
+            "update_kind": update_kind,
+            "record_version": record_version,
+            "replacement_id": admission.replacement_id,
+            "predecessor_task_id": admission.predecessor_task_id,
+            "successor_task_id": successor_task_id,
+            "cleanup_required": cleanup_required,
+        }
 
     if update_kind == "segment_manifest_projection":
         if set(update.keys()) != {
@@ -636,6 +751,44 @@ def _validate_reconciliation(
     to_phase: str,
     to_segment_id: str | None,
 ) -> None:
+    failed: list[FailedCheck] = []
+    not_evaluated: list[NotEvaluatedCheck] = []
+
+    def small(
+        code: str,
+        target: str,
+        expected: str,
+        observed: str,
+        remediation: str,
+    ) -> None:
+        failed.append(
+            FailedCheck(
+                code=code,
+                target=target,
+                expected=expected,
+                observed=observed,
+                accepted_format=expected,
+                remediation=remediation,
+                responsible_actor="orchestrator",
+                retry="same_operation",
+            )
+        )
+
+
+    remediation = (
+        "obtain an accepted repository reconciliation through "
+        "kanban_update_initiative for the exact requested route, then retry; "
+        "stale or wrong records require a new record, never editing an "
+        "immutable accepted record"
+    )
+    remediation_invalid = (
+        "obtain an accepted repository reconciliation through "
+        "kanban_update_initiative for the exact requested route, then retry; "
+        "malformed records require a new record, never editing an immutable "
+        "accepted record, and a system operator must investigate the source "
+        "that produced the malformed record"
+    )
+
     row = conn.execute(
         "SELECT initiative_card_id, initiative_id, phase, segment_id, accepted, "
         "result_kind, actor_evidence, canonical_payload "
@@ -643,66 +796,135 @@ def _validate_reconciliation(
         (reconciliation_ref,),
     ).fetchone()
     if row is None:
-        raise ValueError("reconciliation result not found")
-    if row["initiative_card_id"] != card_id:
-        raise ValueError("reconciliation card mismatch")
-    if row["initiative_id"] != initiative_id:
-        raise ValueError("reconciliation initiative mismatch")
-    if row["accepted"] != 1:
-        raise ValueError("reconciliation not accepted")
-    if row["result_kind"] != "repository_reconciliation":
-        raise ValueError("reconciliation kind mismatch")
-    if row["phase"] != from_phase:
-        raise ValueError("reconciliation phase mismatch")
-    if row["segment_id"] != from_segment_id:
-        raise ValueError("reconciliation segment mismatch")
+        small(
+            "RECONCILIATION_NOT_FOUND",
+            "reconciliation_ref",
+            "accepted repository_reconciliation record for this initiative and "
+            "this exact route",
+            "missing",
+            remediation,
+        )
+        not_evaluated.append(
+            NotEvaluatedCheck(
+                "RECONCILIATION_CONTENT",
+                ("RECONCILIATION_NOT_FOUND",),
+            )
+        )
+        raise CommandRejected(
+            failed_checks=tuple(failed),
+            not_evaluated_checks=tuple(not_evaluated),
+        )
+
+    expected_row = {
+        "initiative_card_id": card_id,
+        "initiative_id": initiative_id,
+        "phase": from_phase,
+        "segment_id": from_segment_id,
+        "accepted": 1,
+        "result_kind": "repository_reconciliation",
+    }
+    for column, value in expected_row.items():
+        if row[column] != value:
+            small(
+                f"RECONCILIATION_ROW_MISMATCH:{column}",
+                f"reconciliation_ref.{column}",
+                repr(value),
+                "does not match requested route",
+                remediation,
+            )
+
 
     try:
         actor_evidence = json.loads(row["actor_evidence"])
     except (json.JSONDecodeError, TypeError):
-        raise ValueError("invalid reconciliation actor evidence")
+        actor_evidence = None
     if not isinstance(actor_evidence, dict):
-        raise ValueError("reconciliation actor evidence must be an object")
-    if actor_evidence.get("actor_profile") != "default":
-        raise ValueError("reconciliation actor profile must be default")
+        small(
+            "RECONCILIATION_ACTOR_INVALID",
+            "actor_evidence.actor_profile",
+            "object actor_evidence",
+            "non-object or malformed JSON",
+            remediation_invalid,
+        )
+        not_evaluated.append(
+            NotEvaluatedCheck(
+                "RECONCILIATION_ACTOR_PROFILE",
+                ("RECONCILIATION_ACTOR_INVALID",),
+            )
+        )
+    elif actor_evidence.get("actor_profile") != "default":
+        small(
+            "RECONCILIATION_ACTOR_PROFILE",
+            "actor_evidence.actor_profile",
+            "default Orchestrator profile",
+            "wrong or absent profile",
+            "obtain an accepted repository reconciliation through "
+            "kanban_update_initiative for the exact requested route, then retry",
+        )
 
     try:
         canonical_payload = json.loads(row["canonical_payload"])
     except (json.JSONDecodeError, TypeError):
-        raise ValueError("invalid reconciliation payload")
+        canonical_payload = None
     if not isinstance(canonical_payload, dict):
-        raise ValueError("reconciliation payload must be an object")
-    required_keys = {
-        "initiative_id",
-        "board",
-        "previous_transition_id",
-        "from_phase",
-        "from_segment_id",
-        "to_phase",
-        "to_segment_id",
-        "verification_result",
-        "canon_route",
-        "exit_gate_ref",
-    }
-    if not required_keys.issubset(canonical_payload):
-        raise ValueError("reconciliation payload is incomplete")
-    expected = {
-        "initiative_id": initiative_id,
-        "board": board,
-        "previous_transition_id": previous_transition_id,
-        "from_phase": from_phase,
-        "from_segment_id": from_segment_id,
-        "to_phase": to_phase,
-        "to_segment_id": to_segment_id,
-        "verification_result": "accepted",
-    }
-    for key, value in expected.items():
-        if canonical_payload.get(key) != value:
-            raise ValueError(f"reconciliation {key} mismatch")
-    for key in ("canon_route", "exit_gate_ref"):
-        value = canonical_payload.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"reconciliation {key} must be nonblank")
+        small(
+            "RECONCILIATION_PAYLOAD_INVALID",
+            "canonical_payload",
+            "object canonical_payload",
+            "non-object or malformed JSON",
+            remediation_invalid,
+        )
+        not_evaluated.append(
+            NotEvaluatedCheck(
+                "RECONCILIATION_ROUTE_FIELDS",
+                ("RECONCILIATION_PAYLOAD_INVALID",),
+            )
+        )
+    else:
+        expected_route = {
+            "initiative_id": initiative_id,
+            "board": board,
+            "previous_transition_id": previous_transition_id,
+            "from_phase": from_phase,
+            "from_segment_id": from_segment_id,
+            "to_phase": to_phase,
+            "to_segment_id": to_segment_id,
+            "verification_result": "accepted",
+        }
+        for key, value in expected_route.items():
+            if key not in canonical_payload:
+                small(
+                    f"RECONCILIATION_FIELD_MISMATCH:{key}",
+                    f"canonical_payload.{key}",
+                    repr(value),
+                    "missing",
+                    remediation,
+                )
+            elif canonical_payload[key] != value:
+                small(
+                    f"RECONCILIATION_FIELD_MISMATCH:{key}",
+                    f"canonical_payload.{key}",
+                    repr(value),
+                    "does not match requested route",
+                    remediation,
+                )
+
+        for key in ("canon_route", "exit_gate_ref"):
+            value = canonical_payload.get(key)
+            if not isinstance(value, str) or not value.strip():
+                small(
+                    f"RECONCILIATION_FIELD_INVALID:{key}",
+                    f"canonical_payload.{key}",
+                    "present nonblank string",
+                    "missing or blank",
+                    remediation,
+                )
+
+    if failed or not_evaluated:
+        raise CommandRejected(
+            failed_checks=tuple(failed),
+            not_evaluated_checks=tuple(not_evaluated),
+        )
 
 
 def _validate_reconciliation_result_candidate(
@@ -819,49 +1041,156 @@ def _validate_segment_projection(
         raise ValueError("readiness references have an unsupported shape")
 
 
+def _validate_transition_payload(payload: dict) -> dict:
+    if type(payload) is not dict:
+        raise CommandRejected(
+            failed_checks=(
+                FailedCheck(
+                    code="TRANSITION_PAYLOAD_INVALID",
+                    target="payload",
+                    expected="object",
+                    observed="non-object",
+                    accepted_format="dict",
+                    remediation="provide a dict payload",
+                    responsible_actor="orchestrator",
+                    retry="same_operation",
+                ),
+            ),
+        )
+
+    allowed = frozenset({"initiative_id", "to_phase", "to_segment_id", "reconciliation_ref", "approval_id", "board"})
+    required = ("initiative_id", "to_phase", "reconciliation_ref", "approval_id", "board")
+    failed: list[FailedCheck] = []
+    not_evaluated: list[NotEvaluatedCheck] = []
+
+    def add(code: str, target: str, expected: str, observed: str, remediation: str) -> None:
+        failed.append(
+            FailedCheck(
+                code=code,
+                target=target,
+                expected=expected,
+                observed=observed,
+                accepted_format=expected,
+                remediation=remediation,
+                responsible_actor="orchestrator",
+                retry="same_operation",
+            )
+        )
+
+    unknown = [k for k in payload if k not in allowed]
+    if unknown:
+        add(
+            "TRANSITION_UNKNOWN_FIELDS",
+            "payload",
+            "initiative_id, to_phase, to_segment_id, reconciliation_ref, approval_id, board",
+            f"{len(unknown)} unrecognized fields",
+            "remove unsupported fields or use initiative update for details",
+        )
+
+    normalized: dict = {}
+    for key in payload:
+        if key not in allowed:
+            continue
+        val = payload[key]
+        if key == "to_segment_id":
+            if val is None:
+                normalized[key] = None
+            elif type(val) is str and val.strip():
+                normalized[key] = val.strip()
+            else:
+                add(
+                    "TRANSITION_FIELD_INVALID:to_segment_id",
+                    "to_segment_id",
+                    "nonblank string or null",
+                    "invalid type or blank",
+                    "provide a nonblank string or null for to_segment_id",
+                )
+        else:
+            if type(val) is str and val.strip():
+                normalized[key] = val.strip()
+            else:
+                observed = "missing" if key not in payload else "invalid type or blank"
+                add(
+                    f"TRANSITION_FIELD_INVALID:{key}",
+                    key,
+                    "nonblank string",
+                    observed,
+                    f"provide a nonblank string for {key}",
+                )
+
+    for field in required:
+        if field not in payload:
+            add(
+                f"TRANSITION_FIELD_INVALID:{field}",
+                field,
+                "nonblank string",
+                "missing",
+                f"provide a nonblank string for {field}",
+            )
+
+    if normalized.get('to_phase') is not None and normalized.get('to_phase') not in INITIATIVE_PHASES:
+        add(
+            code='TRANSITION_PHASE_UNKNOWN',
+            target='to_phase',
+            expected=', '.join(sorted(INITIATIVE_PHASES)),
+            observed='unrecognized phase',
+            remediation='use a valid phase from the allowed list'
+        )
+
+    failure_codes = {c.code for c in failed}
+    prereq_order = (
+        "TRANSITION_FIELD_INVALID:to_phase",
+        "TRANSITION_PHASE_UNKNOWN",
+        "TRANSITION_FIELD_INVALID:to_segment_id",
+    )
+    prereqs = tuple(code for code in prereq_order if code in failure_codes)
+
+    if prereqs:
+        not_evaluated.append(
+            NotEvaluatedCheck(
+                code="TRANSITION_SEGMENT_PHASE_COMPATIBILITY",
+                requires=prereqs,
+            )
+        )
+    else:
+        phase = normalized.get("to_phase")
+        seg = normalized.get("to_segment_id")
+        if phase in ("DEV2", "DEV3", "DEV4"):
+            if seg is None:
+                add(
+                    "TRANSITION_SEGMENT_PHASE_COMPATIBILITY",
+                    "to_segment_id",
+                    "DEV2/DEV3/DEV4 require to_segment_id; other phases require null",
+                    "segment missing",
+                    "choose a declared segment for DEV2/DEV3/DEV4",
+                )
+        else:
+            if seg is not None:
+                add(
+                    "TRANSITION_SEGMENT_PHASE_COMPATIBILITY",
+                    "to_segment_id",
+                    "DEV2/DEV3/DEV4 require to_segment_id; other phases require null",
+                    "segment present",
+                    "omit to_segment_id for non-DEV2/DEV3/DEV4 phases",
+                )
+
+    if failed or not_evaluated:
+        raise CommandRejected(
+            failed_checks=tuple(failed),
+            not_evaluated_checks=tuple(not_evaluated),
+        )
+    return normalized
+
+
 def _handle_transition_initiative(context: Any) -> dict[str, Any]:
     payload = context.payload
-    unknown = set(payload.keys()) - {
-        "initiative_id",
-        "to_phase",
-        "to_segment_id",
-        "reconciliation_ref",
-        "approval_id",
-        "board",
-    }
-    if unknown:
-        raise ValueError(f"unknown fields: {sorted(unknown)}")
-    initiative_id = payload.get("initiative_id")
-    to_phase = payload.get("to_phase")
-    to_segment_id = payload.get("to_segment_id")
-    reconciliation_ref = payload.get("reconciliation_ref")
-    approval_id = payload.get("approval_id")
-    board = payload.get("board")
-    if not (type(initiative_id) is str and initiative_id.strip()):
-        raise ValueError("initiative_id must be a nonblank string")
-    if not (type(to_phase) is str and to_phase.strip()):
-        raise ValueError("to_phase must be a nonblank string")
-    if to_segment_id is not None and not (
-        type(to_segment_id) is str and to_segment_id.strip()
-    ):
-        raise ValueError("to_segment_id must be a nonblank string")
-    if not (type(reconciliation_ref) is str and reconciliation_ref.strip()):
-        raise ValueError("reconciliation_ref must be a nonblank string")
-    if not (type(approval_id) is str and approval_id.strip()):
-        raise ValueError("approval_id must be a nonblank string")
-    if not (type(board) is str and board.strip()):
-        raise ValueError("board must be a nonblank string")
-    initiative_id = initiative_id.strip()
-    to_phase = to_phase.strip()
-    to_segment_id = to_segment_id.strip() if to_segment_id is not None else None
-    reconciliation_ref = reconciliation_ref.strip()
-    board = board.strip()
-    if to_phase not in INITIATIVE_PHASES:
-        raise ValueError("to_phase must be a recognized initiative phase")
-    if to_phase in {"DEV2", "DEV3", "DEV4"} and to_segment_id is None:
-        raise ValueError("to_segment_id is required for DEV2, DEV3, DEV4")
-    if to_phase not in {"DEV2", "DEV3", "DEV4"} and to_segment_id is not None:
-        raise ValueError("to_segment_id must be absent for non-DEV2/3/4 phases")
+    normalized = _validate_transition_payload(payload)
+    initiative_id = normalized["initiative_id"]
+    to_phase = normalized["to_phase"]
+    to_segment_id = normalized.get("to_segment_id")
+    reconciliation_ref = normalized["reconciliation_ref"]
+    approval_id = payload["approval_id"]
+    board = normalized["board"]
 
     card = context.connection.execute(
         "SELECT id, record_version FROM adrian_kanban_cards "
