@@ -64,7 +64,7 @@ def _validate_manifest_path(path: str) -> str:
 def _validate_sha(value: str, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
-    if not (_HEX_40_RE.match(value) or _HEX_64_RE.match(value)):
+    if not (_HEX_40_RE.fullmatch(value) or _HEX_64_RE.fullmatch(value)):
         raise ValueError(f"{field} must be 40 or 64 lowercase hex")
     return value
 
@@ -72,7 +72,7 @@ def _validate_sha(value: str, field: str) -> str:
 def _validate_sha256(value: str, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
-    if not _HEX_64_RE.match(value):
+    if not _HEX_64_RE.fullmatch(value):
         raise ValueError(f"{field} must be 64 lowercase hex")
     return value
 
@@ -80,7 +80,7 @@ def _validate_sha256(value: str, field: str) -> str:
 def _validate_commit(value: str, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
-    if not (_HEX_40_RE.match(value) or _HEX_64_RE.match(value)):
+    if not (_HEX_40_RE.fullmatch(value) or _HEX_64_RE.fullmatch(value)):
         raise ValueError(f"{field} must be 40 or 64 lowercase hex")
     return value
 
