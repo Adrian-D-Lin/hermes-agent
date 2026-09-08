@@ -387,7 +387,7 @@ def _seed_reconciliation(
         conn.commit()
 
 
-def test_transition_supports_approved_non_linear_route_with_reconciliation(
+def test_ordinary_transition_cannot_impersonate_a_human_override_with_approval_alone(
     commands_module, tmp_path, monkeypatch
 ):
     database_path, provider = _database(tmp_path, monkeypatch, commands_module)
@@ -402,6 +402,7 @@ def test_transition_supports_approved_non_linear_route_with_reconciliation(
         "initiative_id": "initiative-1",
         "to_phase": "DEV1",
         "reconciliation_ref": "reconciliation-1",
+        "phase_close_ref": "missing-close",
         "approval_id": "approval-transition",
         "board": "orchestrator",
     }
@@ -432,14 +433,8 @@ def test_transition_supports_approved_non_linear_route_with_reconciliation(
         payload=payload,
     )
 
-    assert result["result"] == "ACCEPTED"
-    assert result["value"] == {
-        "initiative_id": "initiative-1",
-        "from_phase": "D1",
-        "to_phase": "DEV1",
-        "transition_id": 2,
-        "record_version": 1,
-    }
+    assert result["result"] == "REJECTED", result
+    assert "phase_close_ref" in str(result), result
     with sqlite3.connect(database_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -447,22 +442,21 @@ def test_transition_supports_approved_non_linear_route_with_reconciliation(
             "ORDER BY transition_id",
             ("initiative-1",),
         ).fetchall()
-        assert [row["transition_id"] for row in rows] == [1, 2]
-        assert rows[1]["previous_transition_id"] == 1
-        assert rows[1]["repository_reconciliation_ref"] == payload["reconciliation_ref"]
+        assert [row["transition_id"] for row in rows] == [1]
+        assert rows[0]["to_phase"] == "D1"
         assert (
             conn.execute(
                 "SELECT record_version FROM adrian_kanban_cards "
                 "WHERE initiative_id = 'initiative-1'"
             ).fetchone()[0]
-            == 1
+            == 0
         )
         assert (
             conn.execute(
                 "SELECT state FROM write_gate_kanban_approvals "
                 "WHERE approval_id = 'approval-transition'"
             ).fetchone()[0]
-            == "consumed"
+            == "approved"
         )
 
 
@@ -478,6 +472,7 @@ def test_transition_reports_independent_shape_failures_without_spending_approval
         "to_segment_id": 123,
         "approval_id": "approval-transition",
         "reconciliation_ref": "",
+        "phase_close_ref": "close-1",
         "sensitive-unknown-key": "sensitive-value",
     }
     _approve(
@@ -583,6 +578,7 @@ def test_transition_shape_keeps_explicit_phase_segment_contract(
         "to_phase": phase,
         "to_segment_id": segment,
         "reconciliation_ref": " reconciliation-1 ",
+        "phase_close_ref": "close-1",
         "approval_id": "approval-1",
         "board": "orchestrator",
     }
@@ -613,6 +609,7 @@ def test_transition_missing_fields_are_reported_together(commands_module):
         "initiative_id",
         "to_phase",
         "reconciliation_ref",
+        "phase_close_ref",
         "approval_id",
         "board",
     }
@@ -634,6 +631,7 @@ def test_transition_bad_phase_is_diagnostic_not_internal_exception(
             "initiative_id": "initiative-1",
             "to_phase": phase,
             "reconciliation_ref": "ref-1",
+            "phase_close_ref": "close-1",
             "approval_id": "approval-1",
             "board": "orchestrator",
         })
@@ -654,6 +652,7 @@ def test_transition_shape_normalizes_phase_before_enum_check(commands_module):
         "to_phase": " DEV2 ",
         "to_segment_id": " S1 ",
         "reconciliation_ref": "ref-1",
+        "phase_close_ref": "close-1",
         "approval_id": "approval-1",
         "board": "orchestrator",
     })
@@ -670,6 +669,7 @@ def test_transition_rejects_missing_reconciliation_without_spending_approval(
         "initiative_id": "initiative-1",
         "to_phase": "DEV1",
         "reconciliation_ref": "missing-reconciliation",
+        "phase_close_ref": "close-1",
         "approval_id": "approval-transition",
         "board": "orchestrator",
     }
@@ -941,9 +941,15 @@ def test_segment_transition_requires_manifest_defined_segment(
         "to_phase": "DEV2",
         "to_segment_id": "S2",
         "reconciliation_ref": "reconciliation-dev2",
+        "phase_close_ref": "close-1",
         "approval_id": "approval-transition",
         "board": "orchestrator",
     }
+    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        with pytest.raises(ValueError, match="target segment not found"):
+            mutations._validate_segment_projection(conn, card_id, "S2")
     _approve(
         database_path,
         approval_id="approval-transition",
