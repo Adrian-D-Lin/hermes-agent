@@ -56,6 +56,9 @@ class _RecordingBoundary:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
 
+    def _finish_response(self, response):
+        return response
+
     def submit(self, operation: str, **fields):
         self.calls.append((operation, fields))
         return {

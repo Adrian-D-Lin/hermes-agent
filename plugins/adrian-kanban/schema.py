@@ -53,6 +53,19 @@ from __future__ import annotations
 # to NULL-task rows, the task uniqueness only to non-null-task rows (global on
 # task_id alone).
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS adrian_kanban_rejection_audit (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    boundary_json TEXT NOT NULL,
+    failed_checks_json TEXT NOT NULL,
+    not_evaluated_checks_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS adrian_kanban_rejection_audit_attempt_event_idx
+    ON adrian_kanban_rejection_audit (attempt_id, event_id);
+
 -- Canonical initiative identity. One row per initiative_id; this is the parent
 -- the unified cards reference. It is created explicitly by the initiative-card
 -- operation and must already exist before a task card can name it.

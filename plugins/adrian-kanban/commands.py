@@ -13,6 +13,7 @@ from typing import Any
 
 from .attachments import PreparedAttachment, prepare_url_attachment
 from .purge_cleanup import execute_cleanup
+from .rejection_audit import record_rejection
 from .capability import CapabilityBinding
 from .contracts import ContractSnapshot, expand_contract, template_for
 from .diagnostics import (
@@ -936,10 +937,12 @@ class _ModelToolRequestNormalizer:
                 payload=payload,
             )
         except Exception:
-            return self._boundary._rejection_internal(
-                _resolve_attempt_id({"attempt_id": attempt_id}),
-                operation,
-                _PUBLIC_REQUEST_NORMALIZATION_FAILED,
+            return self._boundary._finish_response(
+                self._boundary._rejection_internal(
+                    _resolve_attempt_id({"attempt_id": attempt_id}),
+                    operation,
+                    _PUBLIC_REQUEST_NORMALIZATION_FAILED,
+                )
             )
 
 
@@ -2911,6 +2914,12 @@ class _CommandBoundary:
         self._segment_manifest_preparer = segment_manifest_preparer
 
     def submit(self, action: str, **fields: Any) -> dict[str, Any]:
+        return self._finish_response(self._submit_without_audit(action, **fields))
+
+    def _finish_response(self, response):
+        return record_rejection(self._database_path, response, recognized_operations=RECOGNIZED_OPERATIONS)
+
+    def _submit_without_audit(self, action: str, **fields: Any) -> dict[str, Any]:
         attempt_id = _resolve_attempt_id(fields)
         if action not in RECOGNIZED_OPERATIONS:
             return _rejection(attempt_id, action, _UNRECOGNIZED_OPERATION)
