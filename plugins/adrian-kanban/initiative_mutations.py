@@ -497,13 +497,30 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
         }
 
     if update_kind == "orchestration_checkpoint":
-        admission = admit_orchestration_checkpoint(
-            context.connection,
-            initiative_card_id=card_id,
-            initiative_id=initiative_id,
-            actor_profile=context.binding.actor_profile,
-            update=update,
-        )
+        try:
+            admission = admit_orchestration_checkpoint(
+                context.connection,
+                initiative_card_id=card_id,
+                initiative_id=initiative_id,
+                actor_profile=context.binding.actor_profile,
+                update=update,
+                prepared_execution=context.prepared_phase_result,
+            )
+        except ValueError as exc:
+            raise CommandRejected(
+                failed_checks=(
+                    FailedCheck(
+                        code="ORCHESTRATION_CHECKPOINT_EVIDENCE",
+                        target="update.result",
+                        expected="valid orchestration checkpoint evidence for the requested step",
+                        observed=str(exc),
+                        accepted_format="recognized D4/DEV1 checkpoint result schema with complete prior checkpoint and task evidence",
+                        remediation="correct the checkpoint evidence so it matches the exact accepted predecessor records and retry",
+                        responsible_actor="orchestrator",
+                        retry="same_operation",
+                    ),
+                ),
+            ) from None
         _consume_approval(
             context.connection,
             context,

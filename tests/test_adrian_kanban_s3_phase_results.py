@@ -276,6 +276,50 @@ def _phase_preparer(d1, root, binding=None):
     )
 
 
+@pytest.mark.parametrize("gap", [None, "missing_binding", "missing_lease", "wrong_scope", "missing_blob"])
+def test_d4_preparer_uses_real_registry_and_immutable_git(d1, phase_repository, tmp_path, monkeypatch, gap):
+    from writegate import registry as writegate
+    root, draft_commit, _ = phase_repository
+    prefix = d1.__package__
+    module = importlib.import_module(f"{prefix}.phase_preparer")
+    inputs = importlib.import_module(f"{prefix}.task_inputs")
+    execution = importlib.import_module(f"{prefix}.phase_d4_execution")
+    monkeypatch.setattr(writegate, "utcnow_iso", lambda: "2026-09-01T00:00:00+00:00")
+    registry = writegate.Registry(tmp_path / "authority.sqlite3")
+    try:
+        if gap != "missing_binding":
+            registry.create_binding(session_id="submitting-session", worktree_path=str(root))
+        registry.create_request(request_id="approval", session_id="original-executor", confirmed_worktree=str(root), narrowest_folder=str(root / "2-design"), recovery_location=str(root / "5-archive"), stated_outcome="approved edit")
+        registry.decide_request("approval", "once")
+        if gap != "missing_lease":
+            registry.create_lease(lease_id="lease", approval_reference="approval", session_id="original-executor", confirmed_worktree=str(root), approved_folder=str(root / ("other" if gap == "wrong_scope" else "2-design")), approved_at="2026-09-01T00:00:00+00:00")
+        update = {
+            "phase": "D4", "segment_id": None,
+            "result": {
+                "step": "D4.4", "write_gate_approval_ref": "approval", "approval_lease_ref": "lease",
+                "approved_change_set_digest": "a" * 64, "execution_result": "applied",
+                "post_write_documents": [{"path": "2-design/missing.md" if gap == "missing_blob" else "2-design/draft.md", "sha": draft_commit}],
+                "item_determinations": [{"item_id": "author#/edit_set/0", "determination": "applied"}],
+                "execution_started_at": "2026-09-01T00:01:00+00:00", "execution_finished_at": "2026-09-01T00:02:00+00:00",
+            },
+        }
+        (root / "2-design/draft.md").write_bytes(b"dirty content must not be read")
+        preparer = module.GitPhaseResultPreparer(lambda: registry)
+        context = inputs.TaskInputPreparationContext(session_id="submitting-session", execution_context="test")
+        payload = {"initiative_id": "initiative-1", "update_kind": "orchestration_checkpoint", "update": update, "cwd": "untrusted"}
+        if gap is None:
+            proof = preparer(payload, context)
+            assert type(proof) is execution.PreparedD4Execution
+            assert proof.lease.session_id == "original-executor"
+            assert proof.documents[0].sha256 == hashlib.sha256(b"draft").hexdigest()
+            assert (root / "2-design/draft.md").read_bytes() == b"dirty content must not be read"
+        else:
+            with pytest.raises(ValueError):
+                preparer(payload, context)
+    finally:
+        registry.close()
+
+
 @pytest.mark.parametrize("phase", ["D1", "D2", "D3"])
 def test_phase_preparer_reads_pinned_bytes_not_dirty_files(d1, phase_repository, phase):
     root, draft_commit, review_commit = phase_repository

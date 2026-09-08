@@ -534,6 +534,7 @@ def admit_orchestration_checkpoint(
     initiative_id: str,
     actor_profile: str,
     update: dict[str, Any],
+    prepared_execution: Any = None,
 ) -> CheckpointAdmission:
     if actor_profile != "default":
         raise ValueError("actor profile must be default")
@@ -572,6 +573,11 @@ def admit_orchestration_checkpoint(
         _validate_d4_3(conn, update, initiative_card_id, initiative_id, resolved_steps)
     elif step == "D4.4":
         _validate_d4_4(conn, update, initiative_card_id, initiative_id)
+        from .phase_d4_execution import admit_d4_execution
+
+        admit_d4_execution(
+            conn, initiative_card_id, initiative_id, update, prepared_execution
+        )
     elif step == "DEV1.2":
         _validate_dev1_2(
             conn, update, initiative_card_id, initiative_id, resolved_steps
