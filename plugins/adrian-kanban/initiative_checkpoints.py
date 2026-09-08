@@ -179,18 +179,36 @@ def _validate_d4_3(
     if not _is_nonblank_str(result.get("write_gate_approval_ref")):
         raise ValueError("D4.3 result requires nonblank write_gate_approval_ref")
     digest = result.get("approved_change_set_digest")
-    if not isinstance(digest, str) or not _HEX64_RE.match(digest):
-        raise ValueError(
-            "D4.3 result requires valid 64-hex approved_change_set_digest"
-        )
+    if not isinstance(digest, str) or not _HEX64_RE.fullmatch(digest):
+        raise ValueError("D4.3 result requires valid 64-hex approved_change_set_digest")
     doc_refs = result.get("current_document_refs")
     if not isinstance(doc_refs, list) or not doc_refs:
         raise ValueError("D4.3 result requires nonempty current_document_refs")
     for ref in doc_refs:
         if not _is_nonblank_str(ref):
-            raise ValueError(
-                "D4.3 current_document_refs must contain nonblank strings"
-            )
+            raise ValueError("D4.3 current_document_refs must contain nonblank strings")
+
+    from .phase_d4_evidence import validate_d4_source_pair
+
+    author_ref = next(ref for ref in accepted_refs if resolved_steps[ref] == "D4.1")
+    verifier_ref = next(ref for ref in accepted_refs if resolved_steps[ref] == "D4.2")
+    author, verifier = validate_d4_source_pair(
+        conn,
+        initiative_card_id,
+        initiative_id,
+        author_ref,
+        verifier_ref,
+        digest,
+    )
+    if len(doc_refs) != len(set(doc_refs)):
+        raise ValueError("D4.3 current_document_refs must be unique")
+    expected_doc_refs = {
+        edit["current_state_ref"] for edit in author.metadata["edit_set"]
+    }
+    if set(doc_refs) != expected_doc_refs:
+        raise ValueError(
+            "D4.3 current_document_refs must exactly match author edit_set current_state_refs"
+        )
 
 
 def _validate_d4_4(
@@ -247,7 +265,7 @@ def _validate_d4_4(
             "D4.3 checkpoint payload requires valid write_gate_approval_ref"
         )
     d4_3_digest = d4_3_payload.get("approved_change_set_digest")
-    if not isinstance(d4_3_digest, str) or not _HEX64_RE.match(d4_3_digest):
+    if not isinstance(d4_3_digest, str) or not _HEX64_RE.fullmatch(d4_3_digest):
         raise ValueError(
             "D4.3 checkpoint payload requires valid approved_change_set_digest"
         )
@@ -272,7 +290,7 @@ def _validate_d4_4(
         if not _is_nonblank_str(doc.get("path")):
             raise ValueError("post_write_documents path must be nonblank")
         sha = doc.get("sha")
-        if not isinstance(sha, str) or not _HEX40_RE.match(sha):
+        if not isinstance(sha, str) or not _HEX40_RE.fullmatch(sha):
             raise ValueError("post_write_documents sha must be valid 40-hex")
 
     determinations = result.get("item_determinations")
@@ -344,15 +362,11 @@ def _validate_dev1_2(
         if not _is_positive_int(item_count) and not (
             type(item_count) is int and item_count >= 0
         ):
-            raise ValueError(
-                "source_angles item_count must be a nonnegative integer"
-            )
+            raise ValueError("source_angles item_count must be a nonnegative integer")
         total_count += item_count
 
     if seen_candidate_refs != set(accepted_refs):
-        raise ValueError(
-            "source_angles candidate_refs must equal accepted_task_refs"
-        )
+        raise ValueError("source_angles candidate_refs must equal accepted_task_refs")
 
     total_item_count = result.get("total_item_count")
     if (
@@ -360,14 +374,10 @@ def _validate_dev1_2(
         or isinstance(total_item_count, bool)
         or total_item_count < 0
     ):
-        raise ValueError(
-            "DEV1.2 total_item_count must be a nonnegative integer"
-        )
+        raise ValueError("DEV1.2 total_item_count must be a nonnegative integer")
 
     if result.get("total_item_count") != total_count:
-        raise ValueError(
-            "DEV1.2 total_item_count does not match sum of source_angles"
-        )
+        raise ValueError("DEV1.2 total_item_count does not match sum of source_angles")
 
 
 def _validate_dev1_3(
@@ -409,9 +419,7 @@ def _validate_dev1_3(
             "checkpoint"
         )
     if row["result_id"] != checkpoint_ref:
-        raise ValueError(
-            "DEV1.3 checkpoint ref is not the latest accepted checkpoint"
-        )
+        raise ValueError("DEV1.3 checkpoint ref is not the latest accepted checkpoint")
 
     try:
         latest_payload = json.loads(row["canonical_payload"])
@@ -429,17 +437,11 @@ def _validate_dev1_3(
     if predecessor_step == "DEV1.2":
         expected_cumulative_ref = latest_payload.get("cumulative_record_ref")
         if not _is_nonblank_str(expected_cumulative_ref):
-            raise ValueError(
-                "DEV1.2 predecessor requires valid cumulative_record_ref"
-            )
+            raise ValueError("DEV1.2 predecessor requires valid cumulative_record_ref")
         if result.get("pass_counter") != 1:
-            raise ValueError(
-                "DEV1.3 pass_counter must be 1 when predecessor is DEV1.2"
-            )
+            raise ValueError("DEV1.3 pass_counter must be 1 when predecessor is DEV1.2")
     else:
-        expected_cumulative_ref = latest_payload.get(
-            "updated_cumulative_record_ref"
-        )
+        expected_cumulative_ref = latest_payload.get("updated_cumulative_record_ref")
         if not _is_nonblank_str(expected_cumulative_ref):
             raise ValueError(
                 "DEV1.3 predecessor requires valid updated_cumulative_record_ref"
@@ -448,9 +450,7 @@ def _validate_dev1_3(
         if not _is_positive_int(prior_pass_counter):
             raise ValueError("DEV1.3 predecessor requires valid pass_counter")
         if result.get("pass_counter") != prior_pass_counter + 1:
-            raise ValueError(
-                "DEV1.3 pass_counter must increment from predecessor"
-            )
+            raise ValueError("DEV1.3 pass_counter must increment from predecessor")
 
     if result.get("current_cumulative_record_ref") != expected_cumulative_ref:
         raise ValueError(
@@ -477,9 +477,7 @@ def _validate_dev1_3(
     if len(follow_up_refs) != len(set(follow_up_refs)):
         raise ValueError("follow_up_task_refs must be unique")
     if set(follow_up_refs) != set(accepted_task_refs):
-        raise ValueError(
-            "follow_up_task_refs must exactly equal accepted_task_refs"
-        )
+        raise ValueError("follow_up_task_refs must exactly equal accepted_task_refs")
 
     declarations = result.get("no_new_material_declarations")
     if not isinstance(declarations, list) or len(declarations) != 5:
@@ -498,9 +496,7 @@ def _validate_dev1_3(
     all_true = True
     for decl in declarations:
         if not isinstance(decl, dict):
-            raise ValueError(
-                "no_new_material_declarations entries must be objects"
-            )
+            raise ValueError("no_new_material_declarations entries must be objects")
         step = decl.get("step")
         no_new_material = decl.get("no_new_material")
         if step not in expected_steps:
@@ -573,9 +569,7 @@ def admit_orchestration_checkpoint(
         resolved_steps[ref] = resolved_step
 
     if step == "D4.3":
-        _validate_d4_3(
-            conn, update, initiative_card_id, initiative_id, resolved_steps
-        )
+        _validate_d4_3(conn, update, initiative_card_id, initiative_id, resolved_steps)
     elif step == "D4.4":
         _validate_d4_4(conn, update, initiative_card_id, initiative_id)
     elif step == "DEV1.2":
