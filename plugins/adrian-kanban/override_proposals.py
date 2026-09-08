@@ -65,6 +65,38 @@ def _require_positive_int(value: object, name: str) -> int:
     return value
 
 
+def _validate_closure_fields(source: object, destination: object, actual_closed_at) -> None:
+    """Validate explicit source/destination ``closed_at`` fields against state.
+
+    A currently closed initiative requires an explicit source timestamp equal to
+    its actual ``closed_at`` and an explicit destination of ``None`` (the reopen).
+    An open initiative may omit legacy closure fields (meaning ``None``), but any
+    supplied field must match its open state. An override never closes, so a
+    non-null destination is always rejected. Bool/string values are rejected even
+    when they look like timestamps.
+    """
+    if not isinstance(source, dict) or not isinstance(destination, dict):
+        raise ValueError("source and destination must be mappings")
+    source_closed = source.get("closed_at")
+    destination_closed = destination.get("closed_at")
+    for value in (source_closed, destination_closed):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError("closure fields must be null or an integer timestamp")
+    if destination_closed is not None:
+        # An override cannot close an initiative.
+        raise ValueError("an override cannot close an initiative")
+    if actual_closed_at is None:
+        # Open: legacy omission means None; any supplied source field must match.
+        if source_closed is not None:
+            raise ValueError("source closure does not match the open initiative")
+    else:
+        # Closed: require exact source timestamp and explicit destination null.
+        if "closed_at" not in source or source_closed != actual_closed_at:
+            raise ValueError("source closure does not match the current initiative")
+        if "closed_at" not in destination:
+            raise ValueError("a closed initiative requires an explicit destination closure")
+
+
 def _in_transaction(conn) -> None:
     try:
         in_tx = conn.in_transaction
@@ -171,10 +203,13 @@ def store_prepared_override(
             "FROM adrian_kanban_cards WHERE initiative_id = ? AND task_id IS NULL",
             (initiative_id,),
         ).fetchone()
-        if card is None or card["board_slug"] != board or card["closed_at"] is not None:
-            raise ValueError("open initiative not found in the declared board")
+        if card is None or card["board_slug"] != board:
+            raise ValueError("initiative not found in the declared board")
         if card["record_version"] != expected_version:
             raise ValueError("expected version does not match the current initiative")
+        _validate_closure_fields(
+            proposal["source"], proposal["destination"], card["closed_at"]
+        )
     else:
         card = conn.execute(
             "SELECT c.id, c.initiative_id, c.task_id, c.board_slug, c.record_version, c.closed_at "
@@ -190,6 +225,10 @@ def store_prepared_override(
             raise ValueError("open task not found under the parent initiative/board")
         if card["record_version"] != expected_version:
             raise ValueError("expected version does not match the current task")
+        # Task proposals never carry closure state; reject any non-null field.
+        _validate_closure_fields(
+            proposal["source"], proposal["destination"], None
+        )
         # A task override cannot silently reopen its distinct parent initiative;
         # that needs initiative-specific authority. The parent must exist, be in
         # the same board, and still be open.
