@@ -1,6 +1,7 @@
 from .diagnostics import CommandRejected, FailedCheck
 from .phase_d1 import PreparedD1Result, admit_d1_result
 from .phase_d2 import PreparedD2Result, admit_d2_result
+from .phase_d3 import PreparedD3Result, admit_d3_result
 from .phase_preparer import GitPhaseResultPreparer
 
 
@@ -14,7 +15,7 @@ def _reject(
                 target="update.result",
                 expected="valid immutable phase-close evidence",
                 observed=diagnostic,
-                accepted_format="D1/D2 fixed result schema with exact path, full commit SHA, sha256 and complete prior finding references",
+                accepted_format="D1/D2/D3 fixed result schema with exact path, full commit SHA, sha256 and complete prior finding references",
                 remediation=remediation,
                 responsible_actor=responsible_actor,
                 retry="same_operation",
@@ -34,7 +35,7 @@ def prepare_phase_result(payload, preparation_context, preparer):
     if result_kind != "phase_close":
         return None
     phase = update.get("phase")
-    if phase not in ("D1", "D2"):
+    if phase not in ("D1", "D2", "D3"):
         return None
     if preparer is None:
         raise _reject(
@@ -72,6 +73,14 @@ def prepare_phase_result(payload, preparation_context, preparer):
                 responsible_actor="system_operator",
                 remediation="Verify the preparer returns the correct typed result object for D2 phase close.",
             )
+    elif phase == "D3":
+        if type(proof) is not PreparedD3Result:
+            raise _reject(
+                code="PHASE_RESULT_PREPARER",
+                diagnostic="expected PreparedD3Result",
+                responsible_actor="system_operator",
+                remediation="Verify the preparer returns the correct typed result object for D3 phase close.",
+            )
     return proof
 
 
@@ -80,14 +89,16 @@ def admit_phase_result(context, card_id, initiative_id, update):
     if result_kind != "phase_close":
         return None
     phase = update.get("phase")
-    if phase not in ("D1", "D2"):
+    if phase not in ("D1", "D2", "D3"):
         return None
     prepared = context.prepared_phase_result
     try:
         if phase == "D1":
             return admit_d1_result(context, card_id, initiative_id, update, prepared)
-        else:
+        elif phase == "D2":
             return admit_d2_result(context, card_id, initiative_id, update, prepared)
+        else:
+            return admit_d3_result(context, card_id, initiative_id, update, prepared)
     except ValueError as exc:
         raise _reject(
             code="PHASE_RESULT_EVIDENCE",
