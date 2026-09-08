@@ -275,7 +275,7 @@ def test_cold_initiative_read_hydrates_structured_lifecycle_state(
             "(workspace_id, repository_identity, relative_path, branch, "
             "required_base_sha, observed_head, member_state, observed_at) "
             "VALUES ('workspace-s1', 'hermes', 'members/hermes', 'segment/S1', ?, ?, "
-            "'ready', 1083)",
+            "'materialized', 1083)",
             ("e" * 40, "e" * 40),
         )
         conn.execute(

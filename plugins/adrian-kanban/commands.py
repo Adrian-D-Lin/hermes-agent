@@ -42,6 +42,7 @@ from .output_validators import (
     validate_lifecycle_output,
 )
 from .projections import attachments_projection, list_projection, show_projection
+from .segment_manifest import PreparedSegmentManifest
 from .skill_bundle import resolve_skill_binding, skill_contract, validate_skill_bundle
 from .task_inputs import (
     PreparedManifest,
@@ -2825,6 +2826,7 @@ class _CommandContext:
         prepared_attachment: PreparedAttachment | None = None,
         idempotency_key: str | None = None,
         prepared_manifest: PreparedManifest | None = None,
+        prepared_segment_manifest: PreparedSegmentManifest | None = None,
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -2837,6 +2839,7 @@ class _CommandContext:
         self.prepared_attachment = prepared_attachment
         self.idempotency_key = idempotency_key
         self.prepared_manifest = prepared_manifest
+        self.prepared_segment_manifest = prepared_segment_manifest
 
 
 class _CommandBoundary:
@@ -2849,6 +2852,7 @@ class _CommandBoundary:
         state_resolver: Any = None,
         known_profiles: Any = (),
         task_input_preparer: Any = None,
+        segment_manifest_preparer: Any = None,
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise TypeError("provider must be an AdrianKanbanAuthorityProvider")
@@ -2858,6 +2862,10 @@ class _CommandBoundary:
             raise TypeError("state_resolver must be callable or None")
         if task_input_preparer is not None and not callable(task_input_preparer):
             raise TypeError("task_input_preparer must be callable or None")
+        if segment_manifest_preparer is not None and not callable(
+            segment_manifest_preparer
+        ):
+            raise TypeError("segment_manifest_preparer must be callable or None")
         if type(known_profiles) not in {tuple, frozenset, set}:
             raise TypeError("known_profiles must be a tuple, frozenset, or set")
         normalized_profiles: list[str] = []
@@ -2873,6 +2881,7 @@ class _CommandBoundary:
         self._state_resolver = state_resolver
         self._known_profiles = frozenset(normalized_profiles)
         self._task_input_preparer = task_input_preparer
+        self._segment_manifest_preparer = segment_manifest_preparer
 
     def submit(self, action: str, **fields: Any) -> dict[str, Any]:
         attempt_id = _resolve_attempt_id(fields)
@@ -3040,6 +3049,32 @@ class _CommandBoundary:
                 if type(prepared_manifest) is not PreparedManifest:
                     raise ValueError("task_input_preparer must return PreparedManifest")
 
+            prepared_segment_manifest = None
+            if (
+                action == "kanban_update_initiative"
+                and payload.get("update_kind") == "segment_manifest_projection"
+            ):
+                if self._segment_manifest_preparer is None:
+                    raise ValueError("segment_manifest_preparer is required")
+                preparation_context = TaskInputPreparationContext(
+                    session_id=session_id.strip(),
+                    execution_context=execution_context.strip(),
+                    workspace_id=(
+                        workspace_id.strip() if workspace_id is not None else None
+                    ),
+                    actor_profile=(
+                        actor_profile.strip() if actor_profile is not None else None
+                    ),
+                )
+                prepared_segment_manifest = self._segment_manifest_preparer(
+                    payload, preparation_context
+                )
+                if type(prepared_segment_manifest) is not PreparedSegmentManifest:
+                    raise ValueError(
+                        "segment_manifest_preparer must return "
+                        "PreparedSegmentManifest"
+                    )
+
             prepared_attachment = None
             if action == "kanban_attach_url":
                 prepared_attachment = _prepare_attach_url_payload(payload)
@@ -3127,6 +3162,7 @@ class _CommandBoundary:
                     prepared_attachment=prepared_attachment,
                     idempotency_key=idempotency_key,
                     prepared_manifest=prepared_manifest,
+                    prepared_segment_manifest=prepared_segment_manifest,
                 )
                 try:
                     result = handler(context)

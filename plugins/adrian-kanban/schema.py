@@ -209,12 +209,23 @@ CREATE TABLE IF NOT EXISTS segment_workspace_members (
     repository_identity TEXT NOT NULL,
     relative_path TEXT NOT NULL,
     branch TEXT NOT NULL,
-    required_base_sha TEXT NOT NULL,
+    required_base_sha TEXT,
     observed_head TEXT,
     member_state TEXT NOT NULL,
     observed_at INTEGER NOT NULL,
     PRIMARY KEY (workspace_id, repository_identity),
-    FOREIGN KEY (workspace_id) REFERENCES segment_workspaces (workspace_id)
+    FOREIGN KEY (workspace_id) REFERENCES segment_workspaces (workspace_id),
+    CHECK (member_state IN ('planned', 'materialized', 'merged', 'retired')),
+    CHECK (
+        (member_state = 'planned' AND observed_head IS NULL)
+        OR
+        (member_state IN ('materialized', 'merged', 'retired')
+            AND observed_head IS NOT NULL)
+    ),
+    CHECK (
+        member_state = 'planned'
+        OR required_base_sha IS NOT NULL
+    )
 );
 
 -- Task lifecycle contract: nullable one-per-task immutable contract. A contract

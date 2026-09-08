@@ -10,10 +10,22 @@ from __future__ import annotations
 import sqlite3
 
 from hermes_cli import kanban_db as _kb
+from hermes_cli import config as _config
 
 from .versioning import PLUGIN_NAME, PLUGIN_VERSION, release_identity
 
 _provider_cache: dict[str, "AdrianKanbanAuthorityProvider"] = {}
+
+
+def _trusted_repository_ids_getter() -> frozenset[str]:
+    config = _config.load_config_readonly()
+    kanban_config = config.get("kanban")
+    if not isinstance(kanban_config, dict):
+        raise ValueError("kanban config must be a mapping")
+    registry = kanban_config.get("repository_registry")
+    if not isinstance(registry, dict):
+        raise ValueError("kanban.repository_registry must be a mapping")
+    return frozenset(registry.keys())
 
 
 def register(ctx) -> None:
@@ -56,7 +68,11 @@ def register(ctx) -> None:
         _handle_update_initiative,
         register_public_tools,
     )
-    from .pre_tool_hook import GitTaskInputPreparer, build_pre_tool_hook
+    from .pre_tool_hook import (
+        GitSegmentManifestPreparer,
+        GitTaskInputPreparer,
+        build_pre_tool_hook,
+    )
     from .provider import AdrianKanbanAuthorityProvider, register_provider
     from .routing import ModelToolBoardResolver, resolve_expected_version
 
@@ -68,6 +84,7 @@ def register(ctx) -> None:
         _provider_cache[database_path] = provider
     register_provider(provider)
     preparer = GitTaskInputPreparer()
+    segment_preparer = GitSegmentManifestPreparer(_trusted_repository_ids_getter)
     handlers = {
         "kanban_show": _handle_show,
         "kanban_list": _handle_list,
@@ -102,13 +119,16 @@ def register(ctx) -> None:
             }
         ),
         task_input_preparer=preparer,
+        segment_manifest_preparer=segment_preparer,
     )
     register_public_tools(
         ctx,
         boundary,
         board_resolver=ModelToolBoardResolver(database_path),
     )
-    ctx.register_hook("pre_tool_call", build_pre_tool_hook(preparer))
+    ctx.register_hook(
+        "pre_tool_call", build_pre_tool_hook(preparer, segment_preparer)
+    )
     return None
 
 
