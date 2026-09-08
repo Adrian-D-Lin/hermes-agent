@@ -3145,6 +3145,68 @@ def _seed_governed_running_task(
     return run_id
 
 
+def _seed_d2_lifecycle_contract(commands_module, database_path, task_id: str) -> None:
+    contracts = importlib.import_module(f"{commands_module.__package__}.contracts")
+    snapshot = contracts.expand_contract(
+        step="D2",
+        initiative_id=f"initiative-{task_id}",
+        baseline_refs=("2-design/design.md@commit",),
+        governing_source_refs=("Canon/design-lifecycle.md@commit",),
+    )
+    with sqlite3.connect(database_path) as conn:
+        task_card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        initiative_card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE initiative_id = ? "
+            "AND card_type = 'initiative' AND task_id IS NULL",
+            (f"initiative-{task_id}",),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO task_lifecycle_contracts ("
+            "contract_id, contract_version, step, task_card_id, task_id, "
+            "initiative_card_id, initiative_id, segment_id, workspace_id, "
+            "execution_profile, canonical_contract_payload, registry_hash, "
+            "skill_id, skill_version, skill_hash, created_at) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, 1000)",
+            (
+                snapshot.contract_id,
+                str(snapshot.contract_version),
+                snapshot.step,
+                task_card_id,
+                task_id,
+                initiative_card_id,
+                snapshot.initiative_id,
+                snapshot.execution_profile,
+                snapshot.canonical_payload(),
+                snapshot.registry_hash,
+                "d2-iterative-review",
+                "0.1.0",
+                "a" * 64,
+            ),
+        )
+
+
+def _valid_d2_output() -> dict:
+    return {
+        "artifact_ref": "2-design/d2-review.md@commit",
+        "tests_passed": True,
+        "review_pass_log": ["pass-1"],
+        "angle_coverage": [
+            "principle_alignment",
+            "design_integration",
+            "documentation_silence",
+            "contradiction",
+            "completeness_internal_coherence",
+            "dependencies_downstream_impact",
+            "new_principle_candidate",
+            "alternative_design",
+        ],
+        "findings": [],
+        "conclusion": "DRY",
+    }
+
+
 def _governed_boundary(commands_module, database_path, provider):
     handler_names = {
         "kanban_request_review": "_handle_request_review",
@@ -3289,6 +3351,101 @@ def test_governed_request_review_admits_candidate_and_routes_fixed_reviewer(
             ).fetchone()[0]
             == 1
         )
+
+
+def test_lifecycle_request_review_applies_the_snapshot_fixed_output_validator(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path, monkeypatch, modules["provider"]
+    )
+    task_id = "task-d2-valid-output"
+    _seed_governed_running_task(
+        database_path,
+        task_id=task_id,
+        execution_profile="independent-reviewer",
+        reviewer="builder",
+    )
+    _seed_d2_lifecycle_contract(commands_module, database_path, task_id)
+
+    result = _submit_governed(
+        _governed_boundary(commands_module, database_path, provider),
+        operation="kanban_request_review",
+        task_id=task_id,
+        actor_profile="independent-reviewer",
+        expected_version=0,
+        payload={
+            "summary": "The complete eight-angle record is ready.",
+            "reviewer": "builder",
+            "metadata": _valid_d2_output(),
+        },
+        suffix="d2-valid-output",
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"]["candidate_id"]
+
+
+def test_lifecycle_output_rejection_is_audited_and_rolls_back_candidate_state(
+    commands_module,
+    tmp_path,
+    monkeypatch,
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(
+        tmp_path, monkeypatch, modules["provider"]
+    )
+    task_id = "task-d2-invalid-output"
+    execution_run_id = _seed_governed_running_task(
+        database_path,
+        task_id=task_id,
+        execution_profile="independent-reviewer",
+        reviewer="builder",
+    )
+    _seed_d2_lifecycle_contract(commands_module, database_path, task_id)
+    metadata = _valid_d2_output()
+    metadata["findings"] = [
+        {
+            "materiality": "material",
+            "impact": "secret-impact-value",
+            "route": "D1",
+        }
+    ]
+
+    result = _submit_governed(
+        _governed_boundary(commands_module, database_path, provider),
+        operation="kanban_request_review",
+        task_id=task_id,
+        actor_profile="independent-reviewer",
+        expected_version=0,
+        payload={"summary": "Incomplete output.", "metadata": metadata},
+        suffix="d2-invalid-output",
+    )
+
+    assert result["result"] == "REJECTED"
+    assert any(
+        item["target"] == "findings[0].citation"
+        for item in result["failed_checks"]
+    )
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0] == "running"
+        assert conn.execute(
+            "SELECT ended_at FROM task_runs WHERE id = ?", (execution_run_id,)
+        ).fetchone()[0] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_candidate_handoffs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+        audit = conn.execute(
+            "SELECT findings_json FROM task_handoff_rejections WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        assert "secret-impact-value" not in audit
 
 
 def test_invalid_governed_handoff_audits_fields_without_values_or_state_change(

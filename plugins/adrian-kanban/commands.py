@@ -37,6 +37,10 @@ from .initiative_mutations import (
     _handle_update_initiative,
 )
 from .lifecycle import LifecycleContractRepository
+from .output_validators import (
+    OutputValidationRejected,
+    validate_lifecycle_output,
+)
 from .projections import attachments_projection, list_projection, show_projection
 from .skill_bundle import resolve_skill_binding, skill_contract, validate_skill_bundle
 from .task_inputs import (
@@ -2454,6 +2458,18 @@ def _handle_request_review(context: Any) -> dict[str, Any]:
         validate_candidate_metadata(normalized, metadata)
     except HandoffValidationRejected as exc:
         findings.extend(exc.findings)
+
+    lifecycle_record = LifecycleContractRepository(context.connection).load(task_id)
+    if lifecycle_record is not None:
+        try:
+            validate_lifecycle_output(
+                lifecycle_record.snapshot.output_validator,
+                metadata,
+            )
+        except OutputValidationRejected as exc:
+            findings.extend(
+                HandoffFinding(item.field, item.reason) for item in exc.findings
+            )
 
     if findings:
         findings_json = json.dumps(
