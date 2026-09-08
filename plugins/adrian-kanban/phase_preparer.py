@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional
 from .phase_d1 import prepare_d1_result
 from .phase_d2 import prepare_d2_result
 from .phase_d3 import prepare_d3_result
+from .phase_d4_execution import prepare_d4_execution
 from .task_inputs import TaskInputPreparationContext
 from .published_git import read_published_blob, _git
 from writegate import registry as _writegate
@@ -28,8 +29,11 @@ class GitPhaseResultPreparer:
             )
         if not isinstance(payload, dict):
             raise ValueError("payload must be a dict")
-        if payload.get("update_kind") != "phase_result":
-            raise ValueError("update_kind must be phase_result")
+        update_kind = payload.get("update_kind")
+        if update_kind not in ("phase_result", "orchestration_checkpoint"):
+            raise ValueError(
+                "update_kind must be phase_result or orchestration_checkpoint"
+            )
         initiative_id = payload.get("initiative_id")
         if not isinstance(initiative_id, str) or not initiative_id.strip():
             raise ValueError("initiative_id must be a nonblank string")
@@ -37,10 +41,19 @@ class GitPhaseResultPreparer:
         if not isinstance(update, dict):
             raise ValueError("update must be a dict")
         phase = update.get("phase")
-        if update.get("result_kind") != "phase_close":
-            raise ValueError("result_kind must be phase_close")
-        if phase not in ("D1", "D2", "D3"):
-            raise ValueError("phase must be D1, D2 or D3")
+        if update_kind == "orchestration_checkpoint":
+            if phase != "D4":
+                raise ValueError("orchestration_checkpoint requires phase D4")
+            result = update.get("result")
+            if not isinstance(result, dict) or result.get("step") != "D4.4":
+                raise ValueError(
+                    "orchestration_checkpoint result must be a dict with step D4.4"
+                )
+        else:
+            if update.get("result_kind") != "phase_close":
+                raise ValueError("result_kind must be phase_close")
+            if phase not in ("D1", "D2", "D3"):
+                raise ValueError("phase must be D1, D2 or D3")
         root = self._resolve_root(preparation_context)
         if phase == "D1":
             return prepare_d1_result(
@@ -66,6 +79,18 @@ class GitPhaseResultPreparer:
                     "pinned commit and path, then retry."
                 )
             return blob.stdout
+
+        if update_kind == "orchestration_checkpoint":
+            try:
+                registry = self._registry_getter()
+            except Exception:
+                raise ValueError(
+                    "failed to obtain the trusted writegate registry; restore the "
+                    "writegate registry connection and retry"
+                ) from None
+            return prepare_d4_execution(
+                initiative_id, update, registry, root, immutable_reader
+            )
 
         if phase == "D3":
             return prepare_d3_result(

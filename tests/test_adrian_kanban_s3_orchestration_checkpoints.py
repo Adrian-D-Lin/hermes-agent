@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import dataclasses
 import importlib
 import importlib.util
 import json
@@ -1132,10 +1133,11 @@ def test_d2_close_cannot_omit_a_historical_review_without_prior_closing_record(
         )
 
 
-def _boundary(commands_module, database_path, provider):
+def _boundary(commands_module, database_path, provider, *, phase_result_preparer=None):
     return commands_module._CommandBoundary(
         database_path=str(database_path),
         provider=provider,
+        phase_result_preparer=phase_result_preparer,
         handlers={
             "kanban_update_initiative": commands_module._handle_update_initiative
         },
@@ -1214,6 +1216,116 @@ def _checkpoint_payload(step: str, accepted_task_refs: list[str]) -> dict:
         "approval_id": f"approval:{step}",
         "board": "orchestrator",
     }
+
+
+def _d4_execution_fixture(commands_module, tmp_path, monkeypatch):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    card_id = _seed_initiative(database_path, "D4")
+    for sequence, step in enumerate(("D4.1", "D4.2"), 1):
+        _seed_accepted_handoff(database_path, card_id, step=step, candidate_id=f"candidate:{step}", sequence=sequence)
+    approval = _checkpoint_payload("D4.3", ["candidate:D4.1", "candidate:D4.2"])
+    _approve(database_path, approval)
+    assert _submit(_boundary(commands_module, database_path, provider), approval)["result"] == "ACCEPTED"
+    payload = _checkpoint_payload("D4.4", [])
+    update = payload["update"]
+    update["iteration"] = 2
+    update["accepted_checkpoint_refs"] = ["checkpoint:D4.3"]
+    result = update["result"]
+    result["approved_change_set_digest"] = approval["update"]["result"]["approved_change_set_digest"]
+    result["execution_started_at"] = "2026-09-01T00:01:00+00:00"
+    result["execution_finished_at"] = "2026-09-01T00:02:00+00:00"
+    prefix = commands_module.__package__
+    execution = importlib.import_module(f"{prefix}.phase_d4_execution")
+    evidence = importlib.import_module(f"{prefix}.phase_d4_evidence")
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        author, reviewer = evidence.validate_d4_source_pair(conn, card_id, "initiative-1", "candidate:D4.1", "candidate:D4.2", result["approved_change_set_digest"])
+    result["item_determinations"] = [{"item_id": ref, "determination": "applied"} for ref in (*author.item_refs, *reviewer.item_refs)]
+    lease = execution.VerifiedExecutionLease(result["write_gate_approval_ref"], result["approval_lease_ref"], "original-executor", str(tmp_path), str(tmp_path / "Canon"), result["execution_started_at"], result["execution_finished_at"])
+    proof = execution.PreparedD4Execution("initiative-1", hashlib.sha256(json.dumps(update, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest(), lease, (execution.VerifiedArtifact("Canon/design.md", "c" * 40, "d" * 64),))
+    return database_path, provider, card_id, payload, proof, execution
+
+
+@pytest.mark.parametrize("gap", [None, "missing_item", "foreign_item", "duplicate_item", "wrong_documents", "foreign_checkpoint", "corrupt_refs", "unaccepted_checkpoint", "contract", "wrong_approval", "missing_proof"])
+def test_d4_execution_admission_complete_original_evidence(commands_module, tmp_path, monkeypatch, gap):
+    path, _, card_id, payload, proof, execution = _d4_execution_fixture(commands_module, tmp_path, monkeypatch)
+    update = payload["update"]
+    if gap == "missing_item":
+        update["result"]["item_determinations"].pop()
+    elif gap == "foreign_item":
+        update["result"]["item_determinations"][0]["item_id"] = "invented"
+    elif gap == "duplicate_item":
+        update["result"]["item_determinations"] *= 2
+    elif gap == "wrong_documents":
+        update["result"]["post_write_documents"][0]["path"] = "Canon/other.md"
+        proof = dataclasses.replace(proof, documents=(dataclasses.replace(proof.documents[0], path="Canon/other.md"),))
+    elif gap == "foreign_checkpoint":
+        update["accepted_checkpoint_refs"] = ["other"]
+    elif gap == "wrong_approval":
+        update["result"]["write_gate_approval_ref"] = "other"
+        proof = dataclasses.replace(proof, lease=dataclasses.replace(proof.lease, approval_id="other"))
+    proof = dataclasses.replace(proof, update_digest=hashlib.sha256(json.dumps(update, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest())
+    if gap == "missing_proof":
+        proof = None
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        if gap == "corrupt_refs":
+            conn.execute("UPDATE initiative_phase_results SET accepted_task_refs='not-json' WHERE result_id='checkpoint:D4.3'")
+        elif gap == "unaccepted_checkpoint":
+            conn.execute("UPDATE initiative_phase_results SET accepted=0 WHERE result_id='checkpoint:D4.3'")
+        elif gap == "contract":
+            conn.execute("UPDATE initiative_phase_results SET contract_version='2' WHERE result_id='checkpoint:D4.3'")
+        before = conn.total_changes
+        if gap is None:
+            assert execution.admit_d4_execution(conn, card_id, "initiative-1", update, proof) is None
+        else:
+            with pytest.raises(ValueError):
+                execution.admit_d4_execution(conn, card_id, "initiative-1", update, proof)
+        assert conn.total_changes == before
+
+
+@pytest.mark.parametrize("gap", [None, "deferred", "rejected", "missing_route", "missing_reason", "blank_route", "blank_reason", "no_preparer", "wrong_proof", "missing_item", "wrong_digest"])
+def test_d4_execution_public_command_is_atomic(commands_module, tmp_path, monkeypatch, gap):
+    path, provider, _, payload, proof, _ = _d4_execution_fixture(commands_module, tmp_path, monkeypatch)
+    accepted_case = gap in (None, "deferred", "rejected")
+    if gap in ("deferred", "rejected", "missing_route", "missing_reason", "blank_route", "blank_reason"):
+        item = payload["update"]["result"]["item_determinations"][0]
+        deferred = gap in ("deferred", "missing_route", "blank_route")
+        item["determination"] = "deferred" if deferred else "rejected"
+        field = "deferral_route" if deferred else "rejection_reason"
+        if gap not in ("missing_route", "missing_reason"):
+            item[field] = " " if gap in ("blank_route", "blank_reason") else ("task:follow-up" if deferred else "Outside the approved change set.")
+        proof = dataclasses.replace(proof, update_digest=hashlib.sha256(json.dumps(payload["update"], sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest())
+    elif gap == "missing_item":
+        payload["update"]["result"]["item_determinations"].pop()
+        proof = dataclasses.replace(proof, update_digest=hashlib.sha256(json.dumps(payload["update"], sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest())
+    elif gap == "wrong_digest":
+        payload["update"]["result"]["approved_change_set_digest"] = "e" * 64
+        proof = dataclasses.replace(proof, update_digest=hashlib.sha256(json.dumps(payload["update"], sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest())
+    elif gap == "wrong_proof":
+        proof = object()
+    preparer = None if gap == "no_preparer" else lambda *_: proof
+    boundary = _boundary(commands_module, path, provider, phase_result_preparer=preparer)
+    _approve(path, payload, version=1)
+    response = _submit(boundary, payload, version=1)
+    assert response["result"] == ("ACCEPTED" if accepted_case else "REJECTED"), response
+    if gap in ("missing_route", "missing_reason", "blank_route", "blank_reason"):
+        assert field in json.dumps(response), response
+    if accepted_case:
+        assert _submit(boundary, payload, version=1) == response
+    with sqlite3.connect(path) as conn:
+        state = conn.execute("SELECT state FROM write_gate_kanban_approvals WHERE approval_id=?", (payload["approval_id"],)).fetchone()[0]
+        version = conn.execute("SELECT record_version FROM adrian_kanban_cards WHERE card_type='initiative'").fetchone()[0]
+        count = conn.execute("SELECT count(*) FROM initiative_phase_results WHERE result_id='checkpoint:D4.4'").fetchone()[0]
+        if accepted_case:
+            stored = json.loads(conn.execute("SELECT canonical_payload FROM initiative_phase_results WHERE result_id='checkpoint:D4.4'").fetchone()[0])
+            assert stored["item_determinations"] == payload["update"]["result"]["item_determinations"]
+            conn.row_factory = sqlite3.Row
+            projections = importlib.import_module(f"{commands_module.__package__}.projections")
+            card = projections.show_projection(conn, None, "orchestrator", "initiative-1")
+            checkpoint = next(row for row in card["phase_results"] if row["result_id"] == "checkpoint:D4.4")
+            assert checkpoint["canonical_payload"]["item_determinations"] == stored["item_determinations"]
+    assert (state, version, count) == (("consumed", 2, 1) if accepted_case else ("approved", 1, 0))
 
 
 @pytest.mark.parametrize(
@@ -1383,52 +1495,23 @@ def test_d4_3_rejects_wrong_phase_incomplete_predecessors_or_wrong_actor_atomica
 def test_d4_4_requires_matching_d4_3_checkpoint_and_change_set_digest(
     commands_module, tmp_path, monkeypatch
 ):
-    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
-    card_id = _seed_initiative(database_path, "D4")
-    with sqlite3.connect(database_path) as conn:
-        conn.execute(
-            "INSERT INTO initiative_phase_results "
-            "(result_id, initiative_card_id, initiative_id, phase, segment_id, "
-            "iteration, result_kind, contract_id, contract_version, "
-            "canonical_payload, accepted_task_refs, accepted_checkpoint_refs, "
-            "actor_evidence, idempotency_key, accepted, created_at) VALUES "
-            "('checkpoint:D4.3', ?, 'initiative-1', 'D4', NULL, 1, "
-            "'orchestration_checkpoint', 'adrian-kanban.lifecycle.d4', '1', "
-            "?, '[]', '[]', '{}', 'seed:d4.3', 1, 1)",
-            (
-                card_id,
-                json.dumps(
-                    {
-                        "step": "D4.3",
-                        "write_gate_approval_ref": "write-gate:change-set:1",
-                        "approved_change_set_digest": "a" * 64,
-                        "current_document_refs": ["Canon/design.md@" + "b" * 40],
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            ),
-        )
-        conn.commit()
-    payload = _checkpoint_payload("D4.4", [])
-    payload["update"]["iteration"] = 2
-    payload["update"]["accepted_checkpoint_refs"] = ["checkpoint:D4.3"]
-    _approve(database_path, payload)
-
-    accepted = _submit(_boundary(commands_module, database_path, provider), payload)
+    database_path, provider, _, payload, proof, _ = _d4_execution_fixture(commands_module, tmp_path, monkeypatch)
+    _approve(database_path, payload, version=1)
+    boundary = _boundary(commands_module, database_path, provider, phase_result_preparer=lambda *_: proof)
+    accepted = _submit(boundary, payload, version=1)
     assert accepted["result"] == "ACCEPTED"
-
-    second_payload = _checkpoint_payload("D4.4", [])
+    second_payload = json.loads(json.dumps(payload))
     second_payload["approval_id"] = "approval:D4.4:mismatch"
     second_payload["update"]["result_id"] = "checkpoint:D4.4:mismatch"
     second_payload["update"]["iteration"] = 3
     second_payload["update"]["accepted_checkpoint_refs"] = ["checkpoint:D4.3"]
     second_payload["update"]["result"]["approved_change_set_digest"] = "e" * 64
-    _approve(database_path, second_payload, version=1)
+    proof = dataclasses.replace(proof, update_digest=hashlib.sha256(json.dumps(second_payload["update"], sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest())
+    _approve(database_path, second_payload, version=2)
     rejected = _submit(
-        _boundary(commands_module, database_path, provider),
+        boundary,
         second_payload,
-        version=1,
+        version=2,
     )
     assert rejected["result"] == "REJECTED"
 

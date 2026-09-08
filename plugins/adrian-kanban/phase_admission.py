@@ -2,6 +2,7 @@ from .diagnostics import CommandRejected, FailedCheck
 from .phase_d1 import PreparedD1Result, admit_d1_result
 from .phase_d2 import PreparedD2Result, admit_d2_result
 from .phase_d3 import PreparedD3Result, admit_d3_result
+from .phase_d4_execution import PreparedD4Execution
 from .phase_preparer import GitPhaseResultPreparer
 
 
@@ -24,11 +25,66 @@ def _reject(
     )
 
 
+def _reject_d4(
+    code: str, diagnostic: str, responsible_actor: str, remediation: str
+) -> CommandRejected:
+    return CommandRejected(
+        failed_checks=(
+            FailedCheck(
+                code=code,
+                target="update.result",
+                expected="valid D4.4 execution evidence (write-gate lease, pinned post-write documents, item determinations)",
+                observed=diagnostic,
+                accepted_format="D4.4 fixed result schema with write_gate_approval_ref, approval_lease_ref, approved_change_set_digest, execution_result, pinned post_write_documents and complete item_determinations",
+                remediation=remediation,
+                responsible_actor=responsible_actor,
+                retry="same_operation",
+            ),
+        ),
+    )
+
+
 def prepare_phase_result(payload, preparation_context, preparer):
     update = payload.get("update") if isinstance(payload, dict) else None
     if not isinstance(update, dict):
         return None
     update_kind = payload.get("update_kind")
+    if update_kind == "orchestration_checkpoint":
+        result = update.get("result")
+        if (
+            update.get("phase") != "D4"
+            or not isinstance(result, dict)
+            or result.get("step") != "D4.4"
+        ):
+            return None
+        if preparer is None:
+            raise _reject_d4(
+                code="PHASE_RESULT_PREPARER",
+                diagnostic="preparer is None",
+                responsible_actor="system_operator",
+                remediation="Configure a valid GitPhaseResultPreparer instance before invoking D4.4 execution preparation.",
+            )
+        try:
+            proof = preparer(payload, preparation_context)
+        except ValueError as exc:
+            if type(preparer) is GitPhaseResultPreparer:
+                diagnostic = str(exc)
+            else:
+                diagnostic = "preparation failed"
+            raise _reject_d4(
+                code="PHASE_RESULT_PREPARATION",
+                diagnostic=diagnostic,
+                responsible_actor="orchestrator",
+                remediation="Ensure the payload contains valid D4.4 write-gate lease, pinned post-write document and item determination evidence.",
+            )
+        if type(proof) is not PreparedD4Execution:
+            raise _reject_d4(
+                code="PHASE_RESULT_PREPARER",
+                diagnostic="expected PreparedD4Execution",
+                responsible_actor="system_operator",
+                remediation="Verify the preparer returns the correct typed result object for the D4.4 execution checkpoint.",
+            )
+        return proof
     if update_kind != "phase_result":
         return None
     result_kind = update.get("result_kind")
