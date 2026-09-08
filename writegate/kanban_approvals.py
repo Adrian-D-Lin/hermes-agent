@@ -1,3 +1,5 @@
+import hashlib
+import json
 import sqlite3
 
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ CREATE TABLE IF NOT EXISTS write_gate_kanban_approvals (
     canonical_digest TEXT NOT NULL,
     canonicalization_version INTEGER NOT NULL CHECK (canonicalization_version = 1),
     authorizer_evidence TEXT NOT NULL,
+    requires_distinct_authorizer INTEGER NOT NULL DEFAULT 0 CHECK (requires_distinct_authorizer IN (0, 1)),
     session_id TEXT NOT NULL,
     prepared_at INTEGER NOT NULL,
     approved_at INTEGER,
@@ -53,12 +56,15 @@ class KanbanInitiativeApprovalPreparation:
     canonical_digest: str
     session_id: str
     expires_at: int
+    requires_distinct_authorizer: bool = False
 
     def __post_init__(self) -> None:
         for _name in ("approval_id", "request_id", "operation", "canonical_digest", "session_id"):
             _value = getattr(self, _name)
             if not isinstance(_value, str) or not _value:
                 raise KanbanApprovalRejected(f"{_name} must be a non-empty string")
+        if not isinstance(self.requires_distinct_authorizer, bool):
+            raise KanbanApprovalRejected("requires_distinct_authorizer must be a boolean")
         if not isinstance(self.expected_version, int) or isinstance(self.expected_version, bool) \
                 or self.expected_version < 0:
             raise KanbanApprovalRejected("expected_version must be a non-negative integer")
@@ -167,6 +173,7 @@ class KanbanInitiativeApprovalHost:
             preparation.canonical_digest,
             CANONICALIZATION_VERSION,
             self._authorizer_evidence,
+            int(preparation.requires_distinct_authorizer),
             preparation.session_id,
             now,
             None,
@@ -180,10 +187,11 @@ class KanbanInitiativeApprovalHost:
             "INSERT INTO write_gate_kanban_approvals "
             "(approval_id, approval_type, state, request_id, operation, initiative_id, "
             " proposed_creation_id, expected_version, canonical_digest, "
-            " canonicalization_version, authorizer_evidence, session_id, prepared_at, "
+            " canonicalization_version, authorizer_evidence, requires_distinct_authorizer, "
+            " session_id, prepared_at, "
             " approved_at, expires_at, approval_evidence, cancellation_evidence, "
             " consumed_mutation_id, consumed_idempotency_ref) "
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             _values,
         )
         if _cursor.rowcount != 1:
@@ -203,7 +211,8 @@ class KanbanInitiativeApprovalHost:
             "UPDATE write_gate_kanban_approvals SET state = 'approved', approved_at = ?, "
             " approval_evidence = ? "
             " WHERE approval_id = ? AND state = 'prepared' "
-            " AND approval_type = ? AND authorizer_evidence = ? AND expires_at > ?",
+            " AND approval_type = ? AND authorizer_evidence = ? AND expires_at > ? "
+            " AND requires_distinct_authorizer = 0",
             (now, approval_evidence, approval_id, APPROVAL_TYPE, self._authorizer_evidence, now),
         )
         if _cursor.rowcount != 1:
@@ -228,6 +237,75 @@ class KanbanInitiativeApprovalHost:
         )
         if _cursor.rowcount != 1:
             raise KanbanApprovalRejected("cancel did not update exactly one approval")
+
+    def approve_distinct(self, conn: sqlite3.Connection, approval_id: str, second_authorizer: Any, *,
+                         expected_request_id: str, expected_canonical_digest: str,
+                         approval_quote: str, now: Optional[int] = None) -> None:
+        if now is None:
+            raise KanbanApprovalRejected("now timestamp is required")
+        if not isinstance(now, int) or isinstance(now, bool) or now <= 0:
+            raise KanbanApprovalRejected("now must be a positive integer timestamp")
+        if not isinstance(approval_id, str) or not approval_id:
+            raise KanbanApprovalRejected("approval_id must be a non-empty string")
+        if not isinstance(expected_request_id, str) or not expected_request_id:
+            raise KanbanApprovalRejected("expected_request_id must be a non-empty string")
+        if not isinstance(expected_canonical_digest, str) or not expected_canonical_digest:
+            raise KanbanApprovalRejected("expected_canonical_digest must be a non-empty string")
+        if not isinstance(approval_quote, str) or not approval_quote.strip():
+            raise KanbanApprovalRejected("approval_quote must be a nonblank string")
+        second_canonical = _resolve_authorizer_evidence(second_authorizer)
+        try:
+            second_payload = json.loads(second_canonical)
+        except ValueError:
+            raise KanbanApprovalRejected("second authorizer evidence is invalid")
+        if not isinstance(second_payload, dict):
+            raise KanbanApprovalRejected("second authorizer evidence is invalid")
+        issued_at = second_payload.get("issued_at")
+        expires_at = second_payload.get("expires_at")
+        second_request_id = second_payload.get("request_id")
+        if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+            raise KanbanApprovalRejected("second authorizer evidence time range is invalid")
+        if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+            raise KanbanApprovalRejected("second authorizer evidence time range is invalid")
+        if not (issued_at <= now < expires_at):
+            raise KanbanApprovalRejected("second authorizer evidence is outside its valid time range")
+        if not isinstance(second_request_id, str) or not second_request_id:
+            raise KanbanApprovalRejected("second authorizer event request_id is missing")
+        try:
+            first_payload = json.loads(self._authorizer_evidence)
+        except ValueError:
+            raise KanbanApprovalRejected("first authorizer evidence is invalid")
+        first_request_id = first_payload.get("request_id") if isinstance(first_payload, dict) else None
+        if second_request_id == first_request_id:
+            raise KanbanApprovalRejected("second authorizer event must use a distinct request_id")
+        _receipt = {
+            "second_authorizer": second_payload,
+            "request_id": expected_request_id,
+            "canonical_digest": expected_canonical_digest,
+            "approval_quote": approval_quote,
+            "approval_quote_sha256": hashlib.sha256(approval_quote.encode("utf-8")).hexdigest(),
+        }
+        _receipt_json = json.dumps(_receipt, sort_keys=True, separators=(",", ":"))
+        _cursor = conn.execute(
+            "UPDATE write_gate_kanban_approvals SET state = 'approved', approved_at = ?, "
+            " approval_evidence = ? "
+            " WHERE approval_id = ? AND state = 'prepared' "
+            " AND approval_type = ? AND requires_distinct_authorizer = 1 "
+            " AND authorizer_evidence = ? AND request_id = ? AND canonical_digest = ? "
+            " AND expires_at > ?",
+            (
+                now,
+                _receipt_json,
+                approval_id,
+                APPROVAL_TYPE,
+                self._authorizer_evidence,
+                expected_request_id,
+                expected_canonical_digest,
+                now,
+            ),
+        )
+        if _cursor.rowcount != 1:
+            raise KanbanApprovalRejected("approve_distinct did not update exactly one approval")
 
 
 def consume_approved(conn: sqlite3.Connection, exact_request: KanbanInitiativeApprovalConsumption,
@@ -269,6 +347,13 @@ def consume_approved(conn: sqlite3.Connection, exact_request: KanbanInitiativeAp
 def create_kanban_approval_schema(conn: sqlite3.Connection) -> None:
     """Idempotently create the kanban approval table owned by this module."""
     conn.execute(_SCHEMA)
+    _columns = {row[1] for row in conn.execute("PRAGMA table_info(write_gate_kanban_approvals)")}
+    if "requires_distinct_authorizer" not in _columns:
+        conn.execute(
+            "ALTER TABLE write_gate_kanban_approvals "
+            "ADD COLUMN requires_distinct_authorizer INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (requires_distinct_authorizer IN (0, 1))"
+        )
 
 
 __all__ = (

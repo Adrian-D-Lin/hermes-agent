@@ -33,6 +33,12 @@ Role assignments:
 
 ## Segment anchor
 
+Sequence release requires the accepted completion or recorded orchestration
+checkpoint named by the lifecycle contract. `blocked`, `archived`, worker
+termination, or a terminal-looking status alone does not release the next
+step. Only the separate, exactly approved human gate-override route may
+release an unmet criterion, preserving it without fabricating a reviewer verdict.
+
 Before performing phase work, resolve the active segment and workspace:
 
 1. Read the initiative's transition chain. The active phase is the
@@ -131,8 +137,8 @@ Dispatch protocol:
 candidate implementation brief with the nine required sections.
 - The card must NOT reference findings from other segments or
   initiatives. Each brief is scoped to its own segment.
-- Wait for the card to reach a terminal status (done, archived, or
-  blocked-and-resolved) before proceeding to DEV2.2.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV2.2; terminal status alone is insufficient.
 - Capture the candidate brief for DEV2.2 dispatch.
 
 ## DEV2.2 - Design to Brief Check
@@ -174,8 +180,8 @@ findings.
 - The baseline path must be reachable in the card's worktree or
   attached as a content-addressed bundle with a stated SHA the worker
   must verify before starting.
-- Wait for the card to reach a terminal status (done, archived, or
-  blocked-and-resolved) before proceeding to DEV2.3.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV2.3; terminal status alone is insufficient.
 - Capture the check record for DEV2.3 resolution.
 
 The test-authority-reviewer finding disposition: When the

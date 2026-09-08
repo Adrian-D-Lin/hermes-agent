@@ -47,6 +47,12 @@ Role assignments:
 
 ## Segment anchor
 
+Sequence release requires the accepted completion or recorded orchestration
+checkpoint named by the lifecycle contract. `blocked`, `archived`, worker
+termination, or a terminal-looking status alone does not release the next
+step. Only the separate, exactly approved human gate-override route may
+release an unmet criterion, preserving it without fabricating a reviewer verdict.
+
 Before performing phase work, resolve the active segment and workspace:
 
 1. Read the initiative's transition chain. The active phase is the
@@ -151,8 +157,8 @@ Dispatch protocol:
   the segment workspace).
 - The card states what the independent-reviewer must produce: an
   archival-candidate list with disposition proposals.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV4.1b.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV4.1b; terminal status alone is insufficient.
 - Capture the archival-candidate list for DEV4.1b.
 
 ## DEV4.1b — Archival Verification
@@ -184,8 +190,8 @@ Dispatch protocol:
 - The card states what the test-authority-reviewer must produce: a
   verified
   archival disposition with overreach/underreach findings.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV4.1c.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV4.1c; terminal status alone is insufficient.
 - Capture the verified disposition for DEV4.1c.
 
 ## DEV4.1c — Archival Disposition Execution
@@ -208,8 +214,8 @@ Dispatch protocol:
   and the segment workspace (commit SHA).
 - The card states what the builder-tester must produce: an executed
   archival disposition record.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV4.2a.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV4.2a; terminal status alone is insufficient.
 - Capture the executed archival record for the DEV4 exit gate.
 
 ## DEV4.2a — Implementation-to-Design Ratification Package
@@ -248,8 +254,8 @@ Dispatch protocol:
 - The card states what the independent-reviewer must produce: a
   focused ratification package with one recommended disposition
   per observation.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV4.2b.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV4.2b; terminal status alone is insufficient.
 - Capture the ratification package for DEV4.2b.
 
 ## DEV4.2b — Focused Design-Integration Review
