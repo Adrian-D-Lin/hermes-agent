@@ -762,6 +762,144 @@ class _PrivateNativeAdapter:
         )
         return self._execute_in_active_transaction(capability, binding, args)
 
+    def _create_for_purge_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        title: str,
+        assignee: str,
+        body: Optional[str] = None,
+        parents: tuple[str, ...] = (),
+        tenant: Optional[str] = None,
+        priority: int = 0,
+        workspace_kind: str = "scratch",
+        workspace_path: Optional[str] = None,
+        project: Optional[str] = None,
+        goal_mode: bool = False,
+        goal_max_turns: Optional[int] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        board: Optional[str] = None,
+        initiative_id: str,
+    ) -> Any:
+        if (
+            self._active_capability is None
+            or self._active_binding is None
+            or not self._conn.in_transaction
+        ):
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if capability is not self._active_capability:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if binding is not self._active_binding:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if binding.operation != "kanban_update_initiative":
+            raise _PrivateAdapterRejected(
+                "binding.operation must be kanban_update_initiative"
+            )
+        if binding.actor_profile != "default":
+            raise _PrivateAdapterRejected("actor_profile must be default")
+        if binding.target != initiative_id:
+            raise _PrivateAdapterRejected(
+                "binding.target does not match initiative_id"
+            )
+        if not _is_nonblank_str(board):
+            raise _PrivateAdapterRejected("board must be a nonblank string")
+        row = self._conn.execute(
+            "SELECT id FROM adrian_kanban_cards "
+            "WHERE initiative_id = ? AND board_slug = ? "
+            "AND card_type = 'initiative' AND task_id IS NULL AND closed_at IS NULL",
+            (initiative_id, board),
+        ).fetchone()
+        if row is None:
+            raise _PrivateAdapterRejected("open initiative card not found")
+        args = _CreateTaskArgs(
+            task_id=task_id,
+            title=title,
+            assignee=assignee,
+            body=body,
+            parents=parents,
+            tenant=tenant,
+            priority=priority,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            project=project,
+            goal_mode=goal_mode,
+            goal_max_turns=goal_max_turns,
+            model=model,
+            provider=provider,
+            board=board,
+        )
+        return self._dispatch_native("kanban_create", binding, args, allow_nested=True)
+
+    def _attach_for_purge_in_active_transaction(
+        self,
+        capability: Any,
+        binding: CapabilityBinding,
+        *,
+        task_id: str,
+        filename: str,
+        data: bytes,
+        content_type: Optional[str] = None,
+        board: Optional[str] = None,
+        initiative_id: str,
+        expected_successor_task_id: str,
+    ) -> int:
+        if (
+            self._active_capability is None
+            or self._active_binding is None
+            or not self._conn.in_transaction
+        ):
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if capability is not self._active_capability:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if binding is not self._active_binding:
+            raise _PrivateAdapterRejected("active boundary transaction required")
+        if binding.operation != "kanban_update_initiative":
+            raise _PrivateAdapterRejected(
+                "binding.operation must be kanban_update_initiative"
+            )
+        if binding.actor_profile != "default":
+            raise _PrivateAdapterRejected("actor_profile must be default")
+        if binding.target != initiative_id:
+            raise _PrivateAdapterRejected(
+                "binding.target does not match initiative_id"
+            )
+        if not _is_nonblank_str(board):
+            raise _PrivateAdapterRejected("board must be a nonblank string")
+        card = self._conn.execute(
+            "SELECT id, initiative_id FROM adrian_kanban_cards "
+            "WHERE task_id = ? AND board_slug = ? AND card_type = 'task'",
+            (task_id, board),
+        ).fetchone()
+        if card is None:
+            raise _PrivateAdapterRejected("successor task card not found")
+        if card["initiative_id"] != initiative_id:
+            raise _PrivateAdapterRejected(
+                "successor task does not belong to the bound initiative"
+            )
+        if task_id != expected_successor_task_id:
+            raise _PrivateAdapterRejected(
+                "task_id does not match expected successor task"
+            )
+        row = self._conn.execute(
+            "SELECT id FROM adrian_kanban_cards "
+            "WHERE initiative_id = ? AND board_slug = ? "
+            "AND card_type = 'initiative' AND task_id IS NULL AND closed_at IS NULL",
+            (initiative_id, board),
+        ).fetchone()
+        if row is None:
+            raise _PrivateAdapterRejected("open initiative card not found")
+        args = _AttachArgs(
+            task_id=task_id,
+            filename=filename,
+            data=data,
+            content_type=content_type,
+            board=board,
+        )
+        return self._dispatch_native("kanban_attach", binding, args, allow_nested=True)
+
     def _link_in_active_transaction(
         self,
         capability: Any,

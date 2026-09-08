@@ -118,6 +118,130 @@ def _get_task_attachments(conn: sqlite3.Connection, task_id: str) -> list[dict[s
     return [_row_to_dict(r) for r in rows]
 
 
+def _get_cleanup_status(conn, replacement_id, cleanup_required):
+    if not cleanup_required:
+        return {'state': 'retained', 'items': []}
+    rows = conn.execute(
+        "SELECT source_path, destination_path, expected_inventory FROM task_purge_cleanup_items WHERE replacement_id=? ORDER BY source_path",
+        (replacement_id,),
+    ).fetchall()
+    items = []
+    for row in rows:
+        source_path = row[0]
+        destination_path = row[1]
+        expected_inventory_raw = row[2]
+        evidence = None
+        error = None
+        state = 'failed'
+        event_row = conn.execute(
+            "SELECT status, evidence_json, error FROM task_purge_cleanup_events WHERE replacement_id=? AND source_path=? ORDER BY event_id DESC LIMIT 1",
+            (replacement_id, source_path),
+        ).fetchone()
+        if event_row is None:
+            state = "failed"
+            evidence = None
+            error = "No cleanup event found for source_path"
+        else:
+            status = event_row[0]
+            evidence_raw = event_row[1]
+            error = event_row[2]
+            if status == "prepared":
+                state = "pending"
+                evidence = None
+            elif status == "failed":
+                state = "failed"
+                evidence = None
+            elif status == "verified":
+                try:
+                    evidence = json.loads(evidence_raw) if evidence_raw else None
+                except (json.JSONDecodeError, TypeError):
+                    evidence = None
+                if not isinstance(evidence, dict) or evidence.get("verified") is not True:
+                    state = "failed"
+                    error = "Malformed or missing verified evidence"
+                else:
+                    try:
+                        expected_inv = json.loads(expected_inventory_raw) if expected_inventory_raw else None
+                    except (json.JSONDecodeError, TypeError):
+                        expected_inv = None
+                    if not isinstance(expected_inv, dict):
+                        state = "failed"
+                        error = "Malformed expected_inventory"
+                    else:
+                        ev_source = evidence.get("source")
+                        ev_archive = evidence.get("archive")
+                        ev_sha = evidence.get("sha256")
+                        exp_sha = expected_inv.get("sha256")
+                        if not isinstance(ev_sha, str) or not ev_sha.strip() or ev_sha != exp_sha:
+                            state = "failed"
+                            error = "Evidence mismatch with expected inventory"
+                        elif ev_source != source_path or ev_archive != destination_path:
+                            state = "failed"
+                            error = "Evidence mismatch with expected inventory"
+                        else:
+                            state = "verified"
+            else:
+                state = "failed"
+                error = f"Unknown status: {status}"
+        items.append({
+            "source": source_path,
+            "archive": destination_path,
+            "state": state,
+            "evidence": evidence,
+            "error": error,
+        })
+    if not items:
+        overall_state = "failed"
+    elif all(item["state"] == "verified" for item in items):
+        overall_state = "verified"
+    elif any(item["state"] == "failed" for item in items):
+        overall_state = "failed"
+    else:
+        overall_state = "pending"
+    result = {"state": overall_state, "items": items}
+    if overall_state not in ("verified", "retained"):
+        result["remediation"] = "replay original approved request"
+    return result
+
+
+def _get_purge_replacements(
+    conn: sqlite3.Connection,
+    board: str,
+    initiative_id: str,
+    successor_task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    query = """
+        SELECT replacement_id, initiative_card_id, initiative_id, board_slug,
+               predecessor_task_card_id, predecessor_task_id,
+               successor_task_card_id, successor_task_id,
+               eligibility_classification, eligibility_evidence,
+               authorization_approval_id, requester_evidence,
+               repository_disposition_reference, repository_disposition_action,
+               repository_disposition_preservation_ref, transferred_relations,
+               cleanup_required, predecessor_workspace_snapshot, created_at
+        FROM task_purge_replacements
+        WHERE board_slug = ? AND initiative_id = ?
+    """
+    params: list[Any] = [board, initiative_id]
+    if successor_task_id is not None:
+        query += " AND successor_task_id = ?"
+        params.append(successor_task_id)
+    query += " ORDER BY created_at, replacement_id"
+    rows = conn.execute(query, params).fetchall()
+    result = []
+    for row in rows:
+        d = _row_to_dict(row)
+        d["board"] = d.pop("board_slug")
+        d["eligibility_evidence"] = _json_or_none(d["eligibility_evidence"])
+        d["requester_evidence"] = _json_or_none(d["requester_evidence"])
+        d["transferred_relations"] = _json_or_none(d["transferred_relations"])
+        d["predecessor_workspace_snapshot"] = _json_or_none(d["predecessor_workspace_snapshot"])
+        d["cleanup_required"] = _parse_bool(d["cleanup_required"])
+        d['cleanup'] = _get_cleanup_status(conn, d['replacement_id'], d['cleanup_required'])
+        result.append(d)
+    return result
+
+
 def _collect_open_findings(
     phase_results: list[dict[str, Any]],
     handoff_rejections: list[dict[str, Any]],
@@ -192,6 +316,11 @@ def show_projection(
         accepted_handoff = _get_accepted_handoff(conn, card_row["id"])
         attachments = _get_task_attachments(conn, task_id)
 
+        purge_replacement = None
+        replacements = _get_purge_replacements(conn, board, card_row["initiative_id"], task_id)
+        if replacements:
+            purge_replacement = replacements[-1]
+
         return {
             "card": card,
             "task": task_data,
@@ -202,6 +331,7 @@ def show_projection(
             "latest_candidate": latest_candidate,
             "accepted_handoff": accepted_handoff,
             "attachments": attachments,
+            "purge_replacement": purge_replacement,
         }
 
     if initiative_id is not None:
@@ -299,12 +429,17 @@ def show_projection(
             (initiative_id, board),
         ).fetchall()
 
+        all_replacements = _get_purge_replacements(conn, board, initiative_id)
+        replacement_by_successor = {r["successor_task_id"]: r for r in all_replacements}
         tasks_list = []
         for tc in task_cards:
             tc_dict = _row_to_dict(tc)
             lifecycle = _get_lifecycle_contract(conn, tc_dict["id"])
             latest_candidate = _get_latest_candidate(conn, tc_dict["id"])
             accepted_handoff = _get_accepted_handoff(conn, tc_dict["id"])
+            replaces_task_id = None
+            if tc_dict["task_id"] in replacement_by_successor:
+                replaces_task_id = replacement_by_successor[tc_dict["task_id"]]["predecessor_task_id"]
             tasks_list.append({
                 "task_id": tc_dict["task_id"],
                 "title": tc_dict["title"],
@@ -314,6 +449,7 @@ def show_projection(
                 "lifecycle_contract": lifecycle,
                 "latest_candidate": latest_candidate,
                 "accepted_handoff": accepted_handoff,
+                "replaces_task_id": replaces_task_id,
             })
 
         rejections = conn.execute(
@@ -351,6 +487,7 @@ def show_projection(
             "tasks": tasks_list,
             "open_findings": open_findings,
             "next_permitted_routes": next_permitted_routes,
+            "purge_replacements": all_replacements,
         }
 
     raise ValueError("must provide task_id or initiative_id")
@@ -427,10 +564,28 @@ def list_projection(
         initiatives.append(d)
 
     tasks = []
+    groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for r in task_rows:
+        key = (r["board_slug"], r["initiative_id"])
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(r)
+    replacement_map: dict[tuple[str, str], dict[str, str]] = {}
+    for (b, init_id), rows in groups.items():
+        reps = _get_purge_replacements(conn, b, init_id)
+        m = {}
+        for rep in reps:
+            m[rep["successor_task_id"]] = rep["predecessor_task_id"]
+        replacement_map[(b, init_id)] = m
     for r in task_rows:
         d = _row_to_dict(r)
         d["board"] = d.pop("board_slug")
         d.pop("id")
+        key = (r["board_slug"], r["initiative_id"])
+        replaces_task_id = None
+        if key in replacement_map:
+            replaces_task_id = replacement_map[key].get(d["task_id"])
+        d["replaces_task_id"] = replaces_task_id
         tasks.append(d)
 
     initiatives.sort(key=lambda x: (x["created_at"], x["initiative_id"]))

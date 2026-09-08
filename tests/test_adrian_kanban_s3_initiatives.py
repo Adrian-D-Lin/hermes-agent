@@ -456,6 +456,123 @@ def test_transition_supports_approved_non_linear_route_with_reconciliation(
         ).fetchone()[0] == "consumed"
 
 
+def test_transition_reports_independent_shape_failures_without_spending_approval(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(database_path)
+    payload = {
+        "initiative_id": "initiative-1", "board": "orchestrator",
+        "to_phase": "unrecognized-private-value", "to_segment_id": 123,
+        "approval_id": "approval-transition", "reconciliation_ref": "",
+        "sensitive-unknown-key": "sensitive-value",
+    }
+    _approve(
+        database_path, approval_id="approval-transition", attempt_id="attempt-shape",
+        operation="kanban_transition_initiative", target="initiative-1",
+        expected_version=0, payload=payload,
+    )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path), provider=provider,
+        handlers={"kanban_transition_initiative": commands_module._handle_transition_initiative},
+    )
+    result = _submit(
+        boundary, "kanban_transition_initiative", attempt_id="attempt-shape",
+        key="key-shape", target="initiative-1", version=0, payload=payload,
+    )
+    assert result["result"] == "REJECTED"
+    findings = {check["code"]: check for check in result["failed_checks"]}
+    assert set(findings) == {
+        "TRANSITION_UNKNOWN_FIELDS", "TRANSITION_PHASE_UNKNOWN",
+        "TRANSITION_FIELD_INVALID:reconciliation_ref",
+        "TRANSITION_FIELD_INVALID:to_segment_id",
+    }
+    assert result["not_evaluated_checks"] == [{
+        "code": "TRANSITION_SEGMENT_PHASE_COMPATIBILITY",
+        "requires": ["TRANSITION_PHASE_UNKNOWN", "TRANSITION_FIELD_INVALID:to_segment_id"],
+    }]
+    for check in findings.values():
+        assert check["accepted_format"]
+        assert check["remediation"]
+        assert check["responsible_actor"] == "orchestrator"
+    serialized = json.dumps(result)
+    for secret in ("sensitive-unknown-key", "sensitive-value", "unrecognized-private-value"):
+        assert secret not in serialized
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM initiative_transitions").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals WHERE approval_id = 'approval-transition'"
+        ).fetchone()[0] == "approved"
+        assert conn.execute("SELECT COUNT(*) FROM adrian_kanban_command_receipts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("phase,segment,accepted", [
+    ("DEV2", "S1", True), ("DEV3", "S1", True), ("DEV4", "S1", True),
+    ("D1", None, True), ("D2", None, True), ("D3", None, True),
+    ("D4", None, True), ("DEV1", None, True), ("PC1", None, True),
+    ("DEV2", None, False), ("DEV3", None, False), ("DEV4", None, False),
+    ("D1", "S1", False), ("PC1", "S1", False),
+])
+def test_transition_shape_keeps_explicit_phase_segment_contract(
+    commands_module, phase, segment, accepted
+):
+    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
+    payload = {
+        "initiative_id": " initiative-1 ", "to_phase": phase,
+        "to_segment_id": segment, "reconciliation_ref": " reconciliation-1 ",
+        "approval_id": "approval-1", "board": "orchestrator",
+    }
+    original = payload.copy()
+    if accepted:
+        normalized = mutations._validate_transition_payload(payload)
+        assert normalized["initiative_id"] == "initiative-1"
+        assert normalized["reconciliation_ref"] == "reconciliation-1"
+        assert normalized["to_phase"] == phase
+        assert normalized["to_segment_id"] == segment
+    else:
+        with pytest.raises(diagnostics.CommandRejected) as caught:
+            mutations._validate_transition_payload(payload)
+        assert [check.code for check in caught.value.failed_checks] == [
+            "TRANSITION_SEGMENT_PHASE_COMPATIBILITY"
+        ]
+    assert payload == original
+
+
+def test_transition_missing_fields_are_reported_together(commands_module):
+    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
+    with pytest.raises(diagnostics.CommandRejected) as caught:
+        mutations._validate_transition_payload({})
+    assert {check.target for check in caught.value.failed_checks} == {
+        "initiative_id", "to_phase", "reconciliation_ref", "approval_id", "board"
+    }
+    assert caught.value.not_evaluated_checks[0].requires == ("TRANSITION_FIELD_INVALID:to_phase",)
+
+
+@pytest.mark.parametrize("phase", [[], {}, False, 1, "", "  "])
+def test_transition_bad_phase_is_diagnostic_not_internal_exception(commands_module, phase):
+    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
+    with pytest.raises(diagnostics.CommandRejected) as caught:
+        mutations._validate_transition_payload({
+            "initiative_id": "initiative-1", "to_phase": phase,
+            "reconciliation_ref": "ref-1", "approval_id": "approval-1", "board": "orchestrator",
+        })
+    assert [check.code for check in caught.value.failed_checks] == ["TRANSITION_FIELD_INVALID:to_phase"]
+    assert caught.value.not_evaluated_checks[0].requires == ("TRANSITION_FIELD_INVALID:to_phase",)
+
+
+def test_transition_shape_normalizes_phase_before_enum_check(commands_module):
+    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    normalized = mutations._validate_transition_payload({
+        "initiative_id": "initiative-1", "to_phase": " DEV2 ", "to_segment_id": " S1 ",
+        "reconciliation_ref": "ref-1", "approval_id": "approval-1", "board": "orchestrator",
+    })
+    assert normalized["to_phase"] == "DEV2"
+    assert normalized["to_segment_id"] == "S1"
+
+
 def test_transition_rejects_missing_reconciliation_without_spending_approval(
     commands_module, tmp_path, monkeypatch
 ):
@@ -496,6 +613,10 @@ def test_transition_rejects_missing_reconciliation_without_spending_approval(
     )
 
     assert result["result"] == "REJECTED"
+    assert result["failed_checks"][0]["code"] == "RECONCILIATION_NOT_FOUND"
+    assert result["not_evaluated_checks"] == [{
+        "code": "RECONCILIATION_CONTENT", "requires": ["RECONCILIATION_NOT_FOUND"]
+    }]
     with sqlite3.connect(database_path) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM initiative_transitions"
@@ -508,6 +629,59 @@ def test_transition_rejects_missing_reconciliation_without_spending_approval(
             "SELECT state FROM write_gate_kanban_approvals "
             "WHERE approval_id = 'approval-transition'"
         ).fetchone()[0] == "approved"
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_reconciliation_reports_independent_stored_evidence_failures(
+    commands_module, tmp_path, monkeypatch, malformed
+):
+    database_path, _provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(database_path)
+    _seed_reconciliation(database_path, result_id="bad-ref", from_phase="D1", to_phase="DEV1")
+    mutations = importlib.import_module(f"{commands_module.__package__}.initiative_mutations")
+    diagnostics = importlib.import_module(f"{commands_module.__package__}.diagnostics")
+    with sqlite3.connect(database_path) as conn:
+        # Disposable historical/corrupt-state fixture: no production record is edited.
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM initiative_phase_results WHERE result_id='bad-ref'").fetchone()
+        route = json.loads(row["canonical_payload"])
+        route["to_phase"] = "secret-wrong-phase"
+        route["previous_transition_id"] = 88
+        route.pop("from_segment_id")
+        route["canon_route"] = ""
+        route["exit_gate_ref"] = None
+        conn.execute(
+            "UPDATE initiative_phase_results SET accepted=0, phase='D2', "
+            "actor_evidence=?, canonical_payload=? WHERE result_id='bad-ref'",
+            ("[secret malformed" if malformed else '{"actor_profile":"private-profile"}',
+             "[secret malformed" if malformed else json.dumps(route)),
+        )
+        conn.commit()
+        with pytest.raises(diagnostics.CommandRejected) as caught:
+            mutations._validate_reconciliation(
+                conn, row["initiative_card_id"], "initiative-1", "orchestrator", "bad-ref",
+                1, "D1", None, "DEV1", None,
+            )
+        checks = {check.code: check for check in caught.value.failed_checks}
+        expected = {"RECONCILIATION_ROW_MISMATCH:accepted", "RECONCILIATION_ROW_MISMATCH:phase"}
+        if malformed:
+            expected |= {"RECONCILIATION_ACTOR_INVALID", "RECONCILIATION_PAYLOAD_INVALID"}
+            assert {c.code for c in caught.value.not_evaluated_checks} == {
+                "RECONCILIATION_ACTOR_PROFILE", "RECONCILIATION_ROUTE_FIELDS"
+            }
+        else:
+            expected |= {
+                "RECONCILIATION_ACTOR_PROFILE", "RECONCILIATION_FIELD_MISMATCH:to_phase",
+                "RECONCILIATION_FIELD_MISMATCH:previous_transition_id",
+                "RECONCILIATION_FIELD_MISMATCH:from_segment_id",
+                "RECONCILIATION_FIELD_INVALID:canon_route", "RECONCILIATION_FIELD_INVALID:exit_gate_ref",
+            }
+            assert caught.value.not_evaluated_checks == ()
+        assert set(checks) == expected
+        serialized = json.dumps([c.as_dict() for c in checks.values()])
+        for secret in ("secret-wrong-phase", "private-profile", "secret malformed"):
+            assert secret not in serialized
+        assert not conn.in_transaction
 
 
 def test_repository_reconciliation_result_requires_default_orchestrator(

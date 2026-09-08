@@ -190,6 +190,24 @@ def build_pre_tool_hook(
             }
 
         if tool_name == "kanban_update_initiative":
+            update_kind = args.get("update_kind")
+            if update_kind == "purge_replace_task":
+                update = args.get("update")
+                if not isinstance(update, dict):
+                    return {
+                        "action": "block",
+                        "message": "declared_inputs_accessible = no; invalid update",
+                    }
+                successor_payload = update.get("successor_payload")
+                if not isinstance(successor_payload, dict):
+                    return {
+                        "action": "block",
+                        "message": "declared_inputs_accessible = no; missing successor_payload",
+                    }
+                args = successor_payload
+                tool_name = "kanban_create"
+
+        if tool_name == "kanban_update_initiative":
             if args.get("update_kind") != "segment_manifest_projection":
                 return None
             if segment_preparer is None:

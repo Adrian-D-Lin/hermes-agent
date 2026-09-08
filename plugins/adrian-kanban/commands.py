@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -11,12 +12,15 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 from .attachments import PreparedAttachment, prepare_url_attachment
+from .purge_cleanup import execute_cleanup
 from .capability import CapabilityBinding
 from .contracts import ContractSnapshot, expand_contract, template_for
 from .diagnostics import (
     Boundary,
+    CommandRejected,
     DiagnosticCollector,
     FailedCheck,
+    NotEvaluatedCheck,
 )
 from .provider import (
     AdrianKanbanAuthorityProvider,
@@ -685,7 +689,18 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "update_kind": {
                     "type": "string",
-                    "description": "Kind of update to apply to the initiative.",
+                    "description": (
+                        "Kind of update to apply to the initiative. One of "
+                        "body_update, phase_result, segment_manifest_projection, "
+                        "orchestration_checkpoint, or purge_replace_task."
+                    ),
+                    "enum": [
+                        "body_update",
+                        "phase_result",
+                        "segment_manifest_projection",
+                        "orchestration_checkpoint",
+                        "purge_replace_task",
+                    ],
                 },
                 "update": {
                     "type": "object",
@@ -1283,7 +1298,14 @@ def _handle_create(context: Any) -> dict[str, Any]:
     assignee = assignee.strip()
     board = board.strip()
 
+    if context.connection.execute(
+        "SELECT 1 FROM task_purge_replacements WHERE predecessor_task_id = ?",
+        (task_id,),
+    ).fetchone() is not None:
+        raise ValueError("task_id already retired as a purge predecessor")
+
     handoff_requirements = None
+
     if raw_handoff_requirements is not None:
         if payload.get("goal_mode") is not True:
             raise ValueError("handoff-governed tasks require goal_mode to be true")
@@ -2706,6 +2728,7 @@ def _rejection_from_checks(
     attempt_id: str,
     operation: str,
     checks: tuple[FailedCheck, ...],
+    not_evaluated_checks: tuple[NotEvaluatedCheck, ...] = (),
 ) -> dict[str, Any]:
     collector = DiagnosticCollector(
         attempt_id=attempt_id,
@@ -2717,6 +2740,8 @@ def _rejection_from_checks(
     )
     for check in checks:
         collector.failure(check)
+    for check in not_evaluated_checks:
+        collector.not_evaluated(check)
     return collector.rejection().as_dict()
 
 
@@ -2827,6 +2852,7 @@ class _CommandContext:
         idempotency_key: str | None = None,
         prepared_manifest: PreparedManifest | None = None,
         prepared_segment_manifest: PreparedSegmentManifest | None = None,
+        prepared_successor_manifest: PreparedManifest | None = None,
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -2840,6 +2866,7 @@ class _CommandContext:
         self.idempotency_key = idempotency_key
         self.prepared_manifest = prepared_manifest
         self.prepared_segment_manifest = prepared_segment_manifest
+        self.prepared_successor_manifest = prepared_successor_manifest
 
 
 class _CommandBoundary:
@@ -2934,6 +2961,8 @@ class _CommandBoundary:
                 "operation": action,
                 "value": result,
             }
+        except CommandRejected as exc:
+            return _rejection_from_checks(attempt_id, action, exc.failed_checks, exc.not_evaluated_checks)
         except Exception:
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
@@ -2941,7 +2970,29 @@ class _CommandBoundary:
         finally:
             conn.close()
 
-    def _execute_mutation(
+    def _execute_mutation(self, action: str, handler: Any, attempt_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        result = self._execute_mutation_transaction(action, handler, attempt_id, fields)
+
+        if (
+            result.get('result') == 'ACCEPTED'
+            and action == 'kanban_update_initiative'
+            and result.get('value', {}).get('update_kind') == 'purge_replace_task'
+            and result.get('value', {}).get('cleanup_required') is True
+        ):
+            try:
+                with contextlib.closing(sqlite3.connect(self._database_path)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    replacement_id = result['value']['replacement_id']
+                    cleanup_result = execute_cleanup(conn, replacement_id)
+                    result['post_commit'] = cleanup_result
+            except Exception as e:
+                err_msg = str(e)[:1024]
+                result['post_commit'] = {'state': 'failed', 'items': [], 'error': str(e)[:1024], 'remediation': 'Replay the original approved request.'}
+
+        return result
+
+    def _execute_mutation_transaction(
         self,
         action: str,
         handler: Any,
@@ -3048,6 +3099,38 @@ class _CommandBoundary:
                 )
                 if type(prepared_manifest) is not PreparedManifest:
                     raise ValueError("task_input_preparer must return PreparedManifest")
+
+            prepared_successor_manifest = None
+            if (
+                action == "kanban_update_initiative"
+                and payload.get("update_kind") == "purge_replace_task"
+            ):
+                update = payload.get("update")
+                if not isinstance(update, dict):
+                    raise ValueError("update must be an object")
+                successor_payload = update.get("successor_payload")
+                if not isinstance(successor_payload, dict):
+                    raise ValueError("successor_payload must be an object")
+                if "task_input_manifest_v1" in successor_payload:
+                    if self._task_input_preparer is None:
+                        raise ValueError("task_input_preparer is required")
+                    preparation_context = TaskInputPreparationContext(
+                        session_id=session_id.strip(),
+                        execution_context=execution_context.strip(),
+                        workspace_id=(
+                            workspace_id.strip() if workspace_id is not None else None
+                        ),
+                        actor_profile=(
+                            actor_profile.strip() if actor_profile is not None else None
+                        ),
+                    )
+                    prepared_successor_manifest = self._task_input_preparer(
+                        successor_payload, preparation_context
+                    )
+                    if type(prepared_successor_manifest) is not PreparedManifest:
+                        raise ValueError(
+                            "task_input_preparer must return PreparedManifest"
+                        )
 
             prepared_segment_manifest = None
             if (
@@ -3163,6 +3246,7 @@ class _CommandBoundary:
                     idempotency_key=idempotency_key,
                     prepared_manifest=prepared_manifest,
                     prepared_segment_manifest=prepared_segment_manifest,
+                    prepared_successor_manifest=prepared_successor_manifest,
                 )
                 try:
                     result = handler(context)
@@ -3203,6 +3287,8 @@ class _CommandBoundary:
                 return _rejection_from_checks(
                     attempt_id, action, audited_rejection.failed_checks
                 )
+        except CommandRejected as exc:
+            return _rejection_from_checks(attempt_id, action, exc.failed_checks, exc.not_evaluated_checks)
         except _ConflictError:
             return self._rejection_internal(attempt_id, action, _IDEMPOTENCY_CONFLICT)
         except _StaleDerivedStateError:

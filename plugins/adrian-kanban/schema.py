@@ -438,6 +438,63 @@ CREATE TABLE IF NOT EXISTS task_reviewer_verdicts (
 """
 
 
+SCHEMA_SQL += """
+CREATE TABLE IF NOT EXISTS task_purge_replacements (
+    replacement_id TEXT PRIMARY KEY,
+    initiative_card_id INTEGER NOT NULL,
+    initiative_id TEXT NOT NULL,
+    board_slug TEXT NOT NULL,
+    predecessor_task_card_id INTEGER NOT NULL,
+    predecessor_task_id TEXT NOT NULL UNIQUE,
+    successor_task_card_id INTEGER NOT NULL,
+    successor_task_id TEXT NOT NULL UNIQUE,
+    eligibility_classification TEXT NOT NULL,
+    eligibility_evidence TEXT NOT NULL,
+    authorization_approval_id TEXT NOT NULL,
+    requester_evidence TEXT NOT NULL,
+    repository_disposition_reference TEXT NOT NULL,
+    repository_disposition_action TEXT NOT NULL CHECK (repository_disposition_action IN ('retain', 'cleanup_after_commit')),
+    repository_disposition_preservation_ref TEXT NOT NULL,
+    transferred_relations TEXT NOT NULL,
+    cleanup_required INTEGER NOT NULL CHECK (cleanup_required IN (0, 1)),
+    predecessor_workspace_snapshot TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (initiative_card_id, initiative_id)
+        REFERENCES adrian_kanban_cards (id, initiative_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_purge_replacements_initiative
+    ON task_purge_replacements (initiative_card_id, initiative_id);
+"""
+
+
+SCHEMA_SQL += """
+CREATE TABLE IF NOT EXISTS task_purge_cleanup_items (
+    replacement_id TEXT NOT NULL,
+    source_path    TEXT NOT NULL,
+    destination_path TEXT NOT NULL,
+    kind           TEXT NOT NULL CHECK (kind IN ('scratch','worktree','attachment')),
+    expected_inventory TEXT NOT NULL,
+    board          TEXT NOT NULL,
+    predecessor_task_id TEXT NOT NULL,
+    PRIMARY KEY (replacement_id, source_path),
+    FOREIGN KEY (replacement_id) REFERENCES task_purge_replacements(replacement_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_purge_cleanup_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    replacement_id TEXT NOT NULL,
+    source_path    TEXT NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN ('prepared','verified','failed')),
+    evidence_json  TEXT,
+    error          TEXT,
+    created_at     INTEGER NOT NULL,
+    FOREIGN KEY (replacement_id, source_path)
+        REFERENCES task_purge_cleanup_items(replacement_id, source_path)
+);
+"""
+
+
 def create_schema(conn: object) -> None:
     """Apply the foundational schema (idempotent)."""
     conn.executescript(SCHEMA_SQL)
