@@ -24,6 +24,7 @@ from .segment_manifest import PreparedSegmentManifest
 from .phase_result_scope import validate_phase_result_scope
 from .phase_admission import admit_phase_result
 from .segment_projection import admit_segment_projection, persist_segment_projection
+from .transition_evidence import validate_transition_evidence
 
 INITIATIVE_PHASES = frozenset(
     {
@@ -696,6 +697,18 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
                 segment_id,
                 result,
             )
+        source_transition_id = None
+        if result_kind == "phase_close":
+            latest_row = context.connection.execute(
+                "SELECT transition_id FROM initiative_transitions "
+                "WHERE initiative_id = ? ORDER BY transition_id DESC LIMIT 1",
+                (initiative_id,),
+            ).fetchone()
+            if latest_row is None:
+                raise ValueError("no initiative transition found")
+            source_transition_id = latest_row["transition_id"]
+            if not (type(source_transition_id) is int and source_transition_id > 0):
+                raise ValueError("latest transition ID must be a positive integer")
         _consume_approval(
             context.connection,
             context,
@@ -715,11 +728,14 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
         accepted_checkpoint_refs_json = json.dumps(
             accepted_checkpoint_refs, sort_keys=True, separators=(",", ":")
         )
+        actor_evidence_fields = {
+            "session_id": context.binding.session_id,
+            "actor_profile": context.binding.actor_profile,
+        }
+        if source_transition_id is not None:
+            actor_evidence_fields["source_transition_id"] = source_transition_id
         actor_evidence = json.dumps(
-            {
-                "session_id": context.binding.session_id,
-                "actor_profile": context.binding.actor_profile,
-            },
+            actor_evidence_fields,
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -1079,8 +1095,8 @@ def _validate_transition_payload(payload: dict) -> dict:
             ),
         )
 
-    allowed = frozenset({"initiative_id", "to_phase", "to_segment_id", "reconciliation_ref", "approval_id", "board"})
-    required = ("initiative_id", "to_phase", "reconciliation_ref", "approval_id", "board")
+    allowed = frozenset({"initiative_id", "to_phase", "to_segment_id", "reconciliation_ref", "phase_close_ref", "approval_id", "board"})
+    required = ("initiative_id", "to_phase", "reconciliation_ref", "phase_close_ref", "approval_id", "board")
     failed: list[FailedCheck] = []
     not_evaluated: list[NotEvaluatedCheck] = []
 
@@ -1103,7 +1119,7 @@ def _validate_transition_payload(payload: dict) -> dict:
         add(
             "TRANSITION_UNKNOWN_FIELDS",
             "payload",
-            "initiative_id, to_phase, to_segment_id, reconciliation_ref, approval_id, board",
+            "initiative_id, to_phase, to_segment_id, reconciliation_ref, phase_close_ref, approval_id, board",
             f"{len(unknown)} unrecognized fields",
             "remove unsupported fields or use initiative update for details",
         )
@@ -1210,6 +1226,7 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
     to_phase = normalized["to_phase"]
     to_segment_id = normalized.get("to_segment_id")
     reconciliation_ref = normalized["reconciliation_ref"]
+    phase_close_ref = normalized["phase_close_ref"]
     approval_id = payload["approval_id"]
     board = normalized["board"]
 
@@ -1258,6 +1275,42 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
             card_id,
             to_segment_id,
         )
+    try:
+        validate_transition_evidence(
+            context.connection,
+            initiative_card_id=card_id,
+            initiative_id=initiative_id,
+            from_phase=from_phase,
+            from_segment_id=from_segment_id,
+            to_phase=to_phase,
+            to_segment_id=to_segment_id,
+            previous_transition_id=predecessor_id,
+            phase_close_ref=phase_close_ref,
+        )
+    except ValueError as exc:
+        raise CommandRejected(
+            failed_checks=(
+                FailedCheck(
+                    code="TRANSITION_EVIDENCE_REJECTED",
+                    target="phase_close_ref",
+                    expected=(
+                        f"an accepted phase_close for the current position "
+                        f"{from_phase} matching the requested route to {to_phase}"
+                    ),
+                    observed=str(exc),
+                    accepted_format=(
+                        "accepted phase_close result authorizing this exact transition"
+                    ),
+                    remediation=(
+                        "read the initiative, complete the missing review or evidence, "
+                        "then resubmit; or request the separate Adrian gate-override "
+                        "flow for intentionally unmet criteria"
+                    ),
+                    responsible_actor="orchestrator",
+                    retry="same_operation",
+                ),
+            ),
+        ) from None
     _consume_approval(
         context.connection,
         context,
@@ -1283,6 +1336,7 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
             "from_segment_id": from_segment_id,
             "to_phase": to_phase,
             "to_segment_id": to_segment_id,
+            "phase_close_ref": phase_close_ref,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1302,7 +1356,7 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
             from_segment_id,
             to_phase,
             to_segment_id,
-            "reconciliation",
+            "model_assessment",
             actor_evidence,
             canonical_payload,
             reconciliation_ref,

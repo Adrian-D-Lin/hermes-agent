@@ -759,6 +759,15 @@ TOOL_SCHEMAS: dict[str, Any] = {
                     "type": "string",
                     "description": ("Reconciliation reference backing the transition."),
                 },
+                "phase_close_ref": {
+                    "type": "string",
+                    "description": (
+                        "Reference to the accepted phase_close result that admits this "
+                        "ordinary transition. This is ordinary transition evidence, not "
+                        "an override; an intentionally unmet gate must use the separate "
+                        "Adrian gate-override flow instead."
+                    ),
+                },
                 "approval_id": {
                     "type": "string",
                     "description": "Approval reference authorizing the transition.",
@@ -780,6 +789,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 "initiative_id",
                 "to_phase",
                 "reconciliation_ref",
+                "phase_close_ref",
                 "approval_id",
                 "idempotency_key",
             ],
