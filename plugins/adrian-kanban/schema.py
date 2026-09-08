@@ -448,6 +448,25 @@ CREATE TABLE IF NOT EXISTS task_reviewer_verdicts (
         REFERENCES task_candidate_handoffs (task_card_id, candidate_id),
     FOREIGN KEY (review_run_id) REFERENCES task_runs (id)
 );
+
+-- Immutable gate-override proposal metadata. One row per prepared override
+-- proposal, keyed by the host-owned durable human interaction (the initial
+-- event/message). The proposal is immutable metadata only: the Write-Gate
+-- owns prepared/approved/cancelled/consumed states via its own table, and no
+-- plugin approval-state column or independent approval registry exists here.
+-- A reused initial event cannot back a second proposal even under different
+-- request/approval/idempotency keys.
+CREATE TABLE IF NOT EXISTS gate_override_proposals (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    approval_id TEXT NOT NULL UNIQUE,
+    initial_event_id TEXT NOT NULL UNIQUE,
+    initial_session_id TEXT NOT NULL,
+    initial_message_id TEXT NOT NULL,
+    canonical_payload TEXT NOT NULL,
+    canonical_digest TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
 """
 
 
