@@ -567,6 +567,128 @@ def test_prescriptive_dependency_chain_is_order_independent(commands_module):
     assert exc.not_evaluated_checks == chain
 
 
+@pytest.mark.parametrize("operation", ["kanban_comment", "kanban_show", "secret-unknown-operation"])
+def test_rejected_attempt_audit_is_safe_and_each_retry_is_retained(
+    commands_module, tmp_path, monkeypatch, operation
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(tmp_path, monkeypatch, modules["provider"])
+    diagnostics, failed, pending = _prescriptive_checks(commands_module)
+
+    def rejected(context):
+        if operation == "kanban_comment":
+            context.connection.execute(
+                "INSERT INTO boundary_probe (value, audit) VALUES ('discard', 'secret-payload')"
+            )
+        raise diagnostics.CommandRejected(failed_checks=failed, not_evaluated_checks=pending)
+
+    handlers = {operation: rejected} if operation in commands_module.RECOGNIZED_OPERATIONS else {}
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path), provider=provider, handlers=handlers,
+    )
+    fields = dict(
+        attempt_id="audit-attempt", idempotency_key="secret-idempotency",
+        target="task-1", expected_version=0, session_id="session-1",
+        execution_context="model-tool", payload={"body": "secret-payload"},
+    )
+    first = boundary.submit(operation, **fields)
+    assert first["result"] == "REJECTED"
+    assert boundary.submit(operation, **fields) == first
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM adrian_kanban_rejection_audit ORDER BY event_id").fetchall()
+        assert len(rows) == 2
+        assert rows[0]["event_id"] != rows[1]["event_id"]
+        assert {row["attempt_id"] for row in rows} == {"audit-attempt"}
+        for row in rows:
+            checks = json.loads(row["failed_checks_json"])
+            assert all(set(c) == {"code", "target"} for c in checks)
+            assert all(set(c) == {"code", "requires"} for c in json.loads(row["not_evaluated_checks_json"]))
+            assert row["created_at"] > 0
+        serialized = json.dumps([dict(row) for row in rows])
+        for secret in ("secret-payload", "secret-idempotency", "secret-unknown-operation"):
+            assert secret not in serialized
+        assert conn.execute("SELECT COUNT(*) FROM boundary_probe").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM adrian_kanban_command_receipts").fetchone()[0] == 0
+
+
+def test_audit_failure_preserves_rejection_and_reports_operator_remediation(
+    commands_module, tmp_path, monkeypatch
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(tmp_path, monkeypatch, modules["provider"])
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            "CREATE TRIGGER reject_audit BEFORE INSERT ON adrian_kanban_rejection_audit "
+            "BEGIN SELECT RAISE(ABORT, 'secret-storage-details'); END"
+        )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path), provider=provider, handlers={},
+    )
+    result = boundary.submit("kanban_comment", attempt_id="audit-failed")
+    assert result["result"] == "REJECTED"
+    assert result["state_changed"] is False
+    assert [c["code"] for c in result["failed_checks"]] == [
+        "OPERATION_NOT_IMPLEMENTED", "REJECTION_AUDIT_UNAVAILABLE"
+    ]
+    assert result["failed_checks"][-1]["responsible_actor"] == "system_operator"
+    assert "secret-storage-details" not in json.dumps(result)
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM adrian_kanban_rejection_audit").fetchone()[0] == 0
+
+
+def test_accepted_response_never_opens_rejection_audit_database(commands_module, tmp_path):
+    audit = importlib.import_module(f"{commands_module.__package__}.rejection_audit")
+    absent = tmp_path / "absent.sqlite3"
+    response = {"result": "ACCEPTED", "state_changed": True, "value": {"id": "a"}}
+    assert audit.record_rejection(
+        str(absent), response, recognized_operations=commands_module.RECOGNIZED_OPERATIONS
+    ) is response
+    assert not absent.exists()
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_rejection_audit_never_creates_database_or_schema(commands_module, tmp_path, exists):
+    audit = importlib.import_module(f"{commands_module.__package__}.rejection_audit")
+    path = tmp_path / "uninitialized.sqlite3"
+    if exists:
+        sqlite3.connect(path).close()
+    response = commands_module._rejection("attempt", "kanban_comment", "FIELD_INVALID")
+    result = audit.record_rejection(
+        str(path), response, recognized_operations=commands_module.RECOGNIZED_OPERATIONS
+    )
+    assert result["result"] == "REJECTED"
+    assert result["failed_checks"][-1]["code"] == "REJECTION_AUDIT_UNAVAILABLE"
+    assert response["failed_checks"][-1]["code"] == "FIELD_INVALID"
+    assert path.exists() is exists
+    if exists:
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
+
+
+def test_public_normalization_failure_is_audited_once_without_handler(
+    commands_module, tmp_path, monkeypatch
+):
+    modules = _runtime_modules(commands_module)
+    database_path, provider = _plugin_database(tmp_path, monkeypatch, modules["provider"])
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path), provider=provider, handlers={},
+    )
+    normalizer = commands_module._ModelToolRequestNormalizer(boundary)
+    result = normalizer.submit(
+        "kanban_comment", {"unknown-secret-field": "secret-value"}, {}
+    )
+    assert result["result"] == "REJECTED"
+    assert result["failed_checks"][0]["code"] == "PUBLIC_REQUEST_NORMALIZATION_FAILED"
+    with sqlite3.connect(database_path) as conn:
+        rows = conn.execute("SELECT failed_checks_json FROM adrian_kanban_rejection_audit").fetchall()
+        assert len(rows) == 1
+        assert json.loads(rows[0][0]) == [{
+            "code": "PUBLIC_REQUEST_NORMALIZATION_FAILED", "target": "kanban_comment"
+        }]
+        assert "secret" not in rows[0][0]
+
+
 def test_mutation_failure_rolls_back_and_returns_canonical_rejection(
     commands_module,
     tmp_path,
