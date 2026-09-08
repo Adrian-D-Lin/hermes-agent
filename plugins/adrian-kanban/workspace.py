@@ -42,6 +42,13 @@ def _validate_sha(value, name):
     return value
 
 
+def _validate_sha_or_none(value, name):
+    if value is None:
+        return None
+    _validate_sha(value, name)
+    return value
+
+
 def _validate_bool(value, name):
     if not isinstance(value, bool):
         raise _WorkspaceRejected(f"{name} must be bool")
@@ -69,7 +76,7 @@ class _WorkspaceMember:
     relative_path: str
     target_path: str
     branch: str
-    required_base_sha: str
+    required_base_sha: Optional[str]
     observed_head: Optional[str]
     member_state: str
 
@@ -81,10 +88,23 @@ class _WorkspaceMember:
         _validate_nonblank_str(self.relative_path, "relative_path")
         _validate_absolute_str(self.target_path, "target_path")
         _validate_nonblank_str(self.branch, "branch")
-        _validate_sha(self.required_base_sha, "required_base_sha")
-        if self.observed_head is not None:
-            _validate_sha(self.observed_head, "observed_head")
+        _validate_sha_or_none(self.required_base_sha, "required_base_sha")
+        _validate_sha_or_none(self.observed_head, "observed_head")
         _validate_nonblank_str(self.member_state, "member_state")
+        if self.member_state not in ("planned", "materialized", "merged", "retired"):
+            raise _WorkspaceRejected("invalid member_state")
+        if self.member_state == "planned":
+            if self.observed_head is not None:
+                raise _WorkspaceRejected("planned member must have NULL observed_head")
+        else:
+            if self.required_base_sha is None:
+                raise _WorkspaceRejected(
+                    f"{self.member_state} member requires non-null base"
+                )
+            if self.observed_head is None:
+                raise _WorkspaceRejected(
+                    f"{self.member_state} member requires non-null observed_head"
+                )
 
 
 @dataclass(frozen=True)
@@ -166,6 +186,30 @@ class _SegmentWorkspaceController:
         self._conn = conn
         self._registry = registry
 
+    @staticmethod
+    def _resolve_origin_main(repository_root: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "refs/remotes/origin/main"],
+                cwd=repository_root,
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise _WorkspaceRejected(f"git command failed: {exc}") from exc
+        if result.returncode != 0:
+            raise _WorkspaceRejected(
+                f"git rev-parse failed: {result.stderr.strip()}"
+            )
+        sha = result.stdout.strip()
+        _validate_sha(sha, "origin/main")
+        return sha
+
     def load(self, *, workspace_id: str, expected_initiative_id: str, expected_segment_id: str, expected_controller_binding: str) -> _WorkspacePlan:
         _validate_nonblank_str(workspace_id, "workspace_id")
         _validate_nonblank_str(expected_initiative_id, "expected_initiative_id")
@@ -206,9 +250,8 @@ class _SegmentWorkspaceController:
             _validate_nonblank_str(repository_identity, "repository_identity")
             _validate_nonblank_str(relative_path, "relative_path")
             _validate_nonblank_str(branch, "branch")
-            _validate_sha(required_base_sha, "required_base_sha")
-            if observed_head is not None:
-                _validate_sha(observed_head, "observed_head")
+            _validate_sha_or_none(required_base_sha, "required_base_sha")
+            _validate_sha_or_none(observed_head, "observed_head")
             _validate_nonblank_str(member_state, "member_state")
 
             reg = self._registry.lookup(repository_identity)
@@ -249,6 +292,71 @@ class _SegmentWorkspaceController:
             controller_binding_ref=controller_binding_ref,
             members=tuple(members),
         )
+
+    def pin_planned_member_base(
+        self,
+        workspace_id: str,
+        repository_identity: str,
+        *,
+        pinned_at: int,
+    ) -> str:
+        _validate_nonblank_str(workspace_id, "workspace_id")
+        _validate_nonblank_str(repository_identity, "repository_identity")
+        if type(pinned_at) is not int or pinned_at <= 0:
+            raise _WorkspaceRejected("pinned_at must be positive exact int")
+
+        registration = self._registry.lookup(repository_identity)
+        trusted_sha = self._resolve_origin_main(registration.repository_root)
+
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            workspace = self._conn.execute(
+                "SELECT active FROM segment_workspaces WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+            if workspace is None or workspace[0] != 1:
+                raise _WorkspaceRejected("workspace not found or inactive")
+            row = self._conn.execute(
+                "SELECT required_base_sha, observed_head, member_state "
+                "FROM segment_workspace_members WHERE workspace_id = ? "
+                "AND repository_identity = ?",
+                (workspace_id, repository_identity),
+            ).fetchone()
+            if row is None:
+                raise _WorkspaceRejected("member not found")
+            base, head, state = row
+            if state != "planned":
+                raise _WorkspaceRejected("member not planned")
+            if head is not None:
+                raise _WorkspaceRejected("member observed_head not null")
+            if base is not None:
+                _validate_sha(base, "required_base_sha")
+                if base == trusted_sha:
+                    self._conn.commit()
+                    return trusted_sha
+                raise _WorkspaceRejected("base mismatch")
+            cursor = self._conn.execute(
+                "UPDATE segment_workspace_members SET required_base_sha = ?, "
+                "observed_at = ? WHERE workspace_id = ? AND "
+                "repository_identity = ? AND member_state = 'planned' AND "
+                "required_base_sha IS NULL AND observed_head IS NULL",
+                (trusted_sha, pinned_at, workspace_id, repository_identity),
+            )
+            if cursor.rowcount != 1:
+                raise _WorkspaceRejected("update failed")
+            self._conn.commit()
+            return trusted_sha
+        except BaseException as exc:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            if isinstance(exc, _WorkspaceRejected):
+                raise
+            raise _WorkspaceRejected(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -329,6 +437,8 @@ class _GitWorkspaceExecutor:
         return resolved
 
     def verify(self, member: _WorkspaceMember) -> _MemberVerification:
+        if member.required_base_sha is None:
+            raise _WorkspaceRejected("required_base_sha is null")
         failures = []
         observed_head = None
         branch_matches = False
@@ -434,6 +544,9 @@ class _GitWorkspaceExecutor:
         branch = member.branch
         required_base_sha = member.required_base_sha
 
+        if required_base_sha is None:
+            raise _WorkspaceRejected("required_base_sha is null")
+
         stdout = self._git(repository_root, "rev-parse", "origin/main", allowed_returncodes=(0,))
         if stdout != required_base_sha:
             raise _WorkspaceRejected(f"origin/main does not match required base sha")
@@ -504,6 +617,8 @@ class _GitWorkspaceExecutor:
     def verify_merge(self, member, *, expected_main_sha, expected_source_head):
         if not isinstance(member, _WorkspaceMember):
             raise _WorkspaceRejected("invalid member type")
+        if member.required_base_sha is None:
+            raise _WorkspaceRejected("required_base_sha is null")
         _validate_sha(expected_main_sha, "expected_main_sha")
         _validate_sha(expected_source_head, "expected_source_head")
 
@@ -712,6 +827,8 @@ class _JournaledWorkspaceOperations:
             raise _WorkspaceRejected("intent workspace_id mismatch")
         if intent.repository_identity != member.repository_identity:
             raise _WorkspaceRejected("intent repository_identity mismatch")
+        if member.required_base_sha is None:
+            raise _WorkspaceRejected("required_base_sha is null")
         expected_git = f"base={member.required_base_sha};branch={member.branch}"
         if intent.intended_git_evidence != expected_git:
             raise _WorkspaceRejected("intent intended_git_evidence mismatch")
@@ -788,6 +905,9 @@ class _JournaledWorkspaceOperations:
 
         # Map plan members by identity for verification
         plan_member_map = {m.repository_identity: m for m in plan.members}
+        for plan_member in plan.members:
+            if plan_member.required_base_sha is None:
+                raise _WorkspaceRejected("required_base_sha is null")
 
         # Idempotent path
         if ws[1] == "retired" and ws[2] == 0:

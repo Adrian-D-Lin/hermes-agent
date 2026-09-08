@@ -19,6 +19,8 @@ from writegate.kanban_approvals import (
 )
 
 from .initiative_checkpoints import admit_orchestration_checkpoint
+from .segment_manifest import PreparedSegmentManifest
+from .segment_projection import admit_segment_projection, persist_segment_projection
 
 INITIATIVE_PHASES = frozenset(
     {
@@ -291,6 +293,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
     if update_kind not in {
         "body_update",
         "phase_result",
+        "segment_manifest_projection",
         "orchestration_checkpoint",
     }:
         raise ValueError("unsupported update_kind")
@@ -308,6 +311,73 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
     expected_version = context.binding.expected_version
     if current_version != expected_version:
         raise ValueError("stale initiative version")
+
+    if update_kind == "segment_manifest_projection":
+        if set(update.keys()) != {
+            "result_id",
+            "projection_id",
+            "manifest_path",
+            "manifest_sha",
+        }:
+            raise ValueError(
+                "segment_manifest_projection update must contain exact fields"
+            )
+        prepared = context.prepared_segment_manifest
+        if type(prepared) is not PreparedSegmentManifest:
+            raise ValueError(
+                "prepared_segment_manifest must be a PreparedSegmentManifest"
+            )
+        if prepared.result_id != update["result_id"]:
+            raise ValueError("result_id mismatch")
+        if prepared.projection_id != update["projection_id"]:
+            raise ValueError("projection_id mismatch")
+        if prepared.manifest_path != update["manifest_path"]:
+            raise ValueError("manifest_path mismatch")
+        if prepared.manifest_sha != update["manifest_sha"]:
+            raise ValueError("manifest_sha mismatch")
+        if prepared.initiative_id != initiative_id:
+            raise ValueError("initiative_id mismatch")
+        admission = admit_segment_projection(
+            context.connection,
+            initiative_card_id=card_id,
+            initiative_id=initiative_id,
+            board=board,
+            actor_profile=context.binding.actor_profile,
+            prepared=prepared,
+        )
+        _consume_approval(
+            context.connection,
+            context,
+            approval_id,
+            "kanban_update_initiative",
+            expected_version,
+            payload,
+            initiative_id,
+            None,
+        )
+        actor_evidence = {
+            "session_id": context.binding.session_id,
+            "actor_profile": context.binding.actor_profile,
+        }
+        now = int(time.time())
+        persist_segment_projection(
+            context.connection,
+            admission,
+            actor_evidence=actor_evidence,
+            idempotency_key=context.idempotency_key,
+            created_at=now,
+        )
+        record_version = _advance_initiative_version(
+            context.connection, context, initiative_id, expected_version
+        )
+        return {
+            "initiative_id": initiative_id,
+            "update_kind": update_kind,
+            "record_version": record_version,
+            "result_id": admission.result_id,
+            "projection_id": admission.projection_id,
+            "projection_version": admission.projection_version,
+        }
 
     if update_kind == "orchestration_checkpoint":
         admission = admit_orchestration_checkpoint(
