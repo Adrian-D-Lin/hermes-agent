@@ -276,3 +276,75 @@ def test_writegate_insert_failure_rolls_back_the_new_proposal(proposal_case):
         dict(conn.execute("SELECT * FROM write_gate_kanban_approvals").fetchone())
         == before
     )
+
+
+def test_closed_initiative_prepares_one_explicit_reopen_and_move(proposal_case):
+    conn, proposals = proposal_case
+    conn.execute("UPDATE adrian_kanban_cards SET closed_at=1009")
+    args = arguments()
+    args["proposal"]["source"]["closed_at"] = 1009
+    args["proposal"]["destination"]["closed_at"] = None
+    result = record(conn, proposals, args)
+    saved = json.loads(result["canonical_payload"])["proposal"]
+    assert saved["source"]["closed_at"] == 1009
+    assert saved["destination"] == {"phase": "D3", "segment_id": None, "closed_at": None}
+    assert conn.execute("SELECT closed_at FROM adrian_kanban_cards").fetchone()[0] == 1009
+    assert conn.execute("SELECT COUNT(*) FROM initiative_transitions").fetchone()[0] == 0
+    approvals = conn.execute("SELECT state, canonical_digest FROM write_gate_kanban_approvals").fetchall()
+    assert len(approvals) == 1
+    assert tuple(approvals[0]) == ("prepared", result["canonical_digest"])
+
+
+@pytest.mark.parametrize("case", ["missing_source", "missing_destination", "stale", "false", "string", "close", "source_shape", "destination_shape"])
+def test_inexact_reopening_cannot_prepare_approval(proposal_case, case):
+    conn, proposals = proposal_case
+    conn.execute("UPDATE adrian_kanban_cards SET closed_at=1009")
+    args = arguments()
+    source, destination = args["proposal"]["source"], args["proposal"]["destination"]
+    source["closed_at"] = 1009
+    destination["closed_at"] = None
+    if case == "missing_source":
+        del source["closed_at"]
+    elif case == "missing_destination":
+        del destination["closed_at"]
+    elif case == "stale":
+        source["closed_at"] = 1008
+    elif case == "false":
+        source["closed_at"] = False
+    elif case == "string":
+        source["closed_at"] = "1009"
+    elif case == "close":
+        destination["closed_at"] = 1010
+    elif case == "source_shape":
+        args["proposal"]["source"] = []
+    else:
+        args["proposal"]["destination"] = None
+    with pytest.raises(ValueError):
+        record(conn, proposals, args)
+    assert conn.execute("SELECT COUNT(*) FROM gate_override_proposals").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM write_gate_kanban_approvals").fetchone()[0] == 0
+    assert conn.execute("SELECT closed_at FROM adrian_kanban_cards").fetchone()[0] == 1009
+
+
+@pytest.mark.parametrize("field", ["source", "destination"])
+def test_open_initiative_cannot_claim_or_propose_closure(proposal_case, field):
+    conn, proposals = proposal_case
+    args = arguments()
+    args["proposal"][field]["closed_at"] = 1009
+    with pytest.raises(ValueError):
+        record(conn, proposals, args)
+    assert conn.execute("SELECT COUNT(*) FROM gate_override_proposals").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("field", ["source", "destination"])
+def test_task_override_cannot_carry_a_closure_change(proposal_case, field):
+    conn, proposals = proposal_case
+    conn.execute("""INSERT INTO adrian_kanban_cards
+        (card_type,initiative_id,task_id,title,created_at,board_slug)
+        VALUES ('task','initiative-1','task-1','Task',1000,'orchestrator')""")
+    args = arguments()
+    args["proposal"].update(operation="kanban_execute_task_gate_override", target_kind="task", target="task-1", source={"status": "review"}, destination={"status": "done"})
+    args["proposal"][field]["closed_at"] = 1009
+    with pytest.raises(ValueError):
+        record(conn, proposals, args)
+    assert conn.execute("SELECT COUNT(*) FROM write_gate_kanban_approvals").fetchone()[0] == 0
