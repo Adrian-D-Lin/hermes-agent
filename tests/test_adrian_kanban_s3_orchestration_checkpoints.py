@@ -177,6 +177,57 @@ def _seed_accepted_handoff(
             ),
         )
         conn.commit()
+    if step in {"D4.1", "D4.2"}:
+        prefix = "s3_adrian_kanban_checkpoints"
+        lifecycle = importlib.import_module(f"{prefix}.lifecycle")
+        contracts = importlib.import_module(f"{prefix}.contracts")
+        skills = importlib.import_module(f"{prefix}.skill_bundle")
+        with sqlite3.connect(database_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                "DELETE FROM task_lifecycle_contracts WHERE task_id=?", (task_id,)
+            )
+            lifecycle.LifecycleContractRepository(conn).attach(
+                task_id=task_id,
+                snapshot=contracts.expand_contract(
+                    step=step,
+                    initiative_id="initiative-1",
+                    baseline_refs=("Canon/design.md",),
+                    prior_record_refs=("candidate:D4.1",),
+                    predecessor_ref="candidate:D4.1" if step == "D4.2" else None,
+                ),
+                skill=skills.resolve_skill_binding("D4"),
+                created_at=1,
+            )
+            metadata = (
+                {"edit_set": _d4_checkpoint_edits()}
+                if step == "D4.1"
+                else {
+                    "edit_findings": [
+                        {
+                            "edit_ref": "candidate:D4.1#/edit_set/0",
+                            "consistency": "consistent",
+                            "collateral_changes": [],
+                        }
+                    ],
+                    "conclusion": "verified",
+                    "item_count": 1,
+                }
+            )
+            conn.execute(
+                "UPDATE task_candidate_handoffs SET metadata_json=? WHERE candidate_id=?",
+                (json.dumps(metadata), candidate_id),
+            )
+
+
+def _d4_checkpoint_edits():
+    return [
+        {
+            "document_ref": "Canon/design.md",
+            "current_state_ref": "Canon/design.md@" + "b" * 40,
+            "edit": "exact approved change",
+        }
+    ]
 
 
 def _d2_evidence_fixture(
@@ -246,6 +297,242 @@ def _d2_evidence_fixture(
             (json.dumps(metadata),),
         )
     return database_path, card_id, draft
+
+
+def _d4_evidence_fixture(commands_module, tmp_path, monkeypatch, step):
+    database_path, _ = _database(tmp_path, monkeypatch, commands_module)
+    card_id = _seed_initiative(database_path, "D4")
+    _seed_accepted_handoff(
+        database_path, card_id, step=step, candidate_id="d4-candidate", sequence=1
+    )
+    prefix = commands_module.__package__
+    lifecycle = importlib.import_module(f"{prefix}.lifecycle")
+    contracts = importlib.import_module(f"{prefix}.contracts")
+    skills = importlib.import_module(f"{prefix}.skill_bundle")
+    metadata = {
+        "D4.1": {
+            "edit_set": [
+                {
+                    "document_ref": "Canon/policy.md",
+                    "current_state_ref": "Canon/policy.md@" + "a" * 40,
+                    "edit": "exact change",
+                }
+            ]
+            * 2
+        },
+        "D4.2": {
+            "edit_findings": [
+                {
+                    "edit_ref": "author#/edit_set/0",
+                    "consistency": "consistent",
+                    "collateral_changes": [],
+                }
+            ]
+            * 2,
+            "conclusion": "verified",
+            "item_count": 2,
+        },
+        "D4.5": {
+            "document_verifications": [
+                {"path": "Canon/policy.md", "sha": "a" * 40, "result": "matches"}
+            ],
+            "source_item_count": 4,
+            "determination_count": 4,
+            "development_baseline_ref": "Canon/policy.md",
+        },
+    }[step]
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "DELETE FROM task_lifecycle_contracts WHERE task_id=?", (f"task:{step}",)
+        )
+        lifecycle.LifecycleContractRepository(conn).attach(
+            task_id=f"task:{step}",
+            snapshot=contracts.expand_contract(
+                step=step,
+                initiative_id="initiative-1",
+                baseline_refs=("Canon/policy.md",),
+                prior_record_refs=("prior-accepted-record",),
+                predecessor_ref=None if step == "D4.1" else "prior-accepted-record",
+            ),
+            skill=skills.resolve_skill_binding("D4"),
+            created_at=1,
+        )
+        conn.execute(
+            "UPDATE task_candidate_handoffs SET metadata_json=?",
+            (json.dumps(metadata),),
+        )
+    module = importlib.import_module(f"{prefix}.phase_d4_evidence")
+    return database_path, card_id, module, metadata
+
+
+@pytest.mark.parametrize("step", ["D4.1", "D4.2", "D4.5"])
+def test_d4_inventory_preserves_distinct_equal_rows_and_reads_only(
+    commands_module, tmp_path, monkeypatch, step
+):
+    database_path, card_id, module, metadata = _d4_evidence_fixture(
+        commands_module, tmp_path, monkeypatch, step
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        before = conn.total_changes
+        evidence = module.load_d4_evidence(
+            conn, card_id, "initiative-1", "d4-candidate", step
+        )
+        assert evidence.metadata == metadata
+        assert evidence.step == step
+        field = "edit_set" if step == "D4.1" else "edit_findings"
+        assert evidence.item_refs == (
+            ()
+            if step == "D4.5"
+            else tuple(f"d4-candidate#/{field}/{i}" for i in range(2))
+        )
+        assert conn.total_changes == before
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        "wrong_step",
+        "wrong_initiative",
+        "unaccepted",
+        "bad_metadata",
+        "false_count",
+        "wrong_profile",
+    ],
+)
+def test_d4_inventory_rejects_unproven_candidate_or_false_count(
+    commands_module, tmp_path, monkeypatch, gap
+):
+    database_path, card_id, module, metadata = _d4_evidence_fixture(
+        commands_module, tmp_path, monkeypatch, "D4.2"
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if gap == "unaccepted":
+            conn.execute("DELETE FROM task_reviewer_verdicts")
+        elif gap == "bad_metadata":
+            conn.execute("UPDATE task_candidate_handoffs SET metadata_json='not-json'")
+        elif gap == "false_count":
+            metadata["item_count"] = 3
+            conn.execute(
+                "UPDATE task_candidate_handoffs SET metadata_json=?",
+                (json.dumps(metadata),),
+            )
+        elif gap == "wrong_profile":
+            conn.execute(
+                "UPDATE task_lifecycle_contracts SET execution_profile='builder-tester'"
+            )
+        with pytest.raises(ValueError):
+            module.load_d4_evidence(
+                conn,
+                card_id,
+                "other" if gap == "wrong_initiative" else "initiative-1",
+                "d4-candidate",
+                "D4.1" if gap == "wrong_step" else "D4.2",
+            )
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        None,
+        "omission",
+        "foreign_edit",
+        "predecessor",
+        "prior_record",
+        "digest",
+        "newline",
+        "none",
+        "list",
+        "integer",
+        "duplicate_review",
+    ],
+)
+def test_d4_source_pair_binds_complete_review_to_exact_approved_edits(
+    commands_module, tmp_path, monkeypatch, gap
+):
+    database_path, card_id, module, author = _d4_evidence_fixture(
+        commands_module, tmp_path, monkeypatch, "D4.1"
+    )
+    _seed_accepted_handoff(
+        database_path, card_id, step="D4.2", candidate_id="verifier", sequence=2
+    )
+    prefix = commands_module.__package__
+    lifecycle = importlib.import_module(f"{prefix}.lifecycle")
+    contracts = importlib.import_module(f"{prefix}.contracts")
+    skills = importlib.import_module(f"{prefix}.skill_bundle")
+    findings = [
+        {
+            "edit_ref": f"d4-candidate#/edit_set/{i}",
+            "consistency": "consistent",
+            "collateral_changes": [],
+        }
+        for i in range(2)
+    ]
+    if gap == "omission":
+        findings.pop()
+    elif gap == "foreign_edit":
+        findings[1]["edit_ref"] = "foreign#/edit_set/1"
+    elif gap == "duplicate_review":
+        findings.append(dict(findings[0]))
+    metadata = {
+        "edit_findings": findings,
+        "conclusion": "verified",
+        "item_count": len(findings),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            author["edit_set"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+    digest = {
+        "digest": "0" * 64,
+        "newline": digest + "\n",
+        "none": None,
+        "list": [],
+        "integer": 123,
+    }.get(gap, digest)
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("DELETE FROM task_lifecycle_contracts WHERE task_id='task:D4.2'")
+        lifecycle.LifecycleContractRepository(conn).attach(
+            task_id="task:D4.2",
+            snapshot=contracts.expand_contract(
+                step="D4.2",
+                initiative_id="initiative-1",
+                baseline_refs=("Canon/policy.md",),
+                prior_record_refs=(
+                    "other" if gap == "prior_record" else "d4-candidate",
+                ),
+                predecessor_ref="other" if gap == "predecessor" else "d4-candidate",
+            ),
+            skill=skills.resolve_skill_binding("D4"),
+            created_at=2,
+        )
+        conn.execute(
+            "UPDATE task_candidate_handoffs SET metadata_json=? WHERE candidate_id='verifier'",
+            (json.dumps(metadata),),
+        )
+        before = conn.total_changes
+        if gap in {None, "duplicate_review"}:
+            source, review = module.validate_d4_source_pair(
+                conn, card_id, "initiative-1", "d4-candidate", "verifier", digest
+            )
+            assert source.metadata == author
+            assert review.metadata == metadata
+            assert len(source.item_refs) == 2
+            assert len(review.item_refs) == len(findings)
+        else:
+            with pytest.raises(ValueError):
+                module.validate_d4_source_pair(
+                    conn, card_id, "initiative-1", "d4-candidate", "verifier", digest
+                )
+        assert conn.total_changes == before
 
 
 def test_d2_inventory_keeps_equal_content_findings_distinct_and_is_read_only(
@@ -879,7 +1166,11 @@ def _checkpoint_payload(step: str, accepted_task_refs: list[str]) -> dict:
     if step == "D4.3":
         result.update({
             "write_gate_approval_ref": "write-gate:change-set:1",
-            "approved_change_set_digest": "a" * 64,
+            "approved_change_set_digest": hashlib.sha256(
+                json.dumps(
+                    _d4_checkpoint_edits(), sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest(),
             "current_document_refs": ["Canon/design.md@" + "b" * 40],
         })
     elif step == "D4.4":
@@ -923,6 +1214,72 @@ def _checkpoint_payload(step: str, accepted_task_refs: list[str]) -> dict:
         "approval_id": f"approval:{step}",
         "board": "orchestrator",
     }
+
+
+@pytest.mark.parametrize(
+    "gap",
+    ["digest", "newline", "docs", "duplicate_docs", "foreign_review", "missing_review"],
+)
+def test_d4_3_rejects_unbound_evidence_without_spending_approval(
+    commands_module, tmp_path, monkeypatch, gap
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    card_id = _seed_initiative(database_path, "D4")
+    for sequence, step in enumerate(("D4.1", "D4.2"), start=1):
+        _seed_accepted_handoff(
+            database_path,
+            card_id,
+            step=step,
+            candidate_id=f"candidate:{step}",
+            sequence=sequence,
+        )
+    payload = _checkpoint_payload("D4.3", ["candidate:D4.1", "candidate:D4.2"])
+    result = payload["update"]["result"]
+    if gap == "digest":
+        result["approved_change_set_digest"] = "0" * 64
+    elif gap == "newline":
+        result["approved_change_set_digest"] += "\n"
+    elif gap == "docs":
+        result["current_document_refs"] = ["Canon/other.md@" + "b" * 40]
+    elif gap == "duplicate_docs":
+        result["current_document_refs"] *= 2
+    else:
+        with sqlite3.connect(database_path) as conn:
+            metadata = json.loads(
+                conn.execute(
+                    "SELECT metadata_json FROM task_candidate_handoffs WHERE candidate_id='candidate:D4.2'"
+                ).fetchone()[0]
+            )
+            if gap == "foreign_review":
+                metadata["edit_findings"][0]["edit_ref"] = "foreign#/edit_set/0"
+            else:
+                metadata["edit_findings"] = []
+                metadata["item_count"] = 0
+            conn.execute(
+                "UPDATE task_candidate_handoffs SET metadata_json=? WHERE candidate_id='candidate:D4.2'",
+                (json.dumps(metadata),),
+            )
+    _approve(database_path, payload)
+    response = _submit(_boundary(commands_module, database_path, provider), payload)
+    assert response["result"] == "REJECTED"
+    with sqlite3.connect(database_path) as conn:
+        assert (
+            conn.execute("SELECT count(*) FROM initiative_phase_results").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT record_version FROM adrian_kanban_cards WHERE id=?", (card_id,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id=?",
+                (payload["approval_id"],),
+            ).fetchone()[0]
+            == "approved"
+        )
 
 
 def test_d4_3_checkpoint_pins_exact_accepted_predecessors_and_replays(
