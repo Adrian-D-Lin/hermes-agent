@@ -424,6 +424,196 @@ def _d2_close_fixture(commands_module, tmp_path, monkeypatch):
     return database_path, card_id, module, update
 
 
+def _d3_close_fixture(commands_module, tmp_path, monkeypatch):
+    database_path, card_id, _, prior = _d2_close_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    prior["result"].update(conclusion="DRY", next_route="D3")
+    for finding in prior["result"]["finding_dispositions"]:
+        finding["classification"] = "coverage"
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            "INSERT INTO initiative_phase_results (result_id,initiative_card_id,initiative_id,phase,segment_id,iteration,result_kind,contract_id,contract_version,canonical_payload,accepted_task_refs,accepted_checkpoint_refs,actor_evidence,idempotency_key,accepted,created_at) VALUES ('d2-dry',?,'initiative-1','D2',NULL,1,'phase_close','adrian-kanban.lifecycle.d2','1',?,'[\"review-candidate\"]','[]','{}','prior-key',1,2)",
+            (card_id, json.dumps(prior["result"])),
+        )
+        conn.execute("UPDATE initiative_transitions SET to_phase='D3'")
+    update = {
+        "result_id": "d3-close",
+        "phase": "D3",
+        "segment_id": None,
+        "iteration": 1,
+        "result_kind": "phase_close",
+        "contract_id": "adrian-kanban.lifecycle.d3",
+        "contract_version": "1",
+        "accepted_task_refs": ["review-candidate"],
+        "accepted_checkpoint_refs": [],
+        "result": {
+            "reviewed_ref": prior["result"]["draft_ref"],
+            "decision_record_ref": {
+                "path": "2-design/decision.md",
+                "commit": "c" * 40,
+                "sha256": hashlib.sha256(b"decision").hexdigest(),
+            },
+            "d2_result_ref": "d2-dry",
+            "finding_coverage": [
+                {
+                    "finding_ref": f"review-candidate#/findings/{i}",
+                    "status": "no_decision_required",
+                    "rationale": "resolved coverage",
+                }
+                for i in range(2)
+            ],
+            "decision_items": [],
+            "next_route": "D4",
+        },
+    }
+    module = importlib.import_module(f"{commands_module.__package__}.phase_d3")
+    return database_path, card_id, module, update
+
+
+@pytest.mark.parametrize("gap", [None, "missing_coverage", "unapproved", "wrong_proof"])
+def test_d3_command_requires_approved_complete_ratification_package(
+    commands_module, tmp_path, monkeypatch, gap
+):
+    database_path, _, module, update = _d3_close_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    provider_module = importlib.import_module(f"{commands_module.__package__}.provider")
+    provider = provider_module.AdrianKanbanAuthorityProvider(str(database_path))
+    provider_module.register_provider(provider)
+    if gap == "missing_coverage":
+        update["result"]["finding_coverage"].pop()
+    payload = {
+        "initiative_id": "initiative-1",
+        "board": "orchestrator",
+        "update_kind": "phase_result",
+        "update": update,
+        "approval_id": "approval-d3",
+    }
+    if gap != "unapproved":
+        _approve(database_path, payload)
+
+    def preparer(payload, _):
+        return module.prepare_d3_result(
+            payload["initiative_id"],
+            payload["update"],
+            lambda *_: b"draft",
+            lambda *_: b"decision",
+        )
+
+    if gap == "wrong_proof":
+        preparer = lambda *_: object()
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_update_initiative": commands_module._handle_update_initiative
+        },
+        phase_result_preparer=preparer,
+    )
+    response = _submit(boundary, payload)
+    assert response["result"] == ("ACCEPTED" if gap is None else "REJECTED"), response
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM initiative_phase_results WHERE phase='D3'"
+        ).fetchone()[0] == (1 if gap is None else 0)
+        if gap != "unapproved":
+            assert conn.execute(
+                "SELECT state FROM write_gate_kanban_approvals WHERE approval_id='approval-d3'"
+            ).fetchone()[0] == ("consumed" if gap is None else "approved")
+        assert (
+            conn.execute(
+                "SELECT to_phase FROM initiative_transitions ORDER BY transition_id DESC LIMIT 1"
+            ).fetchone()[0]
+            == "D3"
+        )  # result admission alone never routes or authorizes Canon writes
+    if gap is None:
+        assert _submit(boundary, payload) == response
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        None,
+        "stale_prior",
+        "not_dry",
+        "baseline",
+        "missing_coverage",
+        "extra_coverage",
+        "missing_candidate",
+        "checkpoint",
+        "corrupt_prior",
+        "wrong_current",
+        "post_prepare_change",
+    ],
+)
+def test_d3_admission_binds_complete_dry_history_without_mutation(
+    commands_module, tmp_path, monkeypatch, gap
+):
+    database_path, card_id, module, update = _d3_close_fixture(
+        commands_module, tmp_path, monkeypatch
+    )
+    if gap == "stale_prior":
+        update["result"]["d2_result_ref"] = "stale"
+    elif gap == "baseline":
+        update["result"]["reviewed_ref"]["commit"] = "d" * 40
+    elif gap == "missing_coverage":
+        update["result"]["finding_coverage"].pop()
+    elif gap == "extra_coverage":
+        update["result"]["finding_coverage"].append({
+            "finding_ref": "invented",
+            "status": "no_decision_required",
+            "rationale": "not real",
+        })
+    elif gap == "missing_candidate":
+        update["accepted_task_refs"] = []
+    elif gap == "checkpoint":
+        update["accepted_checkpoint_refs"] = ["notD3"]
+    prepared = module.prepare_d3_result(
+        "initiative-1", update, lambda *_: b"draft", lambda *_: b"decision"
+    )
+    if gap == "post_prepare_change":
+        update["result"]["decision_items"].append({"finding_ref": "new"})
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if gap in {"not_dry", "wrong_current", "corrupt_prior"}:
+            prior = json.loads(
+                conn.execute(
+                    "SELECT canonical_payload FROM initiative_phase_results WHERE result_id='d2-dry'"
+                ).fetchone()[0]
+            )
+            if gap == "not_dry":
+                prior["conclusion"] = "NOT_DRY"
+            elif gap == "wrong_current":
+                prior["current_review_ref"] = "unaccepted"
+            conn.execute(
+                "UPDATE initiative_phase_results SET canonical_payload=? WHERE result_id='d2-dry'",
+                ("notJSON" if gap == "corrupt_prior" else json.dumps(prior),),
+            )
+        before = conn.total_changes
+        if gap is None:
+            assert (
+                module.admit_d3_result(
+                    SimpleNamespace(connection=conn),
+                    card_id,
+                    "initiative-1",
+                    update,
+                    prepared,
+                )
+                is None
+            )
+        else:
+            with pytest.raises(ValueError):
+                module.admit_d3_result(
+                    SimpleNamespace(connection=conn),
+                    card_id,
+                    "initiative-1",
+                    update,
+                    prepared,
+                )
+        assert conn.total_changes == before
+
+
 @pytest.mark.parametrize(
     "gap",
     [None, "missing_finding", "wrong_baseline", "missing_preparer", "wrong_proof"],

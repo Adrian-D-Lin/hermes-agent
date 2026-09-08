@@ -92,6 +92,147 @@ def _d2_update():
     return update
 
 
+def _d3_update(dispositions=()):
+    update = _update()
+    update.update(phase="D3", contract_id="adrian-kanban.lifecycle.d3")
+    update["result"] = {
+        "reviewed_ref": update["result"]["draft_ref"],
+        "decision_record_ref": {
+            "path": "2-design/decision.md",
+            "commit": "c" * 40,
+            "sha256": hashlib.sha256(b"decision").hexdigest(),
+        },
+        "d2_result_ref": "d2-dry",
+        "finding_coverage": [],
+        "decision_items": [],
+        "next_route": "D2" if "design_amendment" in dispositions else "D4",
+    }
+    for index, disposition in enumerate(dispositions):
+        ref = f"review#/findings/{index}"
+        update["result"]["finding_coverage"].append({
+            "finding_ref": ref,
+            "status": "decision_required",
+            "rationale": "human decision needed",
+        })
+        update["result"]["decision_items"].append({
+            "finding_ref": ref,
+            "disposition": disposition,
+            "rationale": "recorded human decision",
+            "amendment_text": "exact design edit"
+            if disposition == "design_amendment"
+            else None,
+            "canon_decision": "exact Canon change decision"
+            if disposition == "canon_amendment"
+            else None,
+        })
+    return update
+
+
+@pytest.mark.parametrize(
+    "dispositions",
+    [
+        (),
+        ("ratified_as_is",),
+        ("design_amendment",),
+        ("canon_amendment",),
+        ("design_amendment", "canon_amendment", "ratified_as_is"),
+    ],
+)
+def test_d3_preparation_preserves_all_decisions_and_exact_route(d1, dispositions):
+    module = importlib.import_module(f"{d1.__package__}.phase_d3")
+    update = _d3_update(dispositions)
+    original = copy.deepcopy(update)
+    calls = []
+    proof = module.prepare_d3_result(
+        "initiative-1",
+        update,
+        lambda *args: calls.append(("published", args)) or b"draft",
+        lambda *args: calls.append(("immutable", args)) or b"decision",
+    )
+    assert update == original
+    assert proof.reviewed.path == "2-design/draft.md"
+    assert proof.decision_record.path == "2-design/decision.md"
+    assert [kind for kind, _ in calls] == ["published", "immutable"]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        proof.initiative_id = "another"
+
+
+def test_d3_resolved_coverage_does_not_force_a_human_decision(d1):
+    module = importlib.import_module(f"{d1.__package__}.phase_d3")
+    update = _d3_update()
+    update["result"]["finding_coverage"] = [
+        {
+            "finding_ref": "review#/findings/0",
+            "status": "no_decision_required",
+            "rationale": "already resolved, explicit coverage retained",
+        }
+    ]
+    module.prepare_d3_result(
+        "initiative-1", update, lambda *_: b"draft", lambda *_: b"decision"
+    )
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        "omitted_decision",
+        "extra_decision",
+        "duplicate_coverage",
+        "duplicate_decision",
+        "wrong_route",
+        "missing_amendment",
+        "inapplicable_canon",
+        "bad_status",
+        "not_a_list",
+        "extra_field",
+    ],
+)
+def test_d3_invalid_package_rejects_before_artifact_reads(d1, gap):
+    module = importlib.import_module(f"{d1.__package__}.phase_d3")
+    update = _d3_update(("design_amendment",))
+    result = update["result"]
+    if gap == "omitted_decision":
+        result["decision_items"] = []
+    elif gap == "extra_decision":
+        result["finding_coverage"][0]["status"] = "no_decision_required"
+    elif gap == "duplicate_coverage":
+        result["finding_coverage"] *= 2
+    elif gap == "duplicate_decision":
+        result["decision_items"] *= 2
+    elif gap == "wrong_route":
+        result["next_route"] = "D4"
+    elif gap == "missing_amendment":
+        result["decision_items"][0]["amendment_text"] = None
+    elif gap == "inapplicable_canon":
+        result["decision_items"][0]["canon_decision"] = "inapplicable"
+    elif gap == "bad_status":
+        result["finding_coverage"][0]["status"] = "invented"
+    elif gap == "not_a_list":
+        result["decision_items"] = {}
+    else:
+        result["extra"] = "unrecognized"
+    calls = []
+    with pytest.raises(ValueError):
+        module.prepare_d3_result(
+            "initiative-1",
+            update,
+            lambda *_: calls.append("draft") or b"draft",
+            lambda *_: calls.append("decision") or b"decision",
+        )
+    assert calls == []
+
+
+def test_d3_decision_document_digest_is_verified(d1):
+    module = importlib.import_module(f"{d1.__package__}.phase_d3")
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        module.prepare_d3_result(
+            "initiative-1",
+            _d3_update(),
+            lambda *_: b"draft",
+            lambda *_: b"wrong decision",
+        )
+
+
 def _git(root, *args):
     result = subprocess.run(
         ["git", "-C", str(root), *args], capture_output=True, text=True, check=True
@@ -135,13 +276,22 @@ def _phase_preparer(d1, root, binding=None):
     )
 
 
-@pytest.mark.parametrize("phase", ["D1", "D2"])
+@pytest.mark.parametrize("phase", ["D1", "D2", "D3"])
 def test_phase_preparer_reads_pinned_bytes_not_dirty_files(d1, phase_repository, phase):
     root, draft_commit, review_commit = phase_repository
-    update = _update() if phase == "D1" else _d2_update()
-    update["result"]["draft_ref"]["commit"] = draft_commit
+    update = (
+        _update() if phase == "D1" else _d2_update() if phase == "D2" else _d3_update()
+    )
+    draft_field = "reviewed_ref" if phase == "D3" else "draft_ref"
+    update["result"][draft_field]["commit"] = draft_commit
     if phase == "D2":
         update["result"]["review_ref"]["commit"] = review_commit
+    elif phase == "D3":
+        update["result"]["decision_record_ref"] = {
+            "path": "2-design/review.md",
+            "commit": review_commit,
+            "sha256": hashlib.sha256(b"review").hexdigest(),
+        }
     (root / "2-design/draft.md").write_bytes(b"dirty draft")
     (root / "2-design/review.md").write_bytes(b"dirty review")
     before = _git(root, "status", "--porcelain")
@@ -155,9 +305,11 @@ def test_phase_preparer_reads_pinned_bytes_not_dirty_files(d1, phase_repository,
         },
         context,
     )
-    assert proof.draft.commit == draft_commit
+    assert (proof.reviewed if phase == "D3" else proof.draft).commit == draft_commit
     if phase == "D2":
         assert proof.review.commit == review_commit  # deliberately NOT on origin/main
+    elif phase == "D3":
+        assert proof.decision_record.commit == review_commit
     assert _git(root, "status", "--porcelain") == before
 
 
