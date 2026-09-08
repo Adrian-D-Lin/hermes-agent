@@ -2156,7 +2156,7 @@ def _handle_complete(context: Any) -> dict[str, Any]:
 
     candidate_row = context.connection.execute(
         "SELECT candidate_id, task_card_id, task_id, execution_run_id, "
-        "reviewer, submitted_by FROM task_candidate_handoffs "
+        "reviewer, submitted_by, metadata_json FROM task_candidate_handoffs "
         "WHERE task_card_id = ? AND task_id = ? "
         "ORDER BY execution_run_id DESC LIMIT 1",
         (card_id, task_id),
@@ -2189,6 +2189,93 @@ def _handle_complete(context: Any) -> dict[str, Any]:
     ).fetchone()
     if verdict_row is not None:
         raise ValueError("candidate already has a reviewer verdict")
+
+    d4_5_findings: list[tuple[str, str, str, str]] = []
+    lifecycle_record = LifecycleContractRepository(context.connection).load(task_id)
+    if lifecycle_record is not None and lifecycle_record.snapshot.step == "D4.5":
+        try:
+            candidate_metadata = json.loads(candidate_row["metadata_json"])
+        except (json.JSONDecodeError, TypeError):
+            candidate_metadata = None
+        if not isinstance(candidate_metadata, dict):
+            d4_5_findings.append(
+                (
+                    "D4_5_VERIFICATION_INVALID_METADATA",
+                    "metadata_json",
+                    "valid D4.5 post-write verification record metadata",
+                    "missing or invalid JSON",
+                )
+            )
+        else:
+            try:
+                validate_lifecycle_output("d4_5_post_write_v1", candidate_metadata)
+            except OutputValidationRejected as exc:
+                d4_5_findings.extend(
+                    (
+                        f"D4_5_VERIFICATION_{index + 1:03d}",
+                        finding.field,
+                        "valid D4.5 post-write verification record evidence",
+                        "missing or invalid",
+                    )
+                    for index, finding in enumerate(exc.findings)
+                )
+            else:
+                verifications = candidate_metadata.get("document_verifications")
+                if not isinstance(verifications, list) or not verifications:
+                    d4_5_findings.append(
+                        (
+                            "D4_5_VERIFICATION_NONEMPTY",
+                            "document_verifications",
+                            "a nonempty list of per-document verification results",
+                            "missing or empty",
+                        )
+                    )
+                else:
+                    bad_results = [
+                        entry.get("result")
+                        for entry in verifications
+                        if type(entry) is dict and entry.get("result") != "MATCH"
+                    ]
+                    if bad_results:
+                        d4_5_findings.append(
+                            (
+                                "D4_5_VERIFICATION_MATCH",
+                                "document_verifications[].result",
+                                "every document verification result is exactly MATCH",
+                                str(bad_results),
+                            )
+                        )
+                if candidate_metadata.get("source_item_count") != candidate_metadata.get("determination_count"):
+                    d4_5_findings.append(
+                        (
+                            "D4_5_VERIFICATION_COUNTS",
+                            "source_item_count/determination_count",
+                            "source_item_count equal to determination_count",
+                            f"source_item_count={candidate_metadata.get('source_item_count')}, determination_count={candidate_metadata.get('determination_count')}",
+                        )
+                    )
+    if d4_5_findings:
+        raise CommandRejected(
+            failed_checks=tuple(
+                FailedCheck(
+                    code=code,
+                    target=target,
+                    expected=expected,
+                    observed=observed,
+                    accepted_format=(
+                        "nonempty document_verifications list whose every entry result is exactly MATCH, "
+                        "with source_item_count equal to determination_count"
+                    ),
+                    remediation=(
+                        "Fix the underlying changes, rerun verification through the ordinary request-changes failure path, "
+                        "and resubmit a fresh immutable candidate; MATCH on every document result is required for success."
+                    ),
+                    responsible_actor="session_agent",
+                    retry="return_route",
+                )
+                for code, target, expected, observed in d4_5_findings
+            )
+        )
 
     changed = context.mutation_executor._complete_in_active_transaction(
         context.capability,

@@ -394,6 +394,30 @@ def test_phase_preparer_missing_binding_cannot_use_payload_cwd(d1, phase_reposit
         )
 
 
+@pytest.mark.parametrize("published", [True, False])
+def test_d4_preparer_requires_the_exact_published_baseline(d1, phase_repository, published):
+    root, draft_commit, review_commit = phase_repository
+    reference = {
+        "path": "2-design/draft.md" if published else "2-design/review.md",
+        "commit": draft_commit if published else review_commit,
+        "sha256": hashlib.sha256(b"draft" if published else b"review").hexdigest(),
+    }
+    update = _update()
+    update.update(phase="D4", contract_id="adrian-kanban.lifecycle.d4", accepted_task_refs=["post-review"], accepted_checkpoint_refs=["checkpoint:D4.4"])
+    update["result"] = {"verified_baseline_ref": reference, "verification_record_ref": "post-review", "next_route": "DEV1"}
+    (root / "2-design/draft.md").write_bytes(b"dirty baseline must not be read")
+    preparer, context = _phase_preparer(d1, root)
+    payload = {"initiative_id": "initiative-1", "update_kind": "phase_result", "update": update}
+    if published:
+        proof = preparer(payload, context)
+        module = importlib.import_module(f"{d1.__package__}.phase_d4_evidence")
+        assert type(proof) is module.PreparedD4Result
+        assert dataclasses.asdict(proof.baseline) == reference
+    else:
+        with pytest.raises(ValueError, match="not an ancestor"):
+            preparer(payload, context)
+
+
 def test_d2_zero_finding_preparation_uses_distinct_artifact_readers(d1):
     module = importlib.import_module(f"{d1.__package__}.phase_d2")
     calls = []

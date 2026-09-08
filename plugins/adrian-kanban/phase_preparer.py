@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional
 from .phase_d1 import prepare_d1_result
 from .phase_d2 import prepare_d2_result
 from .phase_d3 import prepare_d3_result
+from .phase_d4_evidence import prepare_d4_result
 from .phase_d4_execution import prepare_d4_execution
 from .task_inputs import TaskInputPreparationContext
 from .published_git import read_published_blob, _git
@@ -52,8 +53,8 @@ class GitPhaseResultPreparer:
         else:
             if update.get("result_kind") != "phase_close":
                 raise ValueError("result_kind must be phase_close")
-            if phase not in ("D1", "D2", "D3"):
-                raise ValueError("phase must be D1, D2 or D3")
+            if phase not in ("D1", "D2", "D3", "D4"):
+                raise ValueError("phase must be D1, D2, D3 or D4")
         root = self._resolve_root(preparation_context)
         if phase == "D1":
             return prepare_d1_result(
@@ -96,6 +97,8 @@ class GitPhaseResultPreparer:
             return prepare_d3_result(
                 initiative_id, update, published_reader, immutable_reader
             )
+        if phase == "D4":
+            return prepare_d4_result(initiative_id, update, published_reader)
         return prepare_d2_result(
             initiative_id, update, published_reader, immutable_reader
         )
