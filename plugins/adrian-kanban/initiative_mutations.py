@@ -18,6 +18,8 @@ from writegate.kanban_approvals import (
     consume_approved,
 )
 
+from .initiative_checkpoints import admit_orchestration_checkpoint
+
 INITIATIVE_PHASES = frozenset(
     {
         "D1",
@@ -286,7 +288,11 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
     initiative_id = initiative_id.strip()
     update_kind = update_kind.strip()
     board = board.strip()
-    if update_kind not in {"body_update", "phase_result"}:
+    if update_kind not in {
+        "body_update",
+        "phase_result",
+        "orchestration_checkpoint",
+    }:
         raise ValueError("unsupported update_kind")
 
     card = context.connection.execute(
@@ -302,6 +308,82 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
     expected_version = context.binding.expected_version
     if current_version != expected_version:
         raise ValueError("stale initiative version")
+
+    if update_kind == "orchestration_checkpoint":
+        admission = admit_orchestration_checkpoint(
+            context.connection,
+            initiative_card_id=card_id,
+            initiative_id=initiative_id,
+            actor_profile=context.binding.actor_profile,
+            update=update,
+        )
+        _consume_approval(
+            context.connection,
+            context,
+            approval_id,
+            "kanban_update_initiative",
+            expected_version,
+            payload,
+            initiative_id,
+            None,
+        )
+        canonical_payload = json.dumps(
+            admission.result, sort_keys=True, separators=(",", ":")
+        )
+        accepted_task_refs_json = json.dumps(
+            admission.accepted_task_refs,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        accepted_checkpoint_refs_json = json.dumps(
+            admission.accepted_checkpoint_refs,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        actor_evidence = json.dumps(
+            {
+                "session_id": context.binding.session_id,
+                "actor_profile": context.binding.actor_profile,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = int(time.time())
+        context.connection.execute(
+            "INSERT INTO initiative_phase_results "
+            "(result_id, initiative_card_id, initiative_id, phase, segment_id, "
+            "iteration, result_kind, contract_id, contract_version, "
+            "canonical_payload, accepted_task_refs, accepted_checkpoint_refs, "
+            "actor_evidence, idempotency_key, accepted, created_at) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (
+                admission.result_id,
+                card_id,
+                initiative_id,
+                admission.phase,
+                None,
+                admission.iteration,
+                "orchestration_checkpoint",
+                admission.contract_id,
+                admission.contract_version,
+                canonical_payload,
+                accepted_task_refs_json,
+                accepted_checkpoint_refs_json,
+                actor_evidence,
+                context.idempotency_key,
+                now,
+            ),
+        )
+        record_version = _advance_initiative_version(
+            context.connection, context, initiative_id, expected_version
+        )
+        return {
+            "initiative_id": initiative_id,
+            "update_kind": update_kind,
+            "record_version": record_version,
+            "result_id": admission.result_id,
+            "step": admission.step,
+        }
 
     if update_kind == "body_update":
         if set(update.keys()) != {"body"}:
