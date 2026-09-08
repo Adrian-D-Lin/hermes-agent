@@ -75,6 +75,7 @@ def register(ctx) -> None:
     )
     from .provider import AdrianKanbanAuthorityProvider, register_provider
     from .routing import ModelToolBoardResolver, resolve_expected_version
+    from .phase_preparer import GitPhaseResultPreparer
 
     cached_provider = _provider_cache.get(database_path)
     if cached_provider is not None and cached_provider.is_healthy():
@@ -120,6 +121,7 @@ def register(ctx) -> None:
         ),
         task_input_preparer=preparer,
         segment_manifest_preparer=segment_preparer,
+        phase_result_preparer=GitPhaseResultPreparer(),
     )
     register_public_tools(
         ctx,
