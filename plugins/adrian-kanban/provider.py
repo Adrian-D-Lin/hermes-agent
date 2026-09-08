@@ -7,10 +7,9 @@ from pathlib import Path
 from hermes_cli import kanban_db as _kb
 
 from .capability import CapabilityBinding, CapabilityRegistry, CapabilityRejected
+from .versioning import PLUGIN_NAME, PLUGIN_VERSION, PROTOCOL_VERSION
 
-PROVIDER_NAME = "adrian-kanban"
-PLUGIN_VERSION = "0.2.0"
-PROTOCOL_VERSION = "2"
+PROVIDER_NAME = PLUGIN_NAME
 
 
 class AdrianKanbanAuthorityProvider:
