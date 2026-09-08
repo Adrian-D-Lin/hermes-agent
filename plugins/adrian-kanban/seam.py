@@ -34,6 +34,8 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as _kb
 
+from .versioning import PLUGIN_NAME, PLUGIN_VERSION, release_identity
+
 # The fail-closed diagnostic is defined in the generic, core-owned seam. The
 # plugin re-exports it so existing import sites (tests, S2) keep resolving
 # ``from adrian_kanban.seam import AuthorityAdmissionRejected`` without the
@@ -43,7 +45,7 @@ AuthorityAdmissionRejected = _kb.AuthorityAdmissionRejected
 
 # The single canonical authority identifier. Kept in lockstep with the core
 # seam's ``AUTHORITY_ADRIAN_KANBAN`` and ``config_defaults``.
-AUTHORITY_ADRIAN_KANBAN = "adrian-kanban"
+AUTHORITY_ADRIAN_KANBAN = PLUGIN_NAME
 AUTHORITY_NATIVE = "native"
 
 
@@ -61,7 +63,7 @@ class AdmittedAuthorityProvider:
     without any production capability.
     """
 
-    name: str = "adrian-kanban"
+    name: str = PLUGIN_NAME
 
     def is_healthy(self) -> bool:  # pragma: no cover - interface stub
         raise NotImplementedError
@@ -118,11 +120,12 @@ def health_report(db_path: Optional[str] = None) -> dict[str, Any]:
     authority = resolve_authority()
     info: dict[str, Any] = {
         "selected_authority": authority,
-        "plugin_version": "0.1.0",
+        "plugin_version": PLUGIN_VERSION,
         "plugin_name": AUTHORITY_ADRIAN_KANBAN,
         "db_path": db_path,
         "native_surface_ok": True,
         "reason": None,
+        "versions": release_identity(),
     }
     if authority == AUTHORITY_ADRIAN_KANBAN:
         # Resolve the configured authoritative path (raises when missing or

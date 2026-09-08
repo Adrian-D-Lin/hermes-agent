@@ -1,16 +1,38 @@
 name: adrian-kanban
 description: >-
-  adrian-kanban — the inactive, generic mutation-authority seam for the shared
-  Kanban board. S1 establishes ONLY the selection seam, the narrow
-  authority-provider/capability interface, a test-only provider fixture, and the
-  non-public foundational schema/store. It does NOT implement production
-  capability creation, validation, binding, consumption, typed initiative
-  approval, the private worker adapter, plugin eligibility dispatch, or
-  Write-Gate admission (those are S2). When ``kanban.mutation_authority`` is
-  ``adrian-kanban`` and the configured provider is not present, compatible,
-  healthy, and supplies the admitted-operation interface, native mutation and
-  dispatch fail closed with no fallback. The default ``native`` preserves the
-  installed behavior exactly.
-version: 0.1.0
+  Complete Adrian-specific mutation authority for the shared Kanban board.
+  When selected, it replaces all 18 public Kanban operations and supplies the
+  verified-input pre-tool hook. Native selection leaves it inert.
+version: 0.2.0
 author: NousResearch
-kind: backend
+kind: standalone
+manifest_version: 2
+capabilities:
+  - tools.override
+hermes:
+  protocol_version: "2"
+  schema_version: "1"
+  registry_version: "v0.28-s2-1"
+  skill_bundle_version: "0.1.0"
+  desktop_extension_version: "0.2.0"
+provides_tools:
+  - kanban_show
+  - kanban_list
+  - kanban_attachments
+  - kanban_create
+  - kanban_complete
+  - kanban_block
+  - kanban_unblock
+  - kanban_comment
+  - kanban_link
+  - kanban_heartbeat
+  - kanban_attach
+  - kanban_attach_url
+  - kanban_request_changes
+  - kanban_request_review
+  - kanban_create_initiative
+  - kanban_update_initiative
+  - kanban_transition_initiative
+  - kanban_close_initiative
+provides_hooks:
+  - pre_tool_call
