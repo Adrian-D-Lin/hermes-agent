@@ -81,8 +81,12 @@ Dispatch protocol (per angle):
   citations, uncertainties, assumptions, and follow-up probes.
 - The card must NOT reference findings from any other angle. Each
   angle works from the shared baseline independently.
-- Wait for the card to reach a terminal status (done, archived, or
-  blocked-and-resolved) before dispatching the next angle.
+- Wait for the accepted completion or recorded orchestration checkpoint
+  named by the lifecycle contract before dispatching the next angle.
+  `blocked`, `archived`, worker termination, or a terminal-looking card
+  alone does not release the sequence. An explicit, separately approved
+  human gate override may release it while preserving the unmet criterion;
+  never represent that override as an accepted reviewer verdict.
 - Capture the output (card ID, findings, evidence) for DEV1.2 merge.
 
 ## DEV1.2 - Reconnaissance Merge

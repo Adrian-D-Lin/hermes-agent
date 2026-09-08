@@ -45,6 +45,12 @@ Role assignments:
 
 ## Segment anchor
 
+Sequence release requires the accepted completion or recorded orchestration
+checkpoint named by the lifecycle contract. `blocked`, `archived`, worker
+termination, or a terminal-looking status alone does not release the next
+step. Only the separate, exactly approved human gate-override route may
+release an unmet criterion, preserving it without fabricating a reviewer verdict.
+
 Before performing phase work, resolve the active segment and workspace:
 
 1. Read the initiative's transition chain. The active phase is the
@@ -135,8 +141,8 @@ Dispatch protocol:
   once the Kanban field contract is finalized. -->
 - The card states what the builder-tester must produce: build
   artefacts and a build summary.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.2.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.2; terminal status alone is insufficient.
 - Capture the build summary and artefact references for DEV3.2.
 
 ## DEV3.2 — Candidate Test and Fixture Drafting
@@ -165,8 +171,8 @@ Dispatch protocol:
   implementation brief.
 - The card states what the builder-tester must produce: candidate
   tests and fixtures with declaration records.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.3.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.3; terminal status alone is insufficient.
 - Capture the candidate tests and fixtures for DEV3.3.
 
 ## DEV3.3 — Design to Tests Check
@@ -208,8 +214,8 @@ Dispatch protocol:
 - The card states what the test-authority-reviewer must produce: an
   updated exhaustive test store, a ratified test suite, and a
   test-coverage conclusion.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.4.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.4; terminal status alone is insufficient.
 - Capture the ratified test suite and test-coverage conclusion for
   DEV3.4.
 
@@ -242,8 +248,8 @@ Dispatch protocol:
   once the Kanban field contract is finalized. -->
 - The card states what the test-authority-reviewer must produce: a
   complete test-store execution record.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.5.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.5; terminal status alone is insufficient.
 - Capture the execution record for DEV3.6.
 
 ## DEV3.5 — Design and Brief to Code Check
@@ -267,8 +273,8 @@ Dispatch protocol:
   commit SHA from DEV2.3).
 - The card states what the test-authority-reviewer must produce: broad
   code-review findings.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.6.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.6; terminal status alone is insufficient.
 - Capture the broad code-review findings for DEV3.8 synthesis.
   The test-authority-reviewer's findings are NOT made available to
   the independent-reviewer until DEV3.7 is recorded.
@@ -301,8 +307,8 @@ Dispatch protocol:
   once the Kanban field contract is finalized. -->
 - The card states what the independent-reviewer must produce: a
   test-result review record.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.7.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.7; terminal status alone is insufficient.
 - Capture the test-result review record for DEV3.8 synthesis.
 
 ## DEV3.7 — Independent Design and Brief to Code Check
@@ -331,8 +337,8 @@ Dispatch protocol:
 - The card must state that the independent-reviewer must NOT read
   the test-authority-reviewer's broad code-review findings (from
   DEV3.5) before recording the independent finding set.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.8.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.8; terminal status alone is insufficient.
 - Capture the independent code-review record for DEV3.8 synthesis.
 
 ## DEV3.8 — Code-Review Synthesis
@@ -362,8 +368,8 @@ Dispatch protocol:
 - The card states what the independent-reviewer must produce: an
   integrated review record with agreement, disagreement, and gap
   register.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.9.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.9; terminal status alone is insufficient.
 - Capture the integrated review record for DEV3.9 classification.
 
 ## DEV3.9 — Finding Classification
@@ -417,8 +423,8 @@ Dispatch protocol:
   baseline.
 - The card states what the builder-tester must produce: a bounded
   revision brief.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.11.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.11; terminal status alone is insufficient.
 - Capture the revision brief for DEV3.11.
 
 ## DEV3.11 — Revision Application
@@ -439,8 +445,8 @@ Dispatch protocol:
   current build state (commit SHA in the segment workspace).
 - The card states what the builder-tester must produce: revised build
   artefacts and revision evidence.
-- Wait for the card to reach a terminal status before proceeding to
-  DEV3.12.
+- Wait for the contract's accepted completion or checkpoint before
+  proceeding to DEV3.12; terminal status alone is insufficient.
 - Capture the revision evidence for DEV3.12.
 
 ## DEV3.12 — Revision Recheck Through Full-Cycle Repeat
