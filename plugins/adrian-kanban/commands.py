@@ -3886,6 +3886,7 @@ class _CommandBoundary:
                 else:
                     if not isinstance(result, dict):
                         raise TypeError("handler must return a dict")
+                    committed_records = _committed_card_records(conn, action, payload, target)
                     try:
                         response_json = json.dumps(
                             {
@@ -3898,8 +3899,14 @@ class _CommandBoundary:
                             sort_keys=True,
                             separators=(",", ":"),
                         )
+                        committed_records_json = json.dumps(
+                            committed_records,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
                     except (TypeError, ValueError):
                         raise TypeError("handler result is not JSON serializable")
+                    created_at = int(time.time())
                     conn.execute(
                         f"INSERT INTO {_RECEIPT_TABLE} "
                         "(idempotency_key, operation, target, request_digest, "
@@ -3910,8 +3917,14 @@ class _CommandBoundary:
                             target,
                             request_digest,
                             response_json,
-                            int(time.time()),
+                            created_at,
                         ),
+                    )
+                    conn.execute(
+                        "INSERT INTO adrian_kanban_notification_outbox "
+                        "(idempotency_key, created_at, committed_records_json) "
+                        "VALUES (?, ?, ?)",
+                        (idempotency_key, created_at, committed_records_json),
                     )
                     return json.loads(response_json)
             if audited_rejection is not None:
@@ -3955,6 +3968,92 @@ class _CommandBoundary:
             )
         )
         return collector.rejection().as_dict()
+
+
+def _committed_card_records(
+    conn: sqlite3.Connection,
+    action: str,
+    payload: dict[str, Any],
+    target: str = "",
+) -> list[dict[str, Any]]:
+    """Derive the primary committed card records for an accepted mutation.
+
+    Resolved from ``adrian_kanban_cards`` inside the same transaction after the
+    handler succeeds. Exactly the expected cards are required; any mismatch
+    fails closed so the receipt and outbox event roll back together.
+    """
+    if action in INITIATIVE_OPERATIONS:
+        initiative_id = payload.get("initiative_id")
+        if not (type(initiative_id) is str and initiative_id.strip()):
+            raise ValueError("initiative_id must be a nonblank string")
+        rows = conn.execute(
+            "SELECT card_type, initiative_id, task_id, record_version "
+            "FROM adrian_kanban_cards "
+            "WHERE initiative_id = ? AND task_id IS NULL",
+            (initiative_id,),
+        ).fetchall()
+        if len(rows) > 1:
+            raise ValueError(
+                f"expected at most one initiative card, found {len(rows)}"
+            )
+        return [_card_record(rows[0])] if rows else []
+    if action == "kanban_link":
+        parent_id = payload.get("parent_id")
+        child_id = payload.get("child_id")
+        for field_name, value in (("parent_id", parent_id), ("child_id", child_id)):
+            if not (type(value) is str and value.strip()):
+                raise ValueError(f"{field_name} must be a nonblank string")
+        records = []
+        for task_id in (parent_id, child_id):
+            rows = conn.execute(
+                "SELECT card_type, initiative_id, task_id, record_version "
+                "FROM adrian_kanban_cards WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            if len(rows) > 1:
+                raise ValueError(
+                    f"expected at most one task card for {task_id}, "
+                    f"found {len(rows)}"
+                )
+            if rows:
+                records.append(_card_record(rows[0]))
+        return records
+    task_id = payload.get("task_id")
+    if not (type(task_id) is str and task_id.strip()):
+        task_id = target
+    if not (type(task_id) is str and task_id.strip()):
+        return []
+    rows = conn.execute(
+        "SELECT card_type, initiative_id, task_id, record_version "
+        "FROM adrian_kanban_cards WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    if len(rows) > 1:
+        raise ValueError(f"expected at most one task card, found {len(rows)}")
+    return [_card_record(rows[0])] if rows else []
+
+
+def _card_record(row: sqlite3.Row) -> dict[str, Any]:
+    card_type = row["card_type"]
+    initiative_id = row["initiative_id"]
+    task_id = row["task_id"]
+    record_version = row["record_version"]
+    if card_type not in ("initiative", "task"):
+        raise ValueError("unexpected card_type in committed card record")
+    if not (type(initiative_id) is str and initiative_id.strip()):
+        raise ValueError("initiative_id must be a nonblank string")
+    if card_type == "initiative" and task_id is not None:
+        raise ValueError("initiative card must not carry a task_id")
+    if card_type == "task" and not (type(task_id) is str and task_id.strip()):
+        raise ValueError("task card must carry a nonblank task_id")
+    if type(record_version) is not int or isinstance(record_version, bool) or record_version < 0:
+        raise ValueError("record_version must be a non-negative integer")
+    return {
+        "card_type": card_type,
+        "initiative_id": initiative_id,
+        "task_id": task_id,
+        "record_version": record_version,
+    }
 
 
 class _ConflictError(RuntimeError):
