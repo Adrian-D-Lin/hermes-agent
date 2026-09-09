@@ -120,6 +120,7 @@ def test_running_governed_task_derives_exact_close_and_dependency_release(
             "action": "release",
             "from_status": "todo",
             "to_status": "ready",
+            "expected_version": 0,
         }
     ]
     assert proposal["downstream_exceptions"] == []
@@ -166,12 +167,16 @@ def test_backward_move_regates_idle_dependents_and_flags_active_ones(
             "action": "re_gate",
             "from_status": "ready",
             "to_status": "todo",
+            "expected_version": 0,
         }
     ]
     assert proposal["downstream_exceptions"] == [
         {
             "task_id": "task-active",
             "status": "running",
+            "expected_version": 0,
+            "current_run_id": None,
+            "claim_lock": None,
             "reason": "active_or_terminal_dependent_requires_explicit_disposition",
         }
     ]

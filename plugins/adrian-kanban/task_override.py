@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from .override_proposals import store_prepared_override
+import json
+
+from .override_proposals import consume_revalidated_override, store_prepared_override
 
 SUPPORTED_DESTINATIONS = ("todo", "ready", "review", "done")
 TERMINAL_STATUSES = ("done", "archived")
@@ -204,6 +206,23 @@ def derive_task_status_override(
     for child in children:
         child_id = child["id"]
         child_status = child["status"]
+        child_card = conn.execute(
+            """
+            SELECT c.record_version AS record_version,
+                   t.current_run_id AS current_run_id,
+                   t.claim_lock AS claim_lock
+            FROM adrian_kanban_cards c
+            JOIN tasks t ON t.id = c.task_id
+            WHERE c.task_id = ? AND c.card_type = 'task'
+              AND c.board_slug = ? AND c.closed_at IS NULL
+            """,
+            (child_id, board),
+        ).fetchall()
+        if len(child_card) != 1:
+            raise ValueError(
+                f"no open task card found for dependent task {child_id!r}"
+            )
+        child_card = child_card[0]
         if to_status == "done":
             if child_status != "todo":
                 continue
@@ -225,6 +244,7 @@ def derive_task_status_override(
                         "action": "release",
                         "from_status": "todo",
                         "to_status": "ready",
+                        "expected_version": child_card["record_version"],
                     }
                 )
         elif source_status == "done" and to_status in ("todo", "ready", "review"):
@@ -235,6 +255,7 @@ def derive_task_status_override(
                         "action": "re_gate",
                         "from_status": child_status,
                         "to_status": "todo",
+                        "expected_version": child_card["record_version"],
                     }
                 )
             elif child_status in ("running",) or child_status in TERMINAL_STATUSES:
@@ -242,6 +263,9 @@ def derive_task_status_override(
                     {
                         "task_id": child_id,
                         "status": child_status,
+                        "expected_version": child_card["record_version"],
+                        "current_run_id": child_card["current_run_id"],
+                        "claim_lock": child_card["claim_lock"],
                         "reason": "active_or_terminal_dependent_requires_explicit_disposition",
                     }
                 )
@@ -337,3 +361,300 @@ def prepare_task_status_override(
         now=now,
         expires_at=expires_at,
     )
+
+
+def execute_approved_task_status_override(
+    conn,
+    *,
+    request_id,
+    executor_session_id,
+    executor_profile,
+    mutation_id,
+    idempotency_key,
+    now,
+):
+    """Atomically execute an approved task gate override on the caller's open transaction.
+
+    Never begins, commits, or rolls back; a late failure propagates so the
+    caller's rollback reverses approval consumption, version advance, run
+    closure, task movement, dependency changes, and records.
+    """
+    if not request_id or not isinstance(request_id, str):
+        raise ValueError("request_id is required")
+    if not executor_session_id or not isinstance(executor_session_id, str):
+        raise ValueError("executor_session_id is required")
+    if executor_profile != "default":
+        raise ValueError("only the default executor profile may execute overrides")
+    if not mutation_id or not isinstance(mutation_id, str):
+        raise ValueError("mutation_id is required")
+    if not idempotency_key or not isinstance(idempotency_key, str):
+        raise ValueError("idempotency_key is required")
+    if not isinstance(now, int) or now <= 0:
+        raise ValueError("now must be a positive integer")
+
+    row = conn.execute(
+        "SELECT canonical_payload FROM gate_override_proposals WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown override request {request_id!r}")
+    payload = json.loads(row["canonical_payload"])
+    stored_proposal = payload["proposal"]
+    executor = payload["executor"]
+    if executor.get("session_id") != executor_session_id:
+        raise ValueError("executor session does not match the approved override")
+    if executor.get("profile") != executor_profile:
+        raise ValueError("executor profile does not match the approved override")
+
+    rederived = derive_task_status_override(
+        conn,
+        task_id=stored_proposal["target"],
+        board=stored_proposal["board"],
+        to_status=stored_proposal["destination"]["status"],
+        override_reason=stored_proposal["override_reason"],
+        executor_session_id=executor_session_id,
+        executor_profile=executor_profile,
+    )
+    if rederived != stored_proposal:
+        raise ValueError("task record version no longer matches the approved override")
+
+    consumed = consume_revalidated_override(
+        conn,
+        request_id=request_id,
+        operation=stored_proposal["operation"],
+        target=stored_proposal["target"],
+        executor_session_id=executor_session_id,
+        executor_profile=executor_profile,
+        current_proposal=rederived,
+        mutation_id=mutation_id,
+        idempotency_key=idempotency_key,
+        now=now,
+    )
+
+    task_id = stored_proposal["target"]
+    board = stored_proposal["board"]
+    source_status = rederived["source"]["status"]
+    to_status = rederived["destination"]["status"]
+    expected_version = rederived["expected_version"]
+
+    task_card = conn.execute(
+        "SELECT id, record_version FROM adrian_kanban_cards "
+        "WHERE task_id = ? AND card_type = 'task' AND board_slug = ? AND closed_at IS NULL",
+        (task_id, board),
+    ).fetchone()
+    if task_card is None:
+        raise ValueError(f"no open task card found for task {task_id!r}")
+    task_card_id = task_card["id"]
+    if task_card["record_version"] != expected_version:
+        raise ValueError("task record version no longer matches the approved override")
+
+    initiative_card = conn.execute(
+        "SELECT id FROM adrian_kanban_cards "
+        "WHERE initiative_id = ? AND task_id IS NULL AND card_type = 'initiative' "
+        "AND board_slug = ? AND closed_at IS NULL",
+        (rederived["initiative_id"], board),
+    ).fetchone()
+    if initiative_card is None:
+        raise ValueError(f"no open parent initiative found for {rederived['initiative_id']!r}")
+    initiative_card_id = initiative_card["id"]
+
+    updated = conn.execute(
+        "UPDATE adrian_kanban_cards SET record_version = ? WHERE id = ? AND record_version = ?",
+        (expected_version + 1, task_card_id, expected_version),
+    )
+    if updated.rowcount != 1:
+        raise ValueError("task record version no longer matches the approved override")
+
+    for closure in rederived["claim_run_closures"]:
+        run_id = closure["run_id"]
+        run = conn.execute(
+            "SELECT status, ended_at, claim_lock FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if (
+            run is None
+            or run["status"] != closure["run_status"]
+            or run["ended_at"] is not None
+            or run["claim_lock"] != closure["claim_lock"]
+        ):
+            raise ValueError(
+                f"run integrity failure: task {task_id!r} references "
+                f"run {run_id!r} that has no live task_runs row with a matching claim_lock"
+            )
+        run_updated = conn.execute(
+            "UPDATE task_runs SET status = 'released', outcome = 'overridden', "
+            "ended_at = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND task_id = ? AND status = ? AND ended_at IS NULL AND claim_lock = ?",
+            (now, run_id, task_id, closure["run_status"], closure["claim_lock"]),
+        )
+        if run_updated.rowcount != 1:
+            raise ValueError(
+                f"run integrity failure: task {task_id!r} references "
+                f"run {run_id!r} that has no live task_runs row with a matching claim_lock"
+            )
+
+    source = rederived["source"]
+    task_updated = conn.execute(
+        "UPDATE tasks SET status = ?, current_run_id = NULL, claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL, completed_at = ? "
+        "WHERE id = ? AND status = ? AND current_run_id IS ? AND claim_lock IS ? "
+        "AND claim_expires IS ? AND worker_pid IS ?",
+        (
+            to_status,
+            now if to_status == "done" else None,
+            task_id,
+            source_status,
+            source["current_run_id"],
+            source["claim_lock"],
+            source["claim_expires"],
+            source["worker_pid"],
+        ),
+    )
+    if task_updated.rowcount != 1:
+        raise ValueError("task record version no longer matches the approved override")
+
+    for change in rederived["dependency_changes"]:
+        child_id = change["task_id"]
+        child_updated = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = ?",
+            (change["to_status"], child_id, change["from_status"]),
+        )
+        if child_updated.rowcount != 1:
+            raise ValueError("task record version no longer matches the approved override")
+        child_card = conn.execute(
+            "SELECT id, record_version FROM adrian_kanban_cards "
+            "WHERE task_id = ? AND card_type = 'task' AND board_slug = ? AND closed_at IS NULL",
+            (child_id, board),
+        ).fetchall()
+        if len(child_card) != 1:
+            raise ValueError(f"no open task card found for task {child_id!r}")
+        child_card = child_card[0]
+        child_expected_version = change["expected_version"]
+        if child_card["record_version"] != child_expected_version:
+            raise ValueError("task record version no longer matches the approved override")
+        child_card_updated = conn.execute(
+            "UPDATE adrian_kanban_cards SET record_version = ? WHERE id = ? AND record_version = ?",
+            (child_expected_version + 1, child_card["id"], child_expected_version),
+        )
+        if child_card_updated.rowcount != 1:
+            raise ValueError("task record version no longer matches the approved override")
+        unsatisfied_gates = [
+            gate for gate in rederived["gates"] if gate["result"] != "met"
+        ]
+        event_kind = (
+            "gate_override_dependency_release"
+            if change["action"] == "release"
+            else "gate_override_dependency_regate"
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                child_id,
+                event_kind,
+                json.dumps(
+                    {
+                        "override_request_id": request_id,
+                        "unsatisfied_gates": unsatisfied_gates,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+            ),
+        )
+
+    unsatisfied_gates = [gate for gate in rederived["gates"] if gate["result"] != "met"]
+    canonical_payload = json.dumps(
+        {
+            **rederived,
+            "movement_basis": "adrian_gate_override",
+            "result": "accepted_with_active_decision",
+            "override_request_id": request_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    actor_evidence = json.dumps(
+        {
+            "executor_session_id": executor_session_id,
+            "executor_profile": executor_profile,
+            "approval_evidence": consumed["approval_evidence"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    conn.execute(
+        "INSERT INTO task_gate_override_records ("
+        "request_id, approval_id, mutation_id, initiative_card_id, initiative_id, "
+        "task_card_id, task_id, from_status, to_status, "
+        "override_authority_ref, override_reason, unsatisfied_gates, movement_basis, "
+        "result, actor_evidence, canonical_payload, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            request_id,
+            consumed["approval_id"],
+            mutation_id,
+            initiative_card_id,
+            rederived["initiative_id"],
+            task_card_id,
+            task_id,
+            source_status,
+            to_status,
+            request_id,
+            rederived["override_reason"],
+            json.dumps(unsatisfied_gates, sort_keys=True, separators=(",", ":")),
+            "adrian_gate_override",
+            "accepted_with_active_decision",
+            actor_evidence,
+            canonical_payload,
+            now,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_active_decisions ("
+        "decision_id, task_card_id, task_id, initiative_id, decision_kind, "
+        "authority_ref, canonical_payload, active, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+        (
+            f"decision:{request_id}",
+            task_card_id,
+            task_id,
+            rederived["initiative_id"],
+            "adrian_gate_override",
+            request_id,
+            canonical_payload,
+            now,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, 'adrian-kanban', ?, ?)",
+        (task_id, rederived["commentary"], now),
+    )
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, 'gate_override_applied', ?, ?)",
+        (
+            task_id,
+            json.dumps(
+                {
+                    "override_request_id": request_id,
+                    "active_decision_id": f"decision:{request_id}",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            now,
+        ),
+    )
+
+    return {
+        "task_id": task_id,
+        "from_status": source_status,
+        "to_status": to_status,
+        "record_version": expected_version + 1,
+        "request_id": request_id,
+        "result": "accepted_with_active_decision",
+    }
