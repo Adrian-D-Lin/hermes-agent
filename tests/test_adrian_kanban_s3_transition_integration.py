@@ -145,9 +145,14 @@ def test_transition_requires_successful_current_d4_close(
         assert submit() == response
 
 
-def test_transition_tool_exposes_required_close_reference(commands_module):
+def test_transition_tool_exposes_route_specific_close_reference(commands_module):
     parameters = commands_module.TOOL_SCHEMAS["kanban_transition_initiative"][
         "parameters"
     ]
-    assert "phase_close_ref" in parameters["required"]
+    assert "phase_close_ref" not in parameters["required"]
     assert parameters["properties"]["phase_close_ref"]["type"] == "string"
+    ordinary_route, override_route = parameters["oneOf"]
+    assert set(ordinary_route["required"]) == {"phase_close_ref", "approval_id"}
+    assert ordinary_route["not"] == {"required": ["gate_override"]}
+    assert override_route["required"] == ["gate_override"]
+    assert override_route["not"] == {"required": ["phase_close_ref", "approval_id"]}
