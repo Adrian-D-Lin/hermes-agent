@@ -46,6 +46,10 @@ from .initiative_override import (
     execute_approved_initiative_transition_override,
     prepare_initiative_transition_override,
 )
+from .task_override import (
+    execute_approved_task_status_override,
+    prepare_task_status_override,
+)
 from .override_host_flow import present_and_record_override_approval
 from gateway.trusted_authorizer_evidence import mint_current_tailscale_authorizer
 from .lifecycle import LifecycleContractRepository
@@ -322,8 +326,52 @@ TOOL_SCHEMAS: dict[str, Any] = {
                     "type": "string",
                     "description": "Optional board scope for the write.",
                 },
+                "gate_override": {
+                    "type": "object",
+                    "description": (
+                        "Optional Adrian gate-override declaration. When present, "
+                        "the task is prepared for a distinct host approval instead "
+                        "of an ordinary completion."
+                    ),
+                    "properties": {
+                        "to_status": {
+                            "type": "string",
+                            "description": (
+                                "Target status for the gate override."
+                            ),
+                        },
+                        "override_reason": {
+                            "type": "string",
+                            "description": (
+                                "Exact nonblank reason justifying the gate override."
+                            ),
+                        },
+                    },
+                    "required": ["to_status", "override_reason"],
+                    "additionalProperties": False,
+                },
             },
             "required": ["task_id", "idempotency_key"],
+            "oneOf": [
+                {
+                    "not": {"required": ["gate_override"]},
+                },
+                {
+                    "required": ["gate_override"],
+                    "not": {
+                        "anyOf": [
+                            {"required": [field]}
+                            for field in (
+                                "summary",
+                                "metadata",
+                                "result",
+                                "created_cards",
+                                "artifacts",
+                            )
+                        ]
+                    },
+                },
+            ],
             "additionalProperties": False,
         },
     },
@@ -968,9 +1016,25 @@ class _ModelToolRequestNormalizer:
             if not isinstance(target, str) or not target.strip():
                 raise ValueError("target must be nonblank str")
 
-            if operation == "kanban_transition_initiative" and "gate_override" in payload:
-                if "phase_close_ref" in payload or "approval_id" in payload:
-                    raise ValueError("gate_override must not mix ordinary transition evidence")
+            if "gate_override" in payload and operation in (
+                "kanban_transition_initiative",
+                "kanban_complete",
+            ):
+                if operation == "kanban_transition_initiative":
+                    if "phase_close_ref" in payload or "approval_id" in payload:
+                        raise ValueError("gate_override must not mix ordinary transition evidence")
+                else:
+                    for field in (
+                        "summary",
+                        "metadata",
+                        "result",
+                        "created_cards",
+                        "artifacts",
+                    ):
+                        if field in payload:
+                            raise ValueError(
+                                "gate_override must not mix ordinary completion fields"
+                            )
                 if actor_profile.strip() != "default":
                     raise ValueError("gate_override requires the default actor profile")
                 turn_id = runtime.get("turn_id")
@@ -1030,8 +1094,12 @@ class _ModelToolRequestNormalizer:
                         turn_id=turn_id,
                         api_request_id=runtime.get("api_request_id"),
                         user_task=user_task,
-                        payload={
-                            "initiative_id": payload["initiative_id"],
+                        payload=(
+                            {"task_id": payload["task_id"]}
+                            if operation == "kanban_complete"
+                            else {"initiative_id": payload["initiative_id"]}
+                        )
+                        | {
                             "board": board,
                             "_approved_gate_override_request_id": prepared_value[
                                 "request_id"
@@ -1089,8 +1157,12 @@ class _ModelToolRequestNormalizer:
                     turn_id=turn_id,
                     api_request_id=runtime.get("api_request_id"),
                     user_task=user_task,
-                    payload={
-                        "initiative_id": payload["initiative_id"],
+                    payload=(
+                        {"task_id": payload["task_id"]}
+                        if operation == "kanban_complete"
+                        else {"initiative_id": payload["initiative_id"]}
+                    )
+                    | {
                         "board": board,
                         "_approved_gate_override_request_id": preparation["value"][
                             "request_id"
@@ -2188,6 +2260,100 @@ def _handle_comment(context: Any) -> dict[str, Any]:
 
 def _handle_complete(context: Any) -> dict[str, Any]:
     payload = context.payload
+    if "_approved_gate_override_request_id" in payload:
+        unknown = set(payload.keys()) - {
+            "_approved_gate_override_request_id",
+            "task_id",
+            "board",
+        }
+        if unknown:
+            raise ValueError(f"unknown fields: {sorted(unknown)}")
+        request_id = payload["_approved_gate_override_request_id"]
+        task_id = payload["task_id"]
+        board = payload["board"]
+        for field_name, value in (
+            ("_approved_gate_override_request_id", request_id),
+            ("task_id", task_id),
+            ("board", board),
+        ):
+            if not (type(value) is str and value.strip()):
+                raise ValueError(f"{field_name} must be a nonblank string")
+        override_now = context.override_now
+        if (
+            type(override_now) is not int
+            or isinstance(override_now, bool)
+            or override_now <= 0
+        ):
+            raise ValueError("override_now must be a positive integer")
+        return execute_approved_task_status_override(
+            context.connection,
+            request_id=request_id.strip(),
+            executor_session_id=context.binding.session_id,
+            executor_profile=context.binding.actor_profile,
+            mutation_id=f"override-mutation:{request_id.strip()}",
+            idempotency_key=context.idempotency_key,
+            now=override_now,
+        )
+    if "gate_override" in payload:
+        unknown = set(payload.keys()) - {
+            "task_id",
+            "gate_override",
+            "board",
+        }
+        if unknown:
+            raise ValueError(f"unknown fields: {sorted(unknown)}")
+        task_id = payload["task_id"]
+        gate_override = payload["gate_override"]
+        board = payload["board"]
+        for field_name, value in (
+            ("task_id", task_id),
+            ("board", board),
+        ):
+            if not (type(value) is str and value.strip()):
+                raise ValueError(f"{field_name} must be a nonblank string")
+        if type(gate_override) is not dict:
+            raise ValueError("gate_override must be an object")
+        if set(gate_override.keys()) != {"to_status", "override_reason"}:
+            raise ValueError(
+                "gate_override must contain exactly to_status and override_reason"
+            )
+        to_status = gate_override["to_status"]
+        override_reason = gate_override["override_reason"]
+        for field_name, value in (
+            ("to_status", to_status),
+            ("override_reason", override_reason),
+        ):
+            if not (type(value) is str and value.strip()):
+                raise ValueError(f"{field_name} must be a nonblank string")
+        if not (type(context.turn_id) is str and context.turn_id.strip()):
+            raise ValueError("turn_id must be a nonblank string")
+        if not (type(context.user_task) is str and context.user_task.strip()):
+            raise ValueError("user_task must be a nonblank string")
+        if context.initial_authorizer is None:
+            raise ValueError("initial_authorizer is required")
+        override_now = context.override_now
+        if (
+            type(override_now) is not int
+            or isinstance(override_now, bool)
+            or override_now <= 0
+        ):
+            raise ValueError("override_now must be a positive integer")
+        return prepare_task_status_override(
+            context.connection,
+            initial_authorizer=context.initial_authorizer,
+            initial_session_id=context.binding.session_id,
+            initial_message_id=context.turn_id.strip(),
+            initial_quote=context.user_task,
+            executor_session_id=context.binding.session_id,
+            executor_profile=context.binding.actor_profile,
+            task_id=task_id.strip(),
+            board=board.strip(),
+            to_status=to_status.strip(),
+            override_reason=override_reason.strip(),
+            now=override_now,
+            expires_at=override_now + 300,
+        )
+
     allowed_fields = {
         "task_id",
         "summary",
