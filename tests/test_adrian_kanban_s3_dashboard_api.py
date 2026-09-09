@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import importlib
 import json
+import sqlite3
+import sys
+import types
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from tests.test_adrian_kanban_s1 import (  # noqa: F401
     adrian_plugin_modules,
@@ -258,3 +262,161 @@ def test_dashboard_command_requires_a_json_object(client):
     )
 
     assert response.status_code == 422
+
+
+def _seed_notification_event(database_path: Path, schema_module) -> None:
+    with sqlite3.connect(database_path) as conn:
+        schema_module.create_schema(conn)
+        response = json.dumps(
+            {
+                "result": "ACCEPTED",
+                "state_changed": True,
+                "attempt_id": "dashboard-event-attempt",
+                "operation": "kanban_block",
+                "value": {"task_id": "task-event", "blocked": True},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        records = json.dumps(
+            [
+                {
+                    "card_type": "task",
+                    "initiative_id": "initiative-event",
+                    "task_id": "task-event",
+                    "record_version": 4,
+                }
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            "INSERT INTO adrian_kanban_command_receipts "
+            "(idempotency_key, operation, target, request_digest, "
+            "response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "dashboard-event-receipt",
+                "kanban_block",
+                "task-event",
+                "digest",
+                response,
+                123,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO adrian_kanban_notification_outbox "
+            "(idempotency_key, created_at, committed_records_json) "
+            "VALUES (?, ?, ?)",
+            ("dashboard-event-receipt", 123, records),
+        )
+
+
+def test_dashboard_event_stream_requires_canonical_websocket_auth(
+    dashboard_module, monkeypatch
+):
+    monkeypatch.setattr(
+        dashboard_module.kanban_db,
+        "resolve_selected_authority",
+        lambda: "adrian-kanban",
+    )
+    stub = types.SimpleNamespace(_ws_auth_ok=lambda _ws: False)
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+
+    app = FastAPI()
+    app.include_router(dashboard_module.router, prefix="/api/plugins/adrian-kanban")
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with TestClient(app).websocket_connect(
+            "/api/plugins/adrian-kanban/events"
+        ):
+            pass
+    assert exc.value.code == 1008
+
+
+def test_dashboard_event_stream_fails_closed_when_authority_resolution_fails(
+    dashboard_module, monkeypatch
+):
+    monkeypatch.setattr(
+        dashboard_module.kanban_db,
+        "resolve_selected_authority",
+        lambda: (_ for _ in ()).throw(RuntimeError("configuration unavailable")),
+    )
+
+    app = FastAPI()
+    app.include_router(dashboard_module.router, prefix="/api/plugins/adrian-kanban")
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with TestClient(app).websocket_connect(
+            "/api/plugins/adrian-kanban/events"
+        ):
+            pass
+    assert exc.value.code == 1008
+
+
+@pytest.mark.parametrize("cursor", ["-1", "not-an-integer"])
+def test_dashboard_event_stream_rejects_invalid_cursor(
+    dashboard_module, monkeypatch, cursor
+):
+    monkeypatch.setattr(
+        dashboard_module.kanban_db,
+        "resolve_selected_authority",
+        lambda: "adrian-kanban",
+    )
+    stub = types.SimpleNamespace(_ws_auth_ok=lambda _ws: True)
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+
+    app = FastAPI()
+    app.include_router(dashboard_module.router, prefix="/api/plugins/adrian-kanban")
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with TestClient(app).websocket_connect(
+            f"/api/plugins/adrian-kanban/events?since={cursor}"
+        ):
+            pass
+    assert exc.value.code == 1008
+
+
+def test_dashboard_event_stream_projects_plugin_commits(
+    dashboard_module, adrian_plugin_modules, tmp_path, monkeypatch
+):
+    database_path = tmp_path / "events.db"
+    _seed_notification_event(database_path, adrian_plugin_modules["schema"])
+    monkeypatch.setattr(
+        dashboard_module.kanban_db,
+        "resolve_selected_authority",
+        lambda: "adrian-kanban",
+    )
+    monkeypatch.setattr(
+        dashboard_module.kanban_db,
+        "resolve_authority_path",
+        lambda: str(database_path),
+    )
+    stub = types.SimpleNamespace(
+        _ws_auth_ok=lambda ws: ws.query_params.get("token") == "event-secret"
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+
+    app = FastAPI()
+    app.include_router(dashboard_module.router, prefix="/api/plugins/adrian-kanban")
+    with TestClient(app).websocket_connect(
+        "/api/plugins/adrian-kanban/events?token=event-secret&since=0"
+    ) as websocket:
+        message = websocket.receive_json()
+
+    assert message == {
+        "events": [
+            {
+                "event_id": 1,
+                "receipt_id": "dashboard-event-receipt",
+                "operation": "kanban_block",
+                "target": "task-event",
+                "committed_at": 123,
+                "committed_records": [
+                    {
+                        "card_type": "task",
+                        "initiative_id": "initiative-event",
+                        "task_id": "task-event",
+                        "record_version": 4,
+                    }
+                ],
+            }
+        ],
+        "cursor": 1,
+    }

@@ -7,14 +7,18 @@ imports or invokes native dashboard handlers or native DB mutators.
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from hermes_cli import kanban_db
 
 from ..versioning import release_identity
+from ..notifications import list_notifications
 
 router = APIRouter()
 
@@ -149,3 +153,77 @@ async def command(operation: str, request: Request):
     except Exception:
         envelope = None
     return _respond(envelope, attempt_id, operation)
+
+
+_EVENT_POLL_SECONDS = 0.25
+
+
+def _ws_upgrade_authorized(ws: WebSocket) -> bool:
+    try:
+        from hermes_cli import web_server
+        return bool(web_server._ws_auth_ok(ws))
+    except Exception:
+        return False
+
+
+def _read_notification_page(cursor: int) -> dict:
+    db_path = Path(kanban_db.resolve_authority_path()).resolve()
+    conn = sqlite3.connect(
+        db_path.as_uri() + "?mode=ro",
+        uri=True,
+        check_same_thread=False,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        return list_notifications(conn, after_event_id=cursor, limit=100)
+    finally:
+        conn.close()
+
+
+@router.websocket("/events")
+async def dashboard_events(websocket: WebSocket) -> None:
+    try:
+        authority = kanban_db.resolve_selected_authority()
+    except Exception:
+        await websocket.close(code=1008)
+        return
+    if authority != "adrian-kanban":
+        await websocket.close(code=1008)
+        return
+
+    if not _ws_upgrade_authorized(websocket):
+        await websocket.close(code=1008)
+        return
+
+    since_raw = websocket.query_params.get("since", "0")
+    try:
+        cursor = int(since_raw)
+    except (TypeError, ValueError):
+        await websocket.close(code=1008)
+        return
+    if cursor < 0:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    try:
+        while True:
+            page = await asyncio.to_thread(_read_notification_page, cursor)
+            if page["events"]:
+                await websocket.send_json({"events": page["events"], "cursor": page["cursor"]})
+                cursor = page["cursor"]
+            try:
+                await asyncio.wait_for(websocket.receive(), timeout=_EVENT_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+    except WebSocketDisconnect:
+        return
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
