@@ -556,11 +556,32 @@ def list_projection(
     init_rows = conn.execute(init_query, init_params).fetchall()
     task_rows = conn.execute(task_query, task_params).fetchall()
 
+    latest_transitions: dict[str, tuple[Any, Any]] = {}
+    for r in init_rows:
+        row = conn.execute(
+            "SELECT to_phase, to_segment_id FROM initiative_transitions WHERE initiative_id = ? ORDER BY transition_id DESC LIMIT 1",
+            (r["initiative_id"],),
+        ).fetchone()
+        if row is not None:
+            latest_transitions[r["initiative_id"]] = (row[0], row[1])
+
+    lifecycle_contracts: dict[Any, tuple[Any, Any, Any]] = {}
+    for r in task_rows:
+        row = conn.execute(
+            "SELECT step, segment_id, workspace_id FROM task_lifecycle_contracts WHERE task_card_id = ? LIMIT 1",
+            (r["id"],),
+        ).fetchone()
+        if row is not None:
+            lifecycle_contracts[r["id"]] = (row[0], row[1], row[2])
+
     initiatives = []
     for r in init_rows:
         d = _row_to_dict(r)
         d["board"] = d.pop("board_slug")
         d.pop("id")
+        trans = latest_transitions.get(r["initiative_id"])
+        d["current_phase"] = trans[0] if trans else None
+        d["current_segment_id"] = trans[1] if trans else None
         initiatives.append(d)
 
     tasks = []
@@ -586,6 +607,10 @@ def list_projection(
         if key in replacement_map:
             replaces_task_id = replacement_map[key].get(d["task_id"])
         d["replaces_task_id"] = replaces_task_id
+        contract = lifecycle_contracts.get(r["id"])
+        d["lifecycle_phase"] = contract[0] if contract else None
+        d["segment_id"] = contract[1] if contract else None
+        d["segment_workspace_id"] = contract[2] if contract else None
         tasks.append(d)
 
     initiatives.sort(key=lambda x: (x["created_at"], x["initiative_id"]))
