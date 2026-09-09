@@ -945,6 +945,9 @@ class _ModelToolRequestNormalizer:
                 workspace_id=workspace_id,
                 execution_context="model-tool",
                 actor_profile=actor_profile.strip(),
+                turn_id=runtime.get("turn_id"),
+                api_request_id=runtime.get("api_request_id"),
+                user_task=runtime.get("user_task"),
                 payload=payload,
             )
         except Exception:
@@ -2948,6 +2951,9 @@ class _CommandContext:
         capability: Any = None,
         binding: Any = None,
         mutation_executor: Any = None,
+        turn_id: str = "",
+        api_request_id: str = "",
+        user_task: str = "",
         known_profiles: frozenset[str] = frozenset(),
         prepared_attachment: PreparedAttachment | None = None,
         idempotency_key: str | None = None,
@@ -2963,6 +2969,9 @@ class _CommandContext:
         self.capability = capability
         self.binding = binding
         self.mutation_executor = mutation_executor
+        self.turn_id = turn_id
+        self.api_request_id = api_request_id
+        self.user_task = user_task
         self.known_profiles = known_profiles
         self.prepared_attachment = prepared_attachment
         self.idempotency_key = idempotency_key
@@ -3125,6 +3134,9 @@ class _CommandBoundary:
         payload = fields.get("payload")
         derive_expected_version = fields.get("derive_expected_version", False)
         actor_profile = fields.get("actor_profile")
+        turn_id = fields.get("turn_id")
+        api_request_id = fields.get("api_request_id")
+        user_task = fields.get("user_task")
 
         if not isinstance(target, str) or not target.strip():
             return self._rejection_internal(
@@ -3366,6 +3378,9 @@ class _CommandBoundary:
                     capability=capability,
                     binding=binding,
                     mutation_executor=adapter,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    user_task=user_task,
                     known_profiles=self._known_profiles,
                     prepared_attachment=prepared_attachment,
                     idempotency_key=idempotency_key,

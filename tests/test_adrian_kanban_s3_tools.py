@@ -364,6 +364,8 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
         rendered = item["handler"](
             supplied,
             session_id="host-session-1",
+            turn_id="host-turn-1",
+            api_request_id="host-api-1",
             task_id="host-top-level-task",
             user_task="trusted host context",
         )
@@ -401,6 +403,9 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
                 "workspace_id": "workspace-1",
                 "actor_profile": "builder",
                 "execution_context": "model-tool",
+                "turn_id": "host-turn-1",
+                "api_request_id": "host-api-1",
+                "user_task": "trusted host context",
                 "payload": fields["payload"],
             }
         assert json.loads(rendered) == {
