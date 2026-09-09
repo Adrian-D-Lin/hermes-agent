@@ -1079,6 +1079,20 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
         return 0
 
+    # Plugin-selected authority: delegate through the shared boundary before
+    # any delegated-child fast-fail, board metadata access, native DB init, or
+    # native handler.
+    try:
+        authority = kb.resolve_selected_authority()
+    except Exception:
+        return _print_authority_rejection(
+            "AUTHORITY_RESOLUTION_FAILED",
+            "cli_" + action.replace("-", "_"),
+            "The selected Kanban authority could not be resolved.",
+        )
+    if authority == "adrian-kanban":
+        return _dispatch_selected_authority_cli(args, action)
+
     # Fast-fail for clearer CLI UX only. The durable trust boundary is lower in
     # hermes_cli.kanban_db, because children can import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
@@ -1260,6 +1274,132 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "rename",
     "set-default-workdir",
 })
+
+
+def _print_authority_rejection(code: str, operation: str, detail: str) -> int:
+    """Render a complete canonical rejection envelope for a plugin-selected
+    CLI/slash invocation that cannot be delegated. Never falls back to native.
+    """
+    import uuid
+
+    response = {
+        "result": "REJECTED",
+        "state_changed": False,
+        "attempt_id": uuid.uuid4().hex,
+        "operation": operation,
+        "boundary": {"from": "adrian-kanban", "to": "adrian-kanban"},
+        "failed_checks": [
+            {
+                "code": code,
+                "target": operation,
+                "expected": "a resolvable adrian-kanban authority boundary",
+                "observed": operation,
+                "accepted_format": "a resolvable adrian-kanban authority boundary",
+                "remediation": "Resolve the selected Kanban authority and retry.",
+                "responsible_actor": "operator",
+                "retry": "same_operation",
+            }
+        ],
+        "not_evaluated_checks": [],
+    }
+    print(json.dumps(response))
+    return 1
+
+
+def _dispatch_selected_authority_cli(args: argparse.Namespace, action: str) -> int:
+    """Delegate a CLI/slash invocation to the selected plugin authority.
+
+    Runs before board metadata access, ``kb.init_db()``, or any native
+    handler. Never falls back to native on discovery or delegation failure.
+    """
+    import uuid
+
+    from hermes_cli import plugins
+
+    normalized_action = action.replace("-", "_")
+    board = getattr(args, "board", None)
+    attempt_id = uuid.uuid4().hex
+
+    try:
+        plugins.discover_plugins()
+    except Exception:
+        return _print_authority_rejection(
+            "AUTHORITY_BOUNDARY_UNAVAILABLE",
+            "cli_" + normalized_action,
+            "Plugin discovery failed; the selected authority boundary is unavailable.",
+        )
+
+    if action in ("list", "ls"):
+        payload: dict = {}
+        if board:
+            payload["board"] = board
+        assignee = getattr(args, "assignee", None)
+        if getattr(args, "mine", False):
+            assignee = _profile_author()
+        if assignee:
+            payload["assignee"] = assignee
+        status = getattr(args, "status", None)
+        if status:
+            payload["status"] = status
+        tenant = getattr(args, "tenant", None)
+        if tenant:
+            payload["tenant"] = tenant
+        if getattr(args, "archived", False):
+            payload["include_archived"] = True
+        unsupported = {
+            "session": getattr(args, "session", None),
+            "sort": getattr(args, "sort", None),
+            "workflow_template_id": getattr(args, "workflow_template_id", None),
+            "current_step_key": getattr(args, "current_step_key", None),
+        }
+        unsupported = {k: v for k, v in unsupported.items() if v}
+        if unsupported:
+            operation = "cli_list"
+            payload = {"action": "list", "board": board, **unsupported}
+        else:
+            operation = "kanban_list"
+    elif action in ("show", "attachments"):
+        task_id = getattr(args, "task_id", None)
+        payload = {"task_id": task_id}
+        if board:
+            payload["board"] = board
+        if action == "show":
+            unsupported = {
+                "state_type": getattr(args, "state_type", None),
+                "state_name": getattr(args, "state_name", None),
+            }
+            unsupported = {k: v for k, v in unsupported.items() if v}
+            if unsupported:
+                operation = "cli_show"
+                payload = {"action": "show", "task_id": task_id, "board": board, **unsupported}
+            else:
+                operation = "kanban_show"
+        else:
+            operation = "kanban_attachments"
+    else:
+        operation = "cli_" + normalized_action
+        payload = {
+            "action": action,
+            "board": board,
+            "args": {
+                k: v
+                for k, v in vars(args).items()
+                if not k.startswith("_") and k not in ("kanban_action", "board")
+            },
+        }
+
+    try:
+        response = kb.delegate_authority_operation(
+            operation, payload=payload, attempt_id=attempt_id
+        )
+    except Exception:
+        return _print_authority_rejection(
+            "AUTHORITY_BOUNDARY_UNAVAILABLE",
+            operation,
+            "Delegation to the selected authority boundary failed.",
+        )
+    print(json.dumps(response))
+    return 0 if response.get("result") == "ACCEPTED" else 1
 
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
