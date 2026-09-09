@@ -524,6 +524,51 @@ CREATE TABLE IF NOT EXISTS initiative_generated_comments (
     FOREIGN KEY (initiative_card_id, initiative_id)
         REFERENCES adrian_kanban_cards (id, initiative_id)
 );
+
+-- Durable task gate-override execution record. One row per accepted task
+-- override request; the request/approval/mutation identities are each globally
+-- unique. The movement basis and result are pinned to the gate-override
+-- constants so a row with any other meaning is rejected at the schema level.
+CREATE TABLE IF NOT EXISTS task_gate_override_records (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    approval_id TEXT NOT NULL UNIQUE,
+    mutation_id TEXT NOT NULL UNIQUE,
+    initiative_card_id INTEGER NOT NULL,
+    initiative_id TEXT NOT NULL,
+    task_card_id INTEGER NOT NULL,
+    task_id TEXT NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    override_authority_ref TEXT NOT NULL,
+    override_reason TEXT NOT NULL,
+    unsatisfied_gates TEXT NOT NULL,
+    movement_basis TEXT NOT NULL CHECK (movement_basis = 'adrian_gate_override'),
+    result TEXT NOT NULL CHECK (result = 'accepted_with_active_decision'),
+    actor_evidence TEXT NOT NULL,
+    canonical_payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (initiative_card_id, initiative_id)
+        REFERENCES adrian_kanban_cards (id, initiative_id),
+    FOREIGN KEY (task_card_id, task_id)
+        REFERENCES adrian_kanban_cards (id, task_id)
+);
+
+-- Active decision record for a task. One row per decision; the authority
+-- reference is globally unique. The decision kind is pinned to the
+-- gate-override constant and the active flag is constrained to 0/1.
+CREATE TABLE IF NOT EXISTS task_active_decisions (
+    decision_id TEXT PRIMARY KEY NOT NULL,
+    task_card_id INTEGER NOT NULL,
+    task_id TEXT NOT NULL,
+    initiative_id TEXT NOT NULL,
+    decision_kind TEXT NOT NULL CHECK (decision_kind = 'adrian_gate_override'),
+    authority_ref TEXT NOT NULL UNIQUE,
+    canonical_payload TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (task_card_id, task_id)
+        REFERENCES adrian_kanban_cards (id, task_id)
+);
 """
 
 
