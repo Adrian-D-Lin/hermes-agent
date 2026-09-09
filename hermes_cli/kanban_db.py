@@ -3562,6 +3562,46 @@ def ensure_admitted(operation: str, *, db_path: Optional[str] = None) -> bool:
     return admitted
 
 
+def delegate_authority_operation(operation: str, **fields) -> dict:
+    """Delegate a cross-surface operation to the selected authority boundary.
+
+    Requires the ``adrian-kanban`` authority to be selected; any native or
+    unknown selection fails closed with :class:`AuthorityAdmissionRejected`
+    without running native behavior. Resolves the configured absolute
+    authority DB path, requires the registered healthy compatible provider,
+    and calls its ``submit_operation`` method exactly once. The result is
+    returned only when it is exactly a ``dict``; an unavailable method, a
+    provider exception, or a non-dict result fails closed with
+    :class:`AuthorityAdmissionRejected`.
+    """
+    if resolve_selected_authority() != AUTHORITY_ADRIAN_KANBAN:
+        raise AuthorityAdmissionRejected(
+            "selected authority is not adrian-kanban; cross-surface "
+            "delegation fails closed (no native fallback)"
+        )
+    required_path = resolve_authority_path()
+    provider = _require_admitted_provider(required_path)
+    submit = getattr(provider, "submit_operation", None)
+    if not callable(submit):
+        raise AuthorityAdmissionRejected(
+            "command boundary is unavailable; cross-surface delegation "
+            "fails closed (no native fallback)"
+        )
+    try:
+        result = submit(operation, **fields)
+    except Exception:
+        raise AuthorityAdmissionRejected(
+            "command boundary is unavailable; cross-surface delegation "
+            "fails closed (no native fallback)"
+        )
+    if type(result) is not dict:
+        raise AuthorityAdmissionRejected(
+            "invalid command response; cross-surface delegation fails "
+            "closed (no native fallback)"
+        )
+    return result
+
+
 def _sqlite_main_connection_file(conn: sqlite3.Connection) -> Optional[str]:
     """Return the on-disk file of the ``main`` connection from PRAGMA.
 

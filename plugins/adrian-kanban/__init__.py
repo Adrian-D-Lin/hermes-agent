@@ -83,7 +83,6 @@ def register(ctx) -> None:
     else:
         provider = AdrianKanbanAuthorityProvider(database_path)
         _provider_cache[database_path] = provider
-    register_provider(provider)
     preparer = GitTaskInputPreparer()
     segment_preparer = GitSegmentManifestPreparer(_trusted_repository_ids_getter)
     handlers = {
@@ -106,23 +105,27 @@ def register(ctx) -> None:
         "kanban_transition_initiative": _handle_transition_initiative,
         "kanban_close_initiative": _handle_close_initiative,
     }
-    boundary = _CommandBoundary(
-        database_path=database_path,
-        provider=provider,
-        handlers=handlers,
-        state_resolver=resolve_expected_version,
-        known_profiles=frozenset(
-            {
-                "default",
-                "independent-reviewer",
-                "test-authority-reviewer",
-                "builder-tester",
-            }
-        ),
-        task_input_preparer=preparer,
-        segment_manifest_preparer=segment_preparer,
-        phase_result_preparer=GitPhaseResultPreparer(),
-    )
+    boundary = provider.command_boundary
+    if boundary is None:
+        boundary = _CommandBoundary(
+            database_path=database_path,
+            provider=provider,
+            handlers=handlers,
+            state_resolver=resolve_expected_version,
+            known_profiles=frozenset(
+                {
+                    "default",
+                    "independent-reviewer",
+                    "test-authority-reviewer",
+                    "builder-tester",
+                }
+            ),
+            task_input_preparer=preparer,
+            segment_manifest_preparer=segment_preparer,
+            phase_result_preparer=GitPhaseResultPreparer(),
+        )
+        provider.bind_command_boundary(boundary)
+        register_provider(provider)
     register_public_tools(
         ctx,
         boundary,
