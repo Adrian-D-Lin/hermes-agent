@@ -483,6 +483,76 @@ def test_list_is_plugin_authoritative_and_limits_the_combined_order(
     assert limited["value"]["count"] == 1
 
 
+def test_list_exposes_authoritative_lifecycle_coordinates(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    initiative_card_id, task_card_id = _seed_cards(database_path)
+    with sqlite3.connect(database_path, isolation_level=None) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO initiative_transitions "
+            "(initiative_card_id, initiative_id, previous_transition_id, "
+            "transition_id, from_phase, from_segment_id, to_phase, to_segment_id, "
+            "canon_route, actor_evidence, canonical_payload, created_at) "
+            "VALUES (?, 'initiative-read', NULL, 1, 'DEV1', NULL, 'DEV2', 'S1', "
+            "'DEV2', '{}', '{}', 1100)",
+            (initiative_card_id,),
+        )
+        conn.execute(
+            "INSERT INTO initiative_segment_projections "
+            "(projection_id, projection_version, initiative_card_id, initiative_id, "
+            "manifest_path, manifest_sha, content_digest, parsed_segment_definitions, "
+            "readiness_refs, validation_result, projected_at) "
+            "VALUES ('projection-list', 1, ?, 'initiative-read', "
+            "'2-design/segments.json', ?, ?, '[{\"segment_id\":\"S1\"}]', "
+            "'[\"ready:S1\"]', 'accepted', 1100)",
+            (initiative_card_id, "c" * 40, "d" * 64),
+        )
+        conn.execute(
+            "INSERT INTO segment_workspaces "
+            "(workspace_id, initiative_card_id, initiative_id, segment_id, "
+            "projection_id, lifecycle_state, controller_binding_ref, active, "
+            "created_at, updated_at) VALUES ('workspace-s1', ?, "
+            "'initiative-read', 'S1', 'projection-list', 'materialized', "
+            "'binding-list', 1, 1100, 1100)",
+            (initiative_card_id,),
+        )
+        conn.execute(
+            "INSERT INTO task_lifecycle_contracts "
+            "(contract_id, contract_version, step, task_card_id, task_id, "
+            "initiative_card_id, initiative_id, segment_id, workspace_id, "
+            "execution_profile, canonical_contract_payload, registry_hash, "
+            "skill_id, skill_version, skill_hash, created_at) "
+            "VALUES ('contract-dev2', '1', 'DEV2', ?, 'task-read', ?, "
+            "'initiative-read', 'S1', 'workspace-s1', 'builder-tester', '{}', ?, "
+            "'dev2-skill', '1', ?, 1101)",
+            (task_card_id, initiative_card_id, "f" * 64, "1" * 64),
+        )
+
+    boundary = _read_boundary(
+        commands_module,
+        database_path,
+        provider,
+        {"kanban_list": commands_module._handle_list},
+    )
+    result = boundary.submit(
+        "kanban_list",
+        attempt_id="list-lifecycle-coordinates",
+        payload={"board": "orchestrator"},
+    )
+
+    assert result["result"] == "ACCEPTED"
+    initiative = result["value"]["initiatives"][0]
+    assert initiative["current_phase"] == "DEV2"
+    assert initiative["current_segment_id"] == "S1"
+    task = result["value"]["tasks"][0]
+    assert task["lifecycle_phase"] == "DEV2"
+    assert task["segment_id"] == "S1"
+    assert task["segment_workspace_id"] == "workspace-s1"
+    assert task["status"] == "ready"
+
+
 def test_url_preparation_rejects_http_and_private_hosts_without_network(
     commands_module, monkeypatch
 ):
