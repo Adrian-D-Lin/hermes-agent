@@ -27,6 +27,7 @@ from fastapi import (
     APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from uuid import uuid4
 
 from hermes_cli import kanban_db
 from hermes_cli.web_read_coalescing import coalesced_read
