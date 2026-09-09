@@ -256,6 +256,11 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+        try:
+            _kb.require_native_mutation_authority("native_gateway_notifications")
+        except _kb.AuthorityAdmissionRejected as exc:
+            logger.info("kanban notifier: disabled by selected authority: %s", exc)
+            return
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
@@ -1289,6 +1294,17 @@ class GatewayKanbanWatchersMixin:
         in-flight ``to_thread`` returns on its own after the current
         ``dispatch_once`` call finishes (typically <1ms on an idle board).
         """
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+            return
+        try:
+            _kb.require_native_mutation_authority("native_gateway_dispatch")
+        except _kb.AuthorityAdmissionRejected as exc:
+            logger.info("kanban dispatcher: disabled by selected authority: %s", exc)
+            return
+
         # Read config once at boot. If the user flips the flag later, they
         # restart the gateway; same pattern as every other background
         # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
@@ -1313,12 +1329,6 @@ class GatewayKanbanWatchersMixin:
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
-            return
-
-        try:
-            from hermes_cli import kanban_db as _kb
-        except Exception:
-            logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a

@@ -281,6 +281,10 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
+    try:
+        kb.require_native_mutation_authority("kanban_decompose")
+    except kb.AuthorityAdmissionRejected as exc:
+        return DecomposeOutcome(task_id, False, str(exc))
     if not kb.can_exit_triage():
         return DecomposeOutcome(
             task_id, False,

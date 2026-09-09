@@ -3514,6 +3514,27 @@ class AuthorityAdmissionRejected(Exception):
         super().__init__(f"[{authority}] mutation rejected: {reason}")
 
 
+def require_native_mutation_authority(operation: str) -> None:
+    """Reject a legacy native mutation while replacement authority is selected."""
+    if type(operation) is not str or not operation.strip():
+        raise AuthorityAdmissionRejected(
+            f"{operation!r} is not a recognized Kanban mutation"
+        )
+    operation = operation.strip()
+    try:
+        authority = resolve_selected_authority()
+    except Exception:
+        raise AuthorityAdmissionRejected(
+            f"{operation} is not a recognized Kanban mutation because the "
+            "selected authority could not be resolved"
+        ) from None
+    if authority == AUTHORITY_ADRIAN_KANBAN:
+        raise AuthorityAdmissionRejected(
+            f"{operation} is not a recognized Kanban mutation under "
+            "adrian-kanban authority"
+        )
+
+
 def _require_admitted_provider(db_path: Optional[str]) -> object:
     """Return a healthy, interface-compatible provider or raise.
 

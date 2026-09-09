@@ -152,6 +152,10 @@ def specify_task(
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
+    try:
+        kb.require_native_mutation_authority("kanban_specify")
+    except kb.AuthorityAdmissionRejected as exc:
+        return SpecifyOutcome(task_id, False, str(exc))
     if not kb.can_exit_triage():
         return SpecifyOutcome(
             task_id, False,

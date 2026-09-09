@@ -1750,6 +1750,12 @@ def _handle_link(args: dict, **kw) -> str:
 
 def _handle_specify(args: dict, **kw) -> str:
     """Accept and specify a triage proposal (configured dispatcher orchestrator only)."""
+    from hermes_cli import kanban_db as kb
+
+    try:
+        kb.require_native_mutation_authority("kanban_specify")
+    except kb.AuthorityAdmissionRejected as exc:
+        return tool_error(f"kanban_specify: {exc}")
     guard = _require_dispatcher_orchestrator("kanban_specify")
     if guard:
         return guard
@@ -1781,6 +1787,12 @@ def _handle_specify(args: dict, **kw) -> str:
 
 def _handle_decompose(args: dict, **kw) -> str:
     """Accept and fan out a triage proposal (configured dispatcher orchestrator only)."""
+    from hermes_cli import kanban_db as kb
+
+    try:
+        kb.require_native_mutation_authority("kanban_decompose")
+    except kb.AuthorityAdmissionRejected as exc:
+        return tool_error(f"kanban_decompose: {exc}")
     guard = _require_dispatcher_orchestrator("kanban_decompose")
     if guard:
         return guard

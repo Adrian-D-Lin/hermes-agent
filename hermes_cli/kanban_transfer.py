@@ -395,6 +395,7 @@ def import_board(
     slug auto-suffixes if it is taken, so an import never merges into or
     overwrites an existing board.
     """
+    kb.require_native_mutation_authority("kanban_transfer_import")
     archive = Path(archive_path).expanduser()
     if not archive.exists():
         raise FileNotFoundError(f"archive not found: {archive}")
