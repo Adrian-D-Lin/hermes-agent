@@ -39,8 +39,12 @@ from .handoffs import (
 from .initiative_mutations import (
     _handle_close_initiative,
     _handle_create_initiative,
-    _handle_transition_initiative,
+    _handle_transition_initiative as _ordinary_handle_transition_initiative,
     _handle_update_initiative,
+)
+from .initiative_override import (
+    execute_approved_initiative_transition_override,
+    prepare_initiative_transition_override,
 )
 from .lifecycle import LifecycleContractRepository
 from .output_validators import (
@@ -784,14 +788,40 @@ TOOL_SCHEMAS: dict[str, Any] = {
                     "type": "string",
                     "description": "Optional board scope for the write.",
                 },
+                "gate_override": {
+                    "type": "object",
+                    "description": (
+                        "Optional Adrian gate-override declaration. When present, "
+                        "the transition is prepared for a distinct host approval "
+                        "instead of an ordinary phase_close transition."
+                    ),
+                    "properties": {
+                        "override_reason": {
+                            "type": "string",
+                            "description": (
+                                "Exact nonblank reason justifying the gate override."
+                            ),
+                        },
+                    },
+                    "required": ["override_reason"],
+                    "additionalProperties": False,
+                },
             },
             "required": [
                 "initiative_id",
                 "to_phase",
                 "reconciliation_ref",
-                "phase_close_ref",
-                "approval_id",
                 "idempotency_key",
+            ],
+            "oneOf": [
+                {
+                    "required": ["phase_close_ref", "approval_id"],
+                    "not": {"required": ["gate_override"]},
+                },
+                {
+                    "required": ["gate_override"],
+                    "not": {"required": ["phase_close_ref", "approval_id"]},
+                },
             ],
             "additionalProperties": False,
         },
@@ -2750,6 +2780,111 @@ def _handle_heartbeat(context: Any) -> dict[str, Any]:
     return {"task_id": task_id, "heartbeat": True}
 
 
+def _handle_transition_initiative(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    if "_approved_gate_override_request_id" in payload:
+        unknown = set(payload.keys()) - {
+            "_approved_gate_override_request_id",
+            "initiative_id",
+            "board",
+        }
+        if unknown:
+            raise ValueError(f"unknown fields: {sorted(unknown)}")
+        request_id = payload["_approved_gate_override_request_id"]
+        initiative_id = payload["initiative_id"]
+        board = payload["board"]
+        for field_name, value in (
+            ("_approved_gate_override_request_id", request_id),
+            ("initiative_id", initiative_id),
+            ("board", board),
+        ):
+            if not (type(value) is str and value.strip()):
+                raise ValueError(f"{field_name} must be a nonblank string")
+        override_now = context.override_now
+        if (
+            type(override_now) is not int
+            or isinstance(override_now, bool)
+            or override_now <= 0
+        ):
+            raise ValueError("override_now must be a positive integer")
+        return execute_approved_initiative_transition_override(
+            context.connection,
+            request_id=request_id.strip(),
+            executor_session_id=context.binding.session_id,
+            executor_profile=context.binding.actor_profile,
+            mutation_id=f"override-mutation:{request_id.strip()}",
+            idempotency_key=context.idempotency_key,
+            now=override_now,
+        )
+    if "gate_override" in payload:
+        unknown = set(payload.keys()) - {
+            "initiative_id",
+            "to_phase",
+            "to_segment_id",
+            "reconciliation_ref",
+            "gate_override",
+            "board",
+        }
+        if unknown:
+            raise ValueError(f"unknown fields: {sorted(unknown)}")
+        initiative_id = payload["initiative_id"]
+        to_phase = payload["to_phase"]
+        to_segment_id = payload.get("to_segment_id")
+        reconciliation_ref = payload["reconciliation_ref"]
+        gate_override = payload["gate_override"]
+        board = payload["board"]
+        for field_name, value in (
+            ("initiative_id", initiative_id),
+            ("to_phase", to_phase),
+            ("reconciliation_ref", reconciliation_ref),
+            ("board", board),
+        ):
+            if not (type(value) is str and value.strip()):
+                raise ValueError(f"{field_name} must be a nonblank string")
+        if to_segment_id is not None and not (
+            type(to_segment_id) is str and to_segment_id.strip()
+        ):
+            raise ValueError("to_segment_id must be None or a nonblank string")
+        if type(gate_override) is not dict:
+            raise ValueError("gate_override must be an object")
+        if set(gate_override.keys()) != {"override_reason"}:
+            raise ValueError("gate_override must contain exactly override_reason")
+        override_reason = gate_override["override_reason"]
+        if not (type(override_reason) is str and override_reason.strip()):
+            raise ValueError("override_reason must be a nonblank string")
+        if not (type(context.turn_id) is str and context.turn_id.strip()):
+            raise ValueError("turn_id must be a nonblank string")
+        if not (type(context.user_task) is str and context.user_task.strip()):
+            raise ValueError("user_task must be a nonblank string")
+        if context.initial_authorizer is None:
+            raise ValueError("initial_authorizer is required")
+        override_now = context.override_now
+        if (
+            type(override_now) is not int
+            or isinstance(override_now, bool)
+            or override_now <= 0
+        ):
+            raise ValueError("override_now must be a positive integer")
+        return prepare_initiative_transition_override(
+            context.connection,
+            initial_authorizer=context.initial_authorizer,
+            initial_session_id=context.binding.session_id,
+            initial_message_id=context.turn_id.strip(),
+            initial_quote=context.user_task,
+            executor_session_id=context.binding.session_id,
+            executor_profile=context.binding.actor_profile,
+            initiative_id=initiative_id.strip(),
+            board=board.strip(),
+            to_phase=to_phase.strip(),
+            to_segment_id=to_segment_id.strip() if to_segment_id is not None else None,
+            reconciliation_ref=reconciliation_ref.strip(),
+            override_reason=override_reason.strip(),
+            now=override_now,
+            expires_at=override_now + 300,
+        )
+    return _ordinary_handle_transition_initiative(context)
+
+
 def register_public_tools(
     ctx: Any,
     boundary: Any,
@@ -2961,6 +3096,8 @@ class _CommandContext:
         prepared_segment_manifest: PreparedSegmentManifest | None = None,
         prepared_successor_manifest: PreparedManifest | None = None,
         prepared_phase_result: Any = None,
+        initial_authorizer: Any = None,
+        override_now: Any = None,
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -2979,6 +3116,8 @@ class _CommandContext:
         self.prepared_segment_manifest = prepared_segment_manifest
         self.prepared_successor_manifest = prepared_successor_manifest
         self.prepared_phase_result = prepared_phase_result
+        self.initial_authorizer = initial_authorizer
+        self.override_now = override_now
 
 
 class _CommandBoundary:
@@ -3388,6 +3527,8 @@ class _CommandBoundary:
                     prepared_segment_manifest=prepared_segment_manifest,
                     prepared_successor_manifest=prepared_successor_manifest,
                     prepared_phase_result=prepared_phase_result,
+                    initial_authorizer=fields.get("initial_authorizer"),
+                    override_now=fields.get("override_now"),
                 )
                 try:
                     result = handler(context)
