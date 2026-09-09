@@ -1007,10 +1007,58 @@ class _ModelToolRequestNormalizer:
                 )
                 if preparation.get("result") != "ACCEPTED":
                     return preparation
+                prepared_value = preparation["value"]
+                override_state = self._boundary.override_approval_state(
+                    {
+                        "request_id": prepared_value["request_id"],
+                        "approval_id": prepared_value["approval_id"],
+                        "canonical_payload": prepared_value["canonical_payload"],
+                        "canonical_digest": prepared_value["canonical_digest"],
+                    }
+                )
+                if override_state in ("approved", "consumed"):
+                    return self._boundary.submit(
+                        operation,
+                        attempt_id=f"{preparation['attempt_id']}:execute",
+                        idempotency_key=f"{idempotency_key}:execute",
+                        target=target,
+                        derive_expected_version=True,
+                        session_id=session_id.strip(),
+                        workspace_id=workspace_id,
+                        execution_context="model-tool",
+                        actor_profile=actor_profile.strip(),
+                        turn_id=turn_id,
+                        api_request_id=runtime.get("api_request_id"),
+                        user_task=user_task,
+                        payload={
+                            "initiative_id": payload["initiative_id"],
+                            "board": board,
+                            "_approved_gate_override_request_id": prepared_value[
+                                "request_id"
+                            ],
+                        },
+                        override_now=int(time.time()),
+                    )
+                if override_state in ("cancelled", "expired"):
+                    return {
+                        "result": "REJECTED",
+                        "state_changed": False,
+                        "attempt_id": preparation.get("attempt_id"),
+                        "operation": operation,
+                        "value": {
+                            "request_id": prepared_value.get("request_id"),
+                            "canonical_digest": prepared_value.get(
+                                "canonical_digest"
+                            ),
+                            "override_state": "cancelled",
+                        },
+                    }
+                if override_state != "prepared":
+                    raise ValueError(f"unexpected override approval state: {override_state}")
                 approval = present_and_record_override_approval(
                     self._boundary.database_path,
                     initial_authorizer=evidence,
-                    prepared=preparation["value"],
+                    prepared=prepared_value,
                     session_key=session_id.strip(),
                     now=int(time.time()),
                 )
@@ -1021,8 +1069,8 @@ class _ModelToolRequestNormalizer:
                         "attempt_id": preparation.get("attempt_id"),
                         "operation": operation,
                         "value": {
-                            "request_id": preparation["value"].get("request_id"),
-                            "canonical_digest": preparation["value"].get(
+                            "request_id": prepared_value.get("request_id"),
+                            "canonical_digest": prepared_value.get(
                                 "canonical_digest"
                             ),
                             "override_state": "cancelled",
@@ -3254,6 +3302,51 @@ class _CommandBoundary:
     @property
     def database_path(self) -> str:
         return self._database_path
+
+    def override_approval_state(self, prepared: Any) -> str:
+        if type(prepared) is not dict:
+            raise ValueError("prepared must be a dict")
+        required = {
+            "request_id",
+            "approval_id",
+            "canonical_payload",
+            "canonical_digest",
+        }
+        if set(prepared.keys()) != required:
+            raise ValueError("prepared must contain exactly the override keys")
+        request_id = prepared["request_id"]
+        approval_id = prepared["approval_id"]
+        canonical_payload = prepared["canonical_payload"]
+        canonical_digest = prepared["canonical_digest"]
+        for field_name, value in (
+            ("request_id", request_id),
+            ("approval_id", approval_id),
+            ("canonical_payload", canonical_payload),
+            ("canonical_digest", canonical_digest),
+        ):
+            if not (type(value) is str and value.strip()):
+                raise ValueError(f"{field_name} must be a nonblank string")
+        conn = sqlite3.connect(self._database_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT a.state FROM gate_override_proposals p "
+                "JOIN write_gate_kanban_approvals a ON a.approval_id = p.approval_id "
+                "WHERE p.request_id = ? AND a.approval_id = ? "
+                "AND p.canonical_payload = ? AND p.canonical_digest = ?",
+                (request_id, approval_id, canonical_payload, canonical_digest),
+            ).fetchall()
+            if len(rows) != 1:
+                raise ValueError(
+                    "expected exactly one override approval row, "
+                    f"found {len(rows)}"
+                )
+            state = rows[0]["state"]
+            if not (type(state) is str and state.strip()):
+                raise ValueError("override approval state must be a nonblank string")
+            return state
+        finally:
+            conn.close()
 
     def submit(self, action: str, **fields: Any) -> dict[str, Any]:
         return self._finish_response(self._submit_without_audit(action, **fields))

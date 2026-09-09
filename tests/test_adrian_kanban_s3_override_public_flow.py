@@ -183,6 +183,88 @@ def test_denial_cancels_preparation_without_moving_initiative(public_case):
         assert conn.execute("SELECT COUNT(*) FROM gate_override_records").fetchone()[0] == 0
 
 
+def test_exact_replay_returns_saved_execution_without_presenting_again(public_case):
+    path, normalizer, commands_module, monkeypatch = public_case
+    calls = []
+
+    def approve(database_path, *, initial_authorizer, prepared, session_key, now):
+        calls.append(prepared["request_id"])
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            KanbanInitiativeApprovalHost(initial_authorizer).approve_distinct(
+                conn,
+                prepared["approval_id"],
+                evidence("approval-click-1", now),
+                expected_request_id=prepared["request_id"],
+                expected_canonical_digest=prepared["canonical_digest"],
+                approval_quote="Approve this exact gate override.",
+                now=now,
+            )
+            conn.commit()
+        return {"approved": True}
+
+    monkeypatch.setattr(commands_module, "present_and_record_override_approval", approve)
+    first = normalizer.submit("kanban_transition_initiative", _args(), _runtime())
+    second = normalizer.submit("kanban_transition_initiative", _args(), _runtime())
+
+    assert second == first
+    assert calls == ["kanban-gate-override:turn-1"]
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM gate_override_records").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM initiative_transitions").fetchone()[0] == 2
+
+
+def test_approved_interruption_resumes_execution_without_second_prompt(public_case):
+    path, normalizer, commands_module, monkeypatch = public_case
+    calls = []
+
+    def approve_then_interrupt(
+        database_path, *, initial_authorizer, prepared, session_key, now
+    ):
+        calls.append(prepared["request_id"])
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            KanbanInitiativeApprovalHost(initial_authorizer).approve_distinct(
+                conn,
+                prepared["approval_id"],
+                evidence("approval-click-1", now),
+                expected_request_id=prepared["request_id"],
+                expected_canonical_digest=prepared["canonical_digest"],
+                approval_quote="Approve this exact gate override.",
+                now=now,
+            )
+            conn.commit()
+        raise RuntimeError("simulated interruption after durable approval")
+
+    monkeypatch.setattr(
+        commands_module,
+        "present_and_record_override_approval",
+        approve_then_interrupt,
+    )
+    interrupted = normalizer.submit(
+        "kanban_transition_initiative", _args(), _runtime()
+    )
+    assert interrupted["result"] == "REJECTED"
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT state FROM write_gate_kanban_approvals").fetchone()[0] == "approved"
+        assert conn.execute("SELECT COUNT(*) FROM gate_override_records").fetchone()[0] == 0
+
+    monkeypatch.setattr(
+        commands_module,
+        "present_and_record_override_approval",
+        lambda *args, **kwargs: pytest.fail("approved replay must not prompt again"),
+    )
+    resumed = normalizer.submit("kanban_transition_initiative", _args(), _runtime())
+
+    assert resumed["result"] == "ACCEPTED", resumed
+    assert calls == ["kanban-gate-override:turn-1"]
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT state FROM write_gate_kanban_approvals").fetchone()[0] == "consumed"
+        assert conn.execute("SELECT COUNT(*) FROM gate_override_records").fetchone()[0] == 1
+
+
 @pytest.mark.parametrize(
     "args,runtime",
     [
