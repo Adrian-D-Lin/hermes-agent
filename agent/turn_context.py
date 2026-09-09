@@ -785,6 +785,9 @@ def build_turn_context(
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
+    agent._current_user_instruction = (
+        original_user_message if isinstance(original_user_message, str) else None
+    )
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False

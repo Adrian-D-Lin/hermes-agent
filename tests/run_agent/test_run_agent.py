@@ -1708,6 +1708,38 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_sequential_tool_receives_exact_current_user_instruction(self, agent):
+        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        agent._current_user_instruction = "Exact user instruction, unchanged."
+
+        with patch("run_agent.handle_function_call", return_value="ok") as dispatch:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert dispatch.call_args.kwargs["user_task"] == (
+            "Exact user instruction, unchanged."
+        )
+
+    def test_concurrent_invoke_tool_receives_exact_current_user_instruction(self, agent):
+        agent._current_user_instruction = "Exact concurrent instruction."
+
+        with patch("run_agent.handle_function_call", return_value="ok") as dispatch:
+            result = agent._invoke_tool(
+                "web_search",
+                {"q": "test"},
+                "task-1",
+                "call-1",
+                pre_tool_block_checked=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert result == "ok"
+        assert dispatch.call_args.kwargs["user_task"] == (
+            "Exact concurrent instruction."
+        )
+
     def test_sequential_tool_calls_run_without_delay(self, agent):
         """Two sequential tool calls execute back-to-back with no sleep between them."""
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

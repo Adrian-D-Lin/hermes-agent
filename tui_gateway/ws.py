@@ -30,8 +30,10 @@ import logging
 import socket
 import threading
 import time
+import uuid
 from typing import Any
 
+from gateway import trusted_authorizer_evidence as trusted
 from tui_gateway import server
 from tui_gateway.event_replay import replay_epoch
 
@@ -92,6 +94,7 @@ class WSTransport:
         *,
         peer: str = "unknown",
         auth_identity: dict | None = None,
+        authenticated_tailscale_peer: Any = None,
     ) -> None:
         self._ws = ws
         self._loop = loop
@@ -104,6 +107,7 @@ class WSTransport:
         #: never populate this: it is the only identity authority for
         #: browser-controller registration.
         self.auth_identity = auth_identity
+        self._authenticated_tailscale_peer = authenticated_tailscale_peer
         self._closed = False
         self._last_inbound_at = time.monotonic()
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
@@ -351,11 +355,26 @@ async def handle_ws(
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
+        authenticated_tailscale_peer = None
+        client = getattr(ws, "client", None)
+        peer_host = getattr(client, "host", None)
+        if isinstance(peer_host, str):
+            try:
+                authenticated_tailscale_peer = await asyncio.to_thread(
+                    trusted._authenticate_tailscale_peer,
+                    peer_host,
+                    connection_id=uuid.uuid4().hex,
+                    authenticated_at=int(time.time()),
+                )
+            except Exception:
+                authenticated_tailscale_peer = None
+
         transport = WSTransport(
             ws,
             asyncio.get_running_loop(),
             peer=peer,
             auth_identity=auth_identity,
+            authenticated_tailscale_peer=authenticated_tailscale_peer,
         )
 
         # resolve_skin() reads config + initializes the skin engine —

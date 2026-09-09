@@ -1548,6 +1548,9 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        user_task=user_task,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1556,6 +1559,8 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

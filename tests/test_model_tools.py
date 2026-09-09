@@ -30,6 +30,30 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_registry_receives_host_owned_turn_fields(self):
+        """Plugin handlers receive host runtime facts outside model arguments."""
+        with patch("model_tools.registry.dispatch", return_value='{"ok":true}') as dispatch:
+            result = handle_function_call(
+                "kanban_transition_initiative",
+                {},
+                task_id="task-1",
+                session_id="session-1",
+                turn_id="turn-1",
+                api_request_id="turn-1:api:1",
+                user_task="Move initiative INIT-1 to DEV2 segment S1.",
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert result == '{"ok":true}'
+        assert dispatch.call_args.kwargs["session_id"] == "session-1"
+        assert dispatch.call_args.kwargs["turn_id"] == "turn-1"
+        assert dispatch.call_args.kwargs["api_request_id"] == "turn-1:api:1"
+        assert dispatch.call_args.kwargs["user_task"] == (
+            "Move initiative INIT-1 to DEV2 segment S1."
+        )
+
 
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
