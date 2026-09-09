@@ -47,8 +47,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
+from uuid import uuid4
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -56,6 +58,75 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _native_dashboard_suppression_envelope(code: str, method: str, path: str) -> dict:
+    """Build the canonical rendering-neutral rejection envelope for the
+    native-dashboard suppression guard."""
+    return {
+        "result": "REJECTED",
+        "state_changed": False,
+        "attempt_id": str(uuid4()),
+        "operation": f"{method} {path}",
+        "target": f"{method} {path}",
+        "boundary": {
+            "from": "native-kanban-dashboard",
+            "to": "adrian-kanban",
+        },
+        "failed_checks": [
+            {
+                "code": code,
+                "target": f"{method} {path}",
+                "expected": "native authority selected",
+                "observed": "adrian-kanban authority selected",
+                "accepted_format": "native-kanban-dashboard -> adrian-kanban",
+                "remediation": "Use the adrian-kanban plugin dashboard instead of the native surface.",
+                "responsible_actor": "operator",
+                "retry": "use_plugin_surface",
+            }
+        ],
+        "not_evaluated_checks": [],
+    }
+
+
+class _NativeDashboardGuardRoute(APIRoute):
+    """APIRoute subclass that fail-closes non-safe native dashboard mutations
+    when the adrian-kanban authority is selected."""
+
+    _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def guarded_handler(request):
+            method = request.method.upper()
+            if method not in self._SAFE_METHODS:
+                try:
+                    authority = kanban_db.resolve_selected_authority()
+                except Exception:
+                    envelope = _native_dashboard_suppression_envelope(
+                        "AUTHORITY_RESOLUTION_FAILED",
+                        method,
+                        request.url.path,
+                    )
+                    return JSONResponse(
+                        status_code=409, content=envelope
+                    )
+                if authority == "adrian-kanban":
+                    envelope = _native_dashboard_suppression_envelope(
+                        "NATIVE_SURFACE_SUPPRESSED",
+                        method,
+                        request.url.path,
+                    )
+                    return JSONResponse(
+                        status_code=409, content=envelope
+                    )
+            return await original_handler(request)
+
+        return guarded_handler
+
+
+router.route_class = _NativeDashboardGuardRoute
 
 
 def _human_dashboard_route(handler):
@@ -3011,6 +3082,14 @@ async def stream_events(ws: WebSocket):
     # single-use ticket / server-internal credential). Browsers can't set
     # Authorization on a WS upgrade, so the credential rides in the query
     # string — the browser SDK's buildWsUrl() assembles it.
+    try:
+        _authority = kanban_db.resolve_selected_authority()
+    except Exception:
+        await ws.close(code=1008)
+        return
+    if _authority == "adrian-kanban":
+        await ws.close(code=1008)
+        return
     if not _ws_upgrade_authorized(ws):
         await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
         return
