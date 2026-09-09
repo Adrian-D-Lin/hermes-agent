@@ -183,8 +183,109 @@
       });
     }
 
+    var wsRef = React.useRef(null);
+    var cursorRef = React.useRef(0);
+    var reconnectDelayRef = React.useRef(1000);
+    var reconnectTimerRef = React.useRef(null);
+    var debounceTimerRef = React.useRef(null);
+    var closedRef = React.useRef(false);
+
+    function connectEvents() {
+      if (closedRef.current) return;
+      if (typeof SDK.buildWsUrl !== 'function' || typeof window.WebSocket !== 'function') return;
+
+      SDK.buildWsUrl(API_ROOT + '/events', { since: String(cursorRef.current || 0) }).then(function (url) {
+        if (closedRef.current) return;
+        var ws;
+        try {
+          ws = new window.WebSocket(url);
+        } catch (e) {
+          scheduleReconnect();
+          return;
+        }
+        wsRef.current = ws;
+
+        ws.onopen = function () {
+          reconnectDelayRef.current = 1000;
+        };
+
+        ws.onmessage = function (event) {
+          var data;
+          try {
+            data = JSON.parse(event.data);
+          } catch (e) {
+            return;
+          }
+          if (!data || !Array.isArray(data.events) || data.events.length === 0) return;
+          if (typeof data.cursor !== 'number' || data.cursor < 0) return;
+          var valid = data.events.every(function (ev) {
+            return ev && Array.isArray(ev.committed_records);
+          });
+          if (!valid) return;
+          cursorRef.current = Math.max(cursorRef.current, data.cursor);
+          scheduleReload();
+        };
+
+        ws.onclose = function (event) {
+          wsRef.current = null;
+          if (event && event.code === 1008) {
+            set(function (prev) {
+              return {
+                loading: false,
+                error: 'Live updates unavailable: authorization failed. Please refresh the page or re-authenticate.',
+                handshake: prev.handshake,
+                board: prev.board,
+                boardEnvelope: prev.boardEnvelope,
+                mismatch: false
+              };
+            });
+            return;
+          }
+          scheduleReconnect();
+        };
+
+        ws.onerror = function () {};
+      }).catch(function () {
+        scheduleReconnect();
+      });
+    }
+
+    function scheduleReconnect() {
+      if (closedRef.current || reconnectTimerRef.current) return;
+      reconnectTimerRef.current = setTimeout(function () {
+        reconnectTimerRef.current = null;
+        connectEvents();
+      }, reconnectDelayRef.current);
+      reconnectDelayRef.current = Math.min(reconnectDelayRef.current * 2, 30000);
+    }
+
+    function scheduleReload() {
+      if (debounceTimerRef.current) return;
+      debounceTimerRef.current = setTimeout(function () {
+        debounceTimerRef.current = null;
+        load();
+      }, 250);
+    }
+
     React.useEffect(function () {
+      closedRef.current = false;
       load();
+      connectEvents();
+      return function () {
+        closedRef.current = true;
+        if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+        }
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = null;
+        }
+        if (debounceTimerRef.current) {
+          clearTimeout(debounceTimerRef.current);
+          debounceTimerRef.current = null;
+        }
+      };
     }, []);
 
     if (s.loading) {

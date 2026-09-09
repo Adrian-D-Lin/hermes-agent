@@ -99,6 +99,18 @@ def test_dashboard_does_not_discard_unpositioned_cards():
     assert "No cards" in javascript
 
 
+def test_dashboard_uses_authenticated_plugin_events_for_live_refresh():
+    javascript = _asset("src/index.js")
+
+    assert "SDK.buildWsUrl" in javascript
+    assert "API_ROOT + '/events'" in javascript
+    assert "new window.WebSocket" in javascript
+    assert "committed_records" in javascript
+    assert "scheduleReload" in javascript
+    assert "closedRef.current || reconnectTimerRef.current" in javascript
+    assert "wsRef.current.close()" in javascript
+
+
 def test_dashboard_executes_in_host_component_contract_and_keeps_text_utf8():
     javascript_path = ROOT / "src" / "index.js"
     javascript = javascript_path.read_text(encoding="utf-8")
@@ -120,6 +132,7 @@ const React = {
     if (state === undefined) state = initial;
     return [state, function (next) { state = typeof next === "function" ? next(state) : next; }];
   },
+  useRef: function (initial) { return {current: initial}; },
   useEffect: function (effect) { effects.push(effect); }
 };
 const responses = {
@@ -150,8 +163,8 @@ if (!registered || registered.name !== "adrian-kanban" || typeof registered.comp
 const page = registered.component();
 if (!page || typeof page.type !== "function") process.exit(11);
 page.type(page.props);
-if (effects.length !== 1) process.exit(12);
-effects.shift()();
+if (effects.length < 1) process.exit(12);
+effects.splice(0).forEach(function (effect) { effect(); });
 setImmediate(function () {
   setImmediate(function () {
     const tree = page.type(page.props);
