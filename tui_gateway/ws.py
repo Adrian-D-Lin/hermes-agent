@@ -12,8 +12,10 @@ import logging
 import socket
 import threading
 import time
+import uuid
 from typing import Any
 
+from gateway import trusted_authorizer_evidence as trusted
 from tui_gateway import server
 from agent.message_sanitization import _sanitize_surrogates
 from tui_gateway.event_replay import replay_epoch
@@ -96,6 +98,7 @@ class WSTransport:
         #: for legacy-token/stdio. RPC params can never populate it: sole identity authority for browser controllers
         #: and for the ``user_id`` the agent is built with (``server._session_auth_user_id``).
         self.auth_identity = auth_identity
+        self._authenticated_tailscale_peer = authenticated_tailscale_peer
         self._closed = False
         # Token-coalescing buffer. The lock guards the buffer + "armed" flag against worker threads
         # calling write(); the timer handle is only ever touched on the loop thread.
