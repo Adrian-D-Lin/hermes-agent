@@ -8,6 +8,7 @@ from .initiative_mutations import (
     _validate_reconciliation,
     _validate_segment_projection,
 )
+from .override_proposals import store_prepared_override
 from .transition_evidence import validate_transition_evidence
 
 
@@ -156,3 +157,62 @@ def derive_initiative_transition_override(
         "override_reason": override_reason,
         "commentary": commentary,
     }
+
+
+def prepare_initiative_transition_override(
+    conn,
+    *,
+    initial_authorizer,
+    initial_session_id,
+    initial_message_id,
+    initial_quote,
+    executor_session_id,
+    executor_profile,
+    initiative_id,
+    board,
+    to_phase,
+    to_segment_id,
+    reconciliation_ref,
+    override_reason,
+    now,
+    expires_at,
+):
+    """Prepare one initiative transition override on the caller's open transaction.
+
+    Thin coordinator: derives the proposal from live state, then stores it and
+    prepares the Write-Gate approval via ``store_prepared_override``. Never
+    begins, commits, or rolls back; never mints evidence, displays UI, approves,
+    consumes, or mutates an initiative.
+    """
+    if initial_session_id != executor_session_id:
+        raise ValueError("initial and executor sessions must be identical")
+
+    request_id = f"kanban-gate-override:{initial_message_id}"
+    approval_id = f"kanban-gate-override-approval:{initial_message_id}"
+
+    proposal = derive_initiative_transition_override(
+        conn,
+        initiative_id=initiative_id,
+        board=board,
+        to_phase=to_phase,
+        to_segment_id=to_segment_id,
+        reconciliation_ref=reconciliation_ref,
+        override_reason=override_reason,
+        executor_session_id=executor_session_id,
+        executor_profile=executor_profile,
+    )
+
+    return store_prepared_override(
+        conn,
+        request_id=request_id,
+        approval_id=approval_id,
+        initial_authorizer=initial_authorizer,
+        initial_session_id=initial_session_id,
+        initial_message_id=initial_message_id,
+        initial_quote=initial_quote,
+        executor_session_id=executor_session_id,
+        executor_profile=executor_profile,
+        proposal=proposal,
+        now=now,
+        expires_at=expires_at,
+    )
