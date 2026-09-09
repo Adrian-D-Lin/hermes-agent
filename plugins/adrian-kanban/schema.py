@@ -467,6 +467,63 @@ CREATE TABLE IF NOT EXISTS gate_override_proposals (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
+
+-- Durable gate-override execution record. One row per accepted override
+-- request; the request/approval/mutation identities are each globally unique.
+-- The movement basis and result are pinned to the gate-override constants so a
+-- row with any other meaning is rejected at the schema level.
+CREATE TABLE IF NOT EXISTS gate_override_records (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    approval_id TEXT NOT NULL UNIQUE,
+    mutation_id TEXT NOT NULL UNIQUE,
+    initiative_card_id INTEGER NOT NULL,
+    initiative_id TEXT NOT NULL,
+    from_phase TEXT,
+    from_segment_id TEXT,
+    to_phase TEXT,
+    to_segment_id TEXT,
+    override_authority_ref TEXT NOT NULL,
+    override_reason TEXT NOT NULL,
+    unsatisfied_gates TEXT NOT NULL,
+    movement_basis TEXT NOT NULL CHECK (movement_basis = 'adrian_gate_override'),
+    result TEXT NOT NULL CHECK (result = 'accepted_with_active_decision'),
+    actor_evidence TEXT NOT NULL,
+    canonical_payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (initiative_card_id, initiative_id)
+        REFERENCES adrian_kanban_cards (id, initiative_id)
+);
+
+-- Active decision record for an initiative. One row per decision; the
+-- authority reference is globally unique. The decision kind is pinned to the
+-- gate-override constant and the active flag is constrained to 0/1.
+CREATE TABLE IF NOT EXISTS initiative_active_decisions (
+    decision_id TEXT PRIMARY KEY NOT NULL,
+    initiative_card_id INTEGER NOT NULL,
+    initiative_id TEXT NOT NULL,
+    decision_kind TEXT NOT NULL CHECK (decision_kind = 'adrian_gate_override'),
+    authority_ref TEXT NOT NULL UNIQUE,
+    canonical_payload TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (initiative_card_id, initiative_id)
+        REFERENCES adrian_kanban_cards (id, initiative_id)
+);
+
+-- Generated comment record for an initiative. One row per comment; the source
+-- reference is globally unique. The source kind is pinned to the gate-override
+-- constant.
+CREATE TABLE IF NOT EXISTS initiative_generated_comments (
+    comment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    initiative_card_id INTEGER NOT NULL,
+    initiative_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind = 'adrian_gate_override'),
+    source_ref TEXT NOT NULL UNIQUE,
+    body TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (initiative_card_id, initiative_id)
+        REFERENCES adrian_kanban_cards (id, initiative_id)
+);
 """
 
 
