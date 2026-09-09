@@ -615,6 +615,48 @@ CREATE INDEX IF NOT EXISTS idx_task_purge_replacements_initiative
 
 
 SCHEMA_SQL += """
+CREATE TABLE IF NOT EXISTS adrian_kanban_schema_metadata (
+    metadata_key TEXT PRIMARY KEY,
+    metadata_value TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO adrian_kanban_schema_metadata (metadata_key, metadata_value)
+VALUES ('schema_version', '1'), ('migration_format_version', '1');
+
+CREATE TABLE IF NOT EXISTS adrian_kanban_migration_operations (
+    operation_id TEXT PRIMARY KEY,
+    dry_run_digest TEXT NOT NULL,
+    disposition_digest TEXT NOT NULL,
+    rollback_set_digest TEXT NOT NULL,
+    result_payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (dry_run_digest, disposition_digest, rollback_set_digest)
+);
+
+CREATE TABLE IF NOT EXISTS adrian_kanban_migration_map (
+    source_task_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL CHECK (action IN ('retain_legacy', 'migrate')),
+    initiative_id TEXT,
+    task_card_id INTEGER,
+    source_digest TEXT NOT NULL,
+    disposition_payload TEXT NOT NULL,
+    disposition_digest TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    applied_at INTEGER NOT NULL,
+    CHECK (
+        (action = 'retain_legacy' AND initiative_id IS NULL AND task_card_id IS NULL)
+        OR
+        (action = 'migrate' AND initiative_id IS NOT NULL AND task_card_id IS NOT NULL)
+    ),
+    FOREIGN KEY (operation_id)
+        REFERENCES adrian_kanban_migration_operations(operation_id),
+    FOREIGN KEY (task_card_id, source_task_id)
+        REFERENCES adrian_kanban_cards(id, task_id)
+);
+"""
+
+
+SCHEMA_SQL += """
 CREATE TABLE IF NOT EXISTS task_purge_cleanup_items (
     replacement_id TEXT NOT NULL,
     source_path    TEXT NOT NULL,
