@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from gateway.trusted_authorizer_evidence import mint_tailscale_authorizer_for_peer
 from hermes_cli import kanban_db
 
 from ..versioning import release_identity
@@ -147,9 +149,58 @@ async def command(operation: str, request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="Body must be a JSON object")
-    attempt_id = body.get("attempt_id") or str(uuid.uuid4())
+
+    attempt_id = body.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        attempt_id = str(uuid.uuid4())
+
+    client_host = request.client.host
+    connection_id = f"dashboard-http-{uuid.uuid4()}"
+    now = int(time.time())
+
     try:
-        envelope = kanban_db.delegate_authority_operation(operation, **body)
+        evidence = await asyncio.to_thread(
+            mint_tailscale_authorizer_for_peer,
+            client_host,
+            connection_id=connection_id,
+            request_id=attempt_id,
+            issued_at=now,
+            ttl_seconds=300,
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "result": "REJECTED",
+                "state_changed": False,
+                "attempt_id": attempt_id,
+                "operation": operation,
+                "boundary": {"from": "adrian-kanban", "to": "adrian-kanban"},
+                "failed_checks": [
+                    {
+                        "code": "ACTOR_NOT_AUTHORIZED",
+                        "target": operation,
+                        "expected": "authenticated Tailscale ingress",
+                        "observed": "peer verification failed",
+                        "accepted_format": "valid Tailscale peer identity",
+                        "remediation": "connect via Tailscale and retry the same operation",
+                        "responsible_actor": "session_agent",
+                        "retry": "same_operation",
+                    }
+                ],
+                "not_evaluated_checks": [],
+            },
+        )
+
+    fields = dict(body)
+    fields["attempt_id"] = attempt_id
+    fields["execution_context"] = "dashboard"
+    fields["api_request_id"] = attempt_id
+    fields["initial_authorizer"] = evidence
+    fields["override_now"] = now
+
+    try:
+        envelope = kanban_db.delegate_authority_operation(operation, **fields)
     except Exception:
         envelope = None
     return _respond(envelope, attempt_id, operation)

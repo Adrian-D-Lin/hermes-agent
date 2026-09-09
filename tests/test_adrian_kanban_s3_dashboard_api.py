@@ -28,7 +28,13 @@ def dashboard_module(adrian_plugin_modules):
 
 
 @pytest.fixture()
-def client(dashboard_module):
+def client(dashboard_module, monkeypatch):
+    monkeypatch.setattr(
+        dashboard_module,
+        "mint_tailscale_authorizer_for_peer",
+        lambda *_args, **_kwargs: object(),
+        raising=False,
+    )
     app = FastAPI()
     app.include_router(dashboard_module.router, prefix="/api/plugins/adrian-kanban")
     return TestClient(app)
@@ -153,6 +159,14 @@ def test_dashboard_command_forwards_exact_boundary_fields_once(
     dashboard_module, client, monkeypatch
 ):
     calls = []
+    evidence = object()
+
+    def mint(peer_host, **fields):
+        assert peer_host == "testclient"
+        assert fields["request_id"] == "dashboard-attempt-5"
+        assert fields["ttl_seconds"] == 300
+        assert fields["connection_id"].startswith("dashboard-http-")
+        return evidence
 
     def delegate(operation, **fields):
         calls.append((operation, fields))
@@ -161,11 +175,17 @@ def test_dashboard_command_forwards_exact_boundary_fields_once(
     monkeypatch.setattr(
         dashboard_module.kanban_db, "delegate_authority_operation", delegate
     )
+    monkeypatch.setattr(
+        dashboard_module, "mint_tailscale_authorizer_for_peer", mint
+    )
     request = {
         "attempt_id": "dashboard-attempt-5",
         "payload": {"task_id": "task-5", "board": "orchestrator"},
         "session_id": "desktop-session-2",
-        "execution_context": "dashboard",
+        "execution_context": "caller-spoofed-context",
+        "api_request_id": "caller-spoofed-request",
+        "initial_authorizer": "caller-spoofed-authorizer",
+        "override_now": 1,
     }
 
     response = client.post(
@@ -173,7 +193,56 @@ def test_dashboard_command_forwards_exact_boundary_fields_once(
     )
 
     assert response.status_code == 200
-    assert calls == [("kanban_block", request)]
+    assert len(calls) == 1
+    operation, fields = calls[0]
+    assert operation == "kanban_block"
+    assert fields == {
+        "attempt_id": "dashboard-attempt-5",
+        "payload": {"task_id": "task-5", "board": "orchestrator"},
+        "session_id": "desktop-session-2",
+        "execution_context": "dashboard",
+        "api_request_id": "dashboard-attempt-5",
+        "initial_authorizer": evidence,
+        "override_now": fields["override_now"],
+    }
+    assert isinstance(fields["override_now"], int)
+    assert fields["override_now"] > 0
+
+
+def test_dashboard_command_rejects_non_tailscale_ingress_before_boundary(
+    dashboard_module, client, monkeypatch
+):
+    monkeypatch.setattr(
+        dashboard_module,
+        "mint_tailscale_authorizer_for_peer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("authenticated Tailscale peer required")
+        ),
+    )
+    monkeypatch.setattr(
+        dashboard_module.kanban_db,
+        "delegate_authority_operation",
+        lambda *_args, **_kwargs: pytest.fail("untrusted request reached boundary"),
+    )
+
+    response = client.post(
+        "/api/plugins/adrian-kanban/commands/kanban_block",
+        json={
+            "attempt_id": "dashboard-untrusted-1",
+            "payload": {"task_id": "task-5"},
+            "human_authorizer": "adrian",
+            "human_authn": "tailscale_ingress",
+        },
+        headers={"X-Tailscale-User-Login": "adrian@example.com"},
+    )
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["result"] == "REJECTED"
+    assert body["state_changed"] is False
+    assert body["failed_checks"][0]["code"] == "ACTOR_NOT_AUTHORIZED"
+    assert "Tailscale" in body["failed_checks"][0]["expected"]
+    assert body["failed_checks"][0]["retry"] == "same_operation"
 
 
 def test_dashboard_command_rejection_preserves_full_boundary_envelope(
