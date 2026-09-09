@@ -46,6 +46,8 @@ from .initiative_override import (
     execute_approved_initiative_transition_override,
     prepare_initiative_transition_override,
 )
+from .override_host_flow import present_and_record_override_approval
+from gateway.trusted_authorizer_evidence import mint_current_tailscale_authorizer
 from .lifecycle import LifecycleContractRepository
 from .output_validators import (
     OutputValidationRejected,
@@ -965,6 +967,90 @@ class _ModelToolRequestNormalizer:
             target = _target_for_operation(operation, payload)
             if not isinstance(target, str) or not target.strip():
                 raise ValueError("target must be nonblank str")
+
+            if operation == "kanban_transition_initiative" and "gate_override" in payload:
+                if "phase_close_ref" in payload or "approval_id" in payload:
+                    raise ValueError("gate_override must not mix ordinary transition evidence")
+                if actor_profile.strip() != "default":
+                    raise ValueError("gate_override requires the default actor profile")
+                turn_id = runtime.get("turn_id")
+                user_task = runtime.get("user_task")
+                if not (type(turn_id) is str and turn_id.strip()):
+                    raise ValueError("turn_id must be a nonblank str")
+                if not (type(user_task) is str and user_task.strip()):
+                    raise ValueError("user_task must be a nonblank str")
+                if not (type(idempotency_key) is str and idempotency_key.strip()):
+                    raise ValueError("idempotency_key must be a nonblank str")
+
+                now = int(time.time())
+                evidence = mint_current_tailscale_authorizer(
+                    request_id=turn_id,
+                    issued_at=now,
+                    ttl_seconds=300,
+                )
+                preparation = self._boundary.submit(
+                    operation,
+                    attempt_id=attempt_id,
+                    idempotency_key=idempotency_key,
+                    target=target,
+                    derive_expected_version=True,
+                    session_id=session_id.strip(),
+                    workspace_id=workspace_id,
+                    execution_context="model-tool",
+                    actor_profile=actor_profile.strip(),
+                    turn_id=turn_id,
+                    api_request_id=runtime.get("api_request_id"),
+                    user_task=user_task,
+                    payload=payload,
+                    initial_authorizer=evidence,
+                    override_now=now,
+                )
+                if preparation.get("result") != "ACCEPTED":
+                    return preparation
+                approval = present_and_record_override_approval(
+                    self._boundary.database_path,
+                    initial_authorizer=evidence,
+                    prepared=preparation["value"],
+                    session_key=session_id.strip(),
+                    now=int(time.time()),
+                )
+                if not approval.get("approved"):
+                    return {
+                        "result": "REJECTED",
+                        "state_changed": False,
+                        "attempt_id": preparation.get("attempt_id"),
+                        "operation": operation,
+                        "value": {
+                            "request_id": preparation["value"].get("request_id"),
+                            "canonical_digest": preparation["value"].get(
+                                "canonical_digest"
+                            ),
+                            "override_state": "cancelled",
+                        },
+                    }
+                return self._boundary.submit(
+                    operation,
+                    attempt_id=f"{preparation['attempt_id']}:execute",
+                    idempotency_key=f"{idempotency_key}:execute",
+                    target=target,
+                    derive_expected_version=True,
+                    session_id=session_id.strip(),
+                    workspace_id=workspace_id,
+                    execution_context="model-tool",
+                    actor_profile=actor_profile.strip(),
+                    turn_id=turn_id,
+                    api_request_id=runtime.get("api_request_id"),
+                    user_task=user_task,
+                    payload={
+                        "initiative_id": payload["initiative_id"],
+                        "board": board,
+                        "_approved_gate_override_request_id": preparation["value"][
+                            "request_id"
+                        ],
+                    },
+                    override_now=int(time.time()),
+                )
+
             return self._boundary.submit(
                 operation,
                 attempt_id=attempt_id,
@@ -3164,6 +3250,10 @@ class _CommandBoundary:
         self._task_input_preparer = task_input_preparer
         self._segment_manifest_preparer = segment_manifest_preparer
         self._phase_result_preparer = phase_result_preparer
+
+    @property
+    def database_path(self) -> str:
+        return self._database_path
 
     def submit(self, action: str, **fields: Any) -> dict[str, Any]:
         return self._finish_response(self._submit_without_audit(action, **fields))
