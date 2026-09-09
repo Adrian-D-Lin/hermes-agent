@@ -389,7 +389,7 @@ def execute_approved_task_status_override(
         raise ValueError("mutation_id is required")
     if not idempotency_key or not isinstance(idempotency_key, str):
         raise ValueError("idempotency_key is required")
-    if not isinstance(now, int) or now <= 0:
+    if isinstance(now, bool) or not isinstance(now, int) or now <= 0:
         raise ValueError("now must be a positive integer")
 
     row = conn.execute(

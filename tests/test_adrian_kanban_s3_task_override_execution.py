@@ -48,6 +48,25 @@ def _execute(conn, module, prepared, *, now=1030):
         return result
 
 
+def test_boolean_execution_time_is_rejected_without_consuming_approval(
+    task_override_case,
+):
+    conn, module, _initiative_id, _run_id = task_override_case
+    prepared = _prepare(conn, module)
+    _approve(conn, prepared)
+
+    with pytest.raises(ValueError, match="now must be a positive integer"):
+        _execute(conn, module, prepared, now=True)
+
+    assert conn.execute(
+        "SELECT state FROM write_gate_kanban_approvals WHERE request_id=?",
+        (prepared["request_id"],),
+    ).fetchone()[0] == "approved"
+    assert conn.execute(
+        "SELECT status FROM tasks WHERE id='task-parent'"
+    ).fetchone()[0] == "running"
+
+
 def test_approved_execution_closes_run_releases_child_and_records_override(
     task_override_case,
 ):
