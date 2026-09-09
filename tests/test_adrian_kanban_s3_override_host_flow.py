@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import sqlite3
+import time
 
 import pytest
 
@@ -52,6 +53,7 @@ def _approval(path):
 def test_exact_visible_once_approval_becomes_distinct_durable_approval(host_case):
     path, flow, args, prepared, monkeypatch = host_case
     shown = {}
+    monkeypatch.setattr(time, "time", lambda: 1020)
 
     def present(**request):
         shown.update(request)
@@ -93,6 +95,38 @@ def test_exact_visible_once_approval_becomes_distinct_durable_approval(host_case
     assert receipt["second_authorizer"]["request_id"] == "host-click-1"
     assert receipt["request_id"] == prepared["request_id"]
     assert receipt["canonical_digest"] == prepared["canonical_digest"]
+
+
+def test_second_approval_uses_fresh_post_dialogue_timestamp(host_case):
+    path, flow, args, prepared, monkeypatch = host_case
+    observed = {}
+
+    def present(**_request):
+        return {
+            "approved": True,
+            "decision": "once",
+            "approval_reference": "host-click-later",
+        }
+
+    monkeypatch.setattr(flow, "request_write_gate_approval", present)
+    monkeypatch.setattr(time, "time", lambda: 1080)
+
+    def mint(**kwargs):
+        observed.update(kwargs)
+        return evidence(kwargs["request_id"], kwargs["issued_at"])
+
+    monkeypatch.setattr(flow, "mint_current_tailscale_authorizer", mint)
+
+    flow.present_and_record_override_approval(
+        str(path),
+        initial_authorizer=args["initial_authorizer"],
+        prepared=prepared,
+        session_key="human-session",
+        now=1020,
+    )
+
+    assert observed["issued_at"] == 1080
+    assert _approval(path)["approved_at"] == 1080
 
 
 @pytest.mark.parametrize("decision", ["deny", "timeout", None])

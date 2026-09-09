@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sqlite3
 
 import pytest
@@ -152,3 +153,60 @@ def test_derivation_is_read_only(derive_case):
         "proposals": conn.execute("SELECT COUNT(*) FROM gate_override_proposals").fetchone()[0],
     }
     assert after == before
+
+
+def test_derivation_records_an_existing_exact_phase_close_as_met(derive_case):
+    path, conn, module = derive_case
+    reconciliation_payload = {
+        "initiative_id": "initiative-1",
+        "board": "orchestrator",
+        "previous_transition_id": 1,
+        "from_phase": "D1",
+        "from_segment_id": None,
+        "to_phase": "D2",
+        "to_segment_id": None,
+        "canon_route": "Canon/design-lifecycle.md#D2",
+        "exit_gate_ref": "exit-gate:D1:D2",
+        "verification_result": "accepted",
+    }
+    conn.execute(
+        "UPDATE initiative_phase_results SET result_id='reconciliation-d2', "
+        "canonical_payload=?, idempotency_key='key-reconciliation-d2' "
+        "WHERE result_id='reconciliation-1'",
+        (json.dumps(reconciliation_payload, sort_keys=True, separators=(",", ":")),),
+    )
+    card_id = conn.execute(
+        "SELECT id FROM adrian_kanban_cards WHERE initiative_id='initiative-1'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO initiative_phase_results "
+        "(result_id, initiative_card_id, initiative_id, phase, segment_id, "
+        "iteration, result_kind, contract_id, contract_version, canonical_payload, "
+        "accepted_task_refs, accepted_checkpoint_refs, actor_evidence, "
+        "idempotency_key, accepted, created_at) VALUES "
+        "('close-d1', ?, 'initiative-1', 'D1', NULL, 1, 'phase_close', "
+        "'adrian-kanban.lifecycle.d1', '1', ?, '[]', '[]', ?, "
+        "'close-d1-key', 1, 3)",
+        (
+            card_id,
+            json.dumps({"next_route": "D2"}),
+            json.dumps({"source_transition_id": 1, "actor_profile": "default"}),
+        ),
+    )
+    conn.commit()
+
+    proposal = _derive(
+        conn,
+        module,
+        to_phase="D2",
+        reconciliation_ref="reconciliation-d2",
+    )
+
+    assert proposal["gates"] == [
+        {
+            "code": "phase_close",
+            "result": "met",
+            "evidence_ref": "close-d1",
+            "observed": "accepted phase_close authorizes this exact transition",
+        }
+    ]
