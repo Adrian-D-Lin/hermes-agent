@@ -86,6 +86,11 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+        try:
+            _kb.require_native_mutation_authority("native_gateway_notifications")
+        except _kb.AuthorityAdmissionRejected as exc:
+            logger.info("kanban notifier: disabled by selected authority: %s", exc)
+            return
 
         sub_fail_counts: dict[tuple, int] = getattr(self, "_kanban_sub_fail_counts", {})
         self._kanban_sub_fail_counts = sub_fail_counts
