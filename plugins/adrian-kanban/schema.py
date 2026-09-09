@@ -352,6 +352,18 @@ CREATE TABLE IF NOT EXISTS adrian_kanban_command_receipts (
     created_at INTEGER NOT NULL
 );
 
+-- Notification outbox: a read-only projection pointer created in the same
+-- SQLite transaction as an accepted command receipt. It is not a second event
+-- authority; each row merely references the receipt that committed it.
+CREATE TABLE IF NOT EXISTS adrian_kanban_notification_outbox (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    committed_records_json TEXT NOT NULL,
+    FOREIGN KEY (idempotency_key)
+        REFERENCES adrian_kanban_command_receipts(idempotency_key)
+);
+
 -- Immutable task-input manifest. Historical and human-created ordinary tasks
 -- may have no manifest; an admitted agent/automation source-dependent task has
 -- exactly one manifest with one or more child entries.
