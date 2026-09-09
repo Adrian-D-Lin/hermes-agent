@@ -1,0 +1,9 @@
+{
+  "name": "adrian-kanban",
+  "label": "Adrian Kanban",
+  "version": "0.2.0",
+  "api": "plugin_api.py",
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "tab": {"path": "/adrian-kanban", "position": "after:skills"}
+}
