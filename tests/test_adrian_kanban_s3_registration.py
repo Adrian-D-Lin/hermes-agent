@@ -109,6 +109,14 @@ def test_register_wires_one_complete_plugin_authority_runtime(
     assert "adrian_kanban_cards" in tables
     assert "adrian_kanban_command_receipts" in tables
 
+    delegated = package._kb.delegate_authority_operation(
+        "not-a-kanban-operation",
+        attempt_id="registration-read-1",
+    )
+    assert delegated["result"] == "REJECTED", delegated
+    assert delegated["operation"] == "not-a-kanban-operation"
+    assert delegated["failed_checks"][0]["code"] == "UNRECOGNIZED_OPERATION"
+
 
 def test_repeated_registration_reuses_one_provider_instance(
     package, monkeypatch, tmp_path

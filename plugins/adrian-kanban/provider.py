@@ -24,9 +24,28 @@ class AdrianKanbanAuthorityProvider:
         self.database_path = str(raw.expanduser().resolve())
         self._registry = CapabilityRegistry()
         self._healthy = True
+        self._command_boundary = None
+
+    def bind_command_boundary(self, boundary) -> None:
+        if not callable(getattr(boundary, "submit", None)):
+            raise CapabilityRejected("command boundary must expose callable submit")
+        if self._command_boundary is not None:
+            if boundary is self._command_boundary:
+                return
+            raise CapabilityRejected("command boundary already bound")
+        self._command_boundary = boundary
+
+    def submit_operation(self, operation, **fields):
+        if self._command_boundary is None:
+            raise CapabilityRejected("command boundary is unavailable")
+        return self._command_boundary.submit(operation, **fields)
 
     def is_healthy(self) -> bool:
         return self._healthy
+
+    @property
+    def command_boundary(self):
+        return self._command_boundary
 
     def mark_unhealthy(self) -> None:
         self._healthy = False
