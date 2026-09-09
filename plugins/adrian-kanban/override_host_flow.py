@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+import time
 
 from tools.approval import request_write_gate_approval
 from gateway.trusted_authorizer_evidence import mint_current_tailscale_authorizer
@@ -115,6 +116,7 @@ def present_and_record_override_approval(database_path, *, initial_authorizer, p
 
     if not approved:
         # Non-approval path: cancel
+        fresh_now = int(time.time())
         conn = sqlite3.connect(database_path)
         conn.row_factory = sqlite3.Row
         try:
@@ -124,7 +126,7 @@ def present_and_record_override_approval(database_path, *, initial_authorizer, p
                 {"decision": decision, "approval_reference": approval_reference},
                 separators=(",", ":"),
             )
-            host.cancel(conn, approval_id, evidence, now=now)
+            host.cancel(conn, approval_id, evidence, now=fresh_now)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -134,9 +136,10 @@ def present_and_record_override_approval(database_path, *, initial_authorizer, p
         return {"approved": False, "request_id": request_id, "canonical_digest": canonical_digest}
 
     # Approval path: mint second evidence
+    fresh_now = int(time.time())
     second_evidence = mint_current_tailscale_authorizer(
         request_id=approval_reference,
-        issued_at=now,
+        issued_at=fresh_now,
         ttl_seconds=120,
     )
 
@@ -162,7 +165,7 @@ def present_and_record_override_approval(database_path, *, initial_authorizer, p
             expected_request_id=request_id,
             expected_canonical_digest=canonical_digest,
             approval_quote=approval_quote,
-            now=now,
+            now=fresh_now,
         )
         conn.commit()
     except Exception:

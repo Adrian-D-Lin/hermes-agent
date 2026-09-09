@@ -85,19 +85,31 @@ def derive_initiative_transition_override(
     if to_phase in {"DEV2", "DEV3", "DEV4"}:
         _validate_segment_projection(conn, card_id, to_segment_id)
 
-    try:
-        validate_transition_evidence(
-            conn,
-            initiative_card_id=card_id,
-            initiative_id=initiative_id,
-            from_phase=source_phase,
-            from_segment_id=source_segment_id,
-            to_phase=to_phase,
-            to_segment_id=to_segment_id,
-            previous_transition_id=source_predecessor_id,
-            phase_close_ref=reconciliation_ref,
-        )
-    except ValueError:
+    candidates = conn.execute(
+        "SELECT result_id FROM initiative_phase_results "
+        "WHERE initiative_card_id = ? AND result_kind = 'phase_close' AND accepted = 1 "
+        "ORDER BY created_at DESC, result_id DESC",
+        (card_id,),
+    ).fetchall()
+    met_ref = None
+    for candidate in candidates:
+        try:
+            validate_transition_evidence(
+                conn,
+                initiative_card_id=card_id,
+                initiative_id=initiative_id,
+                from_phase=source_phase,
+                from_segment_id=source_segment_id,
+                to_phase=to_phase,
+                to_segment_id=to_segment_id,
+                previous_transition_id=source_predecessor_id,
+                phase_close_ref=candidate["result_id"],
+            )
+        except ValueError:
+            continue
+        met_ref = candidate["result_id"]
+        break
+    if met_ref is None:
         gate_entry = {
             "code": "phase_close",
             "result": "unmet",
@@ -108,7 +120,7 @@ def derive_initiative_transition_override(
         gate_entry = {
             "code": "phase_close",
             "result": "met",
-            "evidence_ref": reconciliation_ref,
+            "evidence_ref": met_ref,
             "observed": "accepted phase_close authorizes this exact transition",
         }
 
