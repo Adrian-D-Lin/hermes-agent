@@ -170,6 +170,24 @@ def _authenticate_tailscale_peer(address, *, connection_id, authenticated_at):
     return peer
 
 
+def mint_tailscale_authorizer_for_peer(
+    address, *, connection_id, request_id, issued_at, ttl_seconds
+):
+    peer = _authenticate_tailscale_peer(
+        address,
+        connection_id=connection_id,
+        authenticated_at=issued_at,
+    )
+    if peer is None:
+        raise ValueError("authenticated Tailscale peer required")
+    return TrustedAuthorizerEvidence._from_authenticated_peer(
+        peer,
+        request_id=request_id,
+        issued_at=issued_at,
+        ttl_seconds=ttl_seconds,
+    )
+
+
 @dataclass(frozen=True, eq=False)
 class TrustedAuthorizerEvidence:
     _mint: InitVar[object]
@@ -291,4 +309,8 @@ def mint_current_tailscale_authorizer(*, request_id, issued_at, ttl_seconds):
     )
 
 
-__all__ = ["TrustedAuthorizerEvidence"]
+__all__ = [
+    "TrustedAuthorizerEvidence",
+    "mint_current_tailscale_authorizer",
+    "mint_tailscale_authorizer_for_peer",
+]

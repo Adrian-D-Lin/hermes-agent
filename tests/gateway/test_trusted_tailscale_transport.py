@@ -62,8 +62,8 @@ def test_tailscale_whois_mints_registered_transport_authority(monkeypatch):
     payload = json.loads(evidence._canonical_for_writegate())
     assert payload == {
         "connection_id": "ws-connection-1",
-        "evidence_type": "trusted_authorizer",
-        "evidence_version": 1,
+        "type": "trusted_authorizer",
+        "version": 1,
         "expires_at": 1_061,
         "issued_at": 1_001,
         "peer_identity": "adrian@example.com",
@@ -101,3 +101,54 @@ def test_no_bound_authenticated_transport_cannot_mint_authority():
         assert "authenticated Tailscale transport" in str(exc)
     else:
         raise AssertionError("authority unexpectedly minted without a bound transport")
+
+
+def test_direct_tailscale_peer_can_mint_request_bound_authority(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _whois_result(login="adrian@example.com", address="100.115.246.102")
+
+    monkeypatch.setattr(trusted.subprocess, "run", fake_run)
+
+    evidence = trusted.mint_tailscale_authorizer_for_peer(
+        "100.115.246.102",
+        connection_id="http-connection-1",
+        request_id="dashboard-request-1",
+        issued_at=2_000,
+        ttl_seconds=60,
+    )
+
+    assert calls[0][0] == ["tailscale", "whois", "--json", "100.115.246.102"]
+    assert json.loads(evidence._canonical_for_writegate()) == {
+        "connection_id": "http-connection-1",
+        "type": "trusted_authorizer",
+        "version": 1,
+        "expires_at": 2_060,
+        "issued_at": 2_000,
+        "peer_identity": "adrian@example.com",
+        "request_id": "dashboard-request-1",
+        "route": "gateway/tailscale",
+    }
+
+
+def test_direct_tailscale_peer_mint_rejects_unverified_peer(monkeypatch):
+    monkeypatch.setattr(
+        trusted.subprocess,
+        "run",
+        lambda *args, **kwargs: _whois_result(address="100.115.246.103"),
+    )
+
+    try:
+        trusted.mint_tailscale_authorizer_for_peer(
+            "100.115.246.102",
+            connection_id="http-connection-2",
+            request_id="dashboard-request-2",
+            issued_at=2_000,
+            ttl_seconds=60,
+        )
+    except ValueError as exc:
+        assert "authenticated Tailscale peer" in str(exc)
+    else:
+        raise AssertionError("authority unexpectedly minted for an unverified peer")
