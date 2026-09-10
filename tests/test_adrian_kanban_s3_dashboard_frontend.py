@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1] / "plugins" / "adrian-kanban" / "dashboard"
+DESKTOP_ENTRY = ROOT.parent / "desktop" / "plugin.js"
 
 
 def _asset(relative: str) -> str:
@@ -200,3 +201,74 @@ def test_dashboard_styles_support_phase_columns_and_status_badges():
     assert ".adrian-kanban-task-status" in css
     assert ".adrian-kanban-diagnostic" in css
     assert ".adrian-kanban-controls-disabled" in css
+
+
+def test_unified_package_supplies_the_matching_desktop_extension():
+    javascript = DESKTOP_ENTRY.read_text(encoding="utf-8")
+
+    assert "@hermes/plugin-sdk" in javascript
+    assert "id: 'adrian-kanban'" in javascript
+    assert "name: 'Kanban'" in javascript
+    assert "defaultEnabled: false" in javascript
+    assert "ROUTES_AREA" in javascript
+    assert "SIDEBAR_NAV_AREA" in javascript
+    assert "path: '/kanban'" in javascript
+    assert "ctx.rest" in javascript
+    assert "'/handshake'" in javascript
+    assert "'/board'" in javascript
+    assert "EXPECTED_PROTOCOL_VERSION = '2'" in javascript
+    assert "mutation_controls_enabled" in javascript
+    assert "/api/plugins/kanban" not in javascript
+
+
+def test_desktop_extension_renders_the_complete_lifecycle_projection_and_diagnostics():
+    javascript = DESKTOP_ENTRY.read_text(encoding="utf-8")
+
+    phase_match = re.search(
+        r"const PHASES = Object\.freeze\((\[[^;]+\])\)", javascript
+    )
+    assert phase_match is not None
+    assert json.loads(phase_match.group(1).replace("'", '"')) == [
+        "D1",
+        "D2",
+        "D3",
+        "D4",
+        "DEV1",
+        "DEV2",
+        "DEV3",
+        "DEV4",
+        "PC1",
+    ]
+    for field in (
+        "initiative_id",
+        "task_id",
+        "current_phase",
+        "lifecycle_phase",
+        "current_segment_id",
+        "segment_id",
+        "status",
+        "failed_checks",
+        "not_evaluated_checks",
+        "accepted_format",
+        "remediation",
+    ):
+        assert field in javascript
+
+
+def test_desktop_extension_is_one_self_contained_runtime_module():
+    javascript = DESKTOP_ENTRY.read_text(encoding="utf-8")
+
+    imports = re.findall(r"from\s+['\"]([^'\"]+)['\"]", javascript)
+    assert set(imports) == {"@hermes/plugin-sdk", "react"}
+    assert "export default plugin" in javascript
+    assert "setInterval" in javascript
+    assert "clearInterval" in javascript
+
+    parsed = subprocess.run(
+        ["node", "--input-type=module", "--check"],
+        input=javascript,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert parsed.returncode == 0, parsed.stderr or parsed.stdout
