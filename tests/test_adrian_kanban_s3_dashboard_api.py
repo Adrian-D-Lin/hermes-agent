@@ -7,6 +7,7 @@ import json
 import sqlite3
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,7 @@ def test_dashboard_api_loads_through_real_serve_standalone_spec_contract():
         assert {route.path for route in module.router.routes} >= {
             "/handshake",
             "/board",
+            "/projects",
         }
     finally:
         sys.modules.pop(module_name, None)
@@ -142,6 +144,61 @@ def test_board_projection_delegates_to_kanban_list(dashboard_module, client, mon
         )
     ]
     assert response.json()["operation"] == "kanban_list"
+
+
+def test_projects_lists_live_project_board_bindings(
+    dashboard_module, client, monkeypatch
+):
+    @contextmanager
+    def connection():
+        yield object()
+
+    projects = [
+        types.SimpleNamespace(
+            id="p_grc",
+            slug="grc",
+            name="GRC",
+            board_slug="project-01-grc",
+        ),
+        types.SimpleNamespace(
+            id="p_harness",
+            slug="ai-harness",
+            name="AI Harness",
+            board_slug="orchestrator",
+        ),
+        types.SimpleNamespace(
+            id="p_unbound",
+            slug="notes",
+            name="Notes",
+            board_slug=None,
+        ),
+    ]
+    monkeypatch.setattr(dashboard_module.projects_db, "connect_closing", connection)
+    monkeypatch.setattr(
+        dashboard_module.projects_db,
+        "list_projects",
+        lambda _conn, *, include_archived: projects,
+    )
+
+    response = client.get("/api/plugins/adrian-kanban/projects")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "projects": [
+            {
+                "id": "p_grc",
+                "slug": "grc",
+                "name": "GRC",
+                "board": "project-01-grc",
+            },
+            {
+                "id": "p_harness",
+                "slug": "ai-harness",
+                "name": "AI Harness",
+                "board": "orchestrator",
+            },
+        ]
+    }
 
 
 @pytest.mark.parametrize(

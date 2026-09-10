@@ -13,15 +13,16 @@ const PHASES = Object.freeze(['D1', 'D2', 'D3', 'D4', 'DEV1', 'DEV2', 'DEV3', 'D
 const POLL_MS = 30000
 
 const styles = {
-  page: { display: 'flex', flexDirection: 'column', gap: 12, padding: 16 },
-  toolbar: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  page: { display: 'flex', flexDirection: 'column', gap: 12, padding: 16, width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box', overflow: 'hidden' },
+  toolbar: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' },
+  actions: { display: 'flex', gap: 8, flexWrap: 'wrap' },
   title: { margin: 0, fontSize: 18 },
   button: { cursor: 'pointer', padding: '4px 10px' },
   warn: { border: '1px solid #b45309', background: '#fef3c7', color: '#92400e', padding: 8, borderRadius: 4 },
   error: { border: '1px solid #b91c1c', background: '#fee2e2', color: '#7f1d1d', padding: 8, borderRadius: 4 },
   info: { border: '1px solid #2563eb', background: '#dbeafe', color: '#1e3a8a', padding: 8, borderRadius: 4 },
-  columns: { display: 'flex', gap: 12, overflowX: 'auto', alignItems: 'flex-start' },
-  column: { minWidth: 200, flex: '0 0 auto', border: '1px solid #d1d5db', borderRadius: 4, padding: 8 },
+  columns: { display: 'flex', gap: 12, overflowX: 'auto', alignItems: 'flex-start', width: '100%', maxWidth: '100%', minWidth: 0, paddingBottom: 8 },
+  column: { width: 240, maxWidth: 240, minWidth: 240, flex: '0 0 240px', border: '1px solid #d1d5db', borderRadius: 4, padding: 8, boxSizing: 'border-box' },
   columnHeader: { display: 'flex', justifyContent: 'space-between', marginBottom: 8 },
   columnTitle: { margin: 0, fontSize: 14 },
   count: { fontSize: 12, color: '#6b7280' },
@@ -136,32 +137,47 @@ function AdrianKanbanPage({ ctx }) {
   const [state, setState] = useState({
     loading: true,
     error: null,
+    projects: [],
     handshake: null,
     boardEnvelope: null,
     mismatch: false
   })
   const timerRef = useRef(null)
+  const [selectedBoard, setSelectedBoard] = useState('')
+  const selectedBoardRef = useRef('')
 
-  function load() {
+  function load(boardOverride) {
+    const board = typeof boardOverride === 'string' ? boardOverride : selectedBoardRef.current
+    const boardParam = board ? `?board=${encodeURIComponent(board)}` : ''
     setState((prev) => ({ ...prev, loading: true, error: null, mismatch: false }))
-    Promise.all([ctx.rest('/handshake'), ctx.rest('/board')])
-      .then(([handshake, boardEnvelope]) => {
-        setState({
+    Promise.all([
+      ctx.rest('/handshake'),
+      ctx.rest('/projects'),
+      ctx.rest(`/board${boardParam}`)
+    ])
+      .then(([handshake, projectsResponse, boardEnvelope]) => {
+        const projects = projectsResponse && Array.isArray(projectsResponse.projects)
+          ? projectsResponse.projects
+          : []
+        setState((prev) => ({
+          ...prev,
           loading: false,
           error: null,
           handshake,
           boardEnvelope,
+          projects,
           mismatch: false
-        })
+        }))
       })
       .catch((err) => {
-        setState({
+        setState((prev) => ({
+          ...prev,
           loading: false,
           error: err && err.message ? err.message : 'Failed to load Kanban board data',
           handshake: null,
           boardEnvelope: null,
           mismatch: false
-        })
+        }))
       })
   }
 
@@ -174,16 +190,23 @@ function AdrianKanbanPage({ ctx }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  function handleBoardChange(event) {
+    const value = event.target.value
+    setSelectedBoard(value)
+    selectedBoardRef.current = value
+    load(value)
+  }
+
   if (state.loading) {
     return h('div', { style: styles.page },
-      h('div', { style: styles.info }, 'Loading Kanban board…')
+      h('div', { style: styles.info }, 'Loading Initiative Tracker…')
     )
   }
 
   if (state.error) {
     return h('div', { style: styles.page },
       h('div', { style: styles.error }, 'Fetch failed: ' + state.error),
-      h('button', { style: styles.button, onClick: load, type: 'button' }, 'Refresh')
+      h('button', { style: styles.button, onClick: () => load(), type: 'button' }, 'Refresh')
     )
   }
 
@@ -217,8 +240,20 @@ function AdrianKanbanPage({ ctx }) {
 
   return h('div', { style: styles.page },
     h('header', { style: styles.toolbar },
-      h('h1', { style: styles.title }, 'Adrian Kanban'),
-      h('button', { style: styles.button, onClick: load, type: 'button' }, 'Refresh')),
+      h('h1', { style: styles.title }, 'Initiative Tracker'),
+      h('div', { style: styles.actions },
+        h('select', {
+          style: styles.button,
+          value: selectedBoard,
+          onChange: handleBoardChange,
+          'aria-label': 'Project'
+        },
+        h('option', { value: '' }, 'All projects'),
+        state.projects.map((project) => h('option', {
+          key: project.board,
+          value: project.board
+        }, project.name))),
+        h('button', { style: styles.button, onClick: () => load(), type: 'button' }, 'Refresh'))),
     !controlsEnabled ? h('div', { style: styles.warn },
       'Mutation controls are disabled: handshake authority, protocol version, or mutation_controls_enabled does not match.') : null,
     !boardAccepted ? h('div', { style: styles.error },
@@ -245,8 +280,8 @@ function AdrianKanbanPage({ ctx }) {
 
 const plugin = {
   id: 'adrian-kanban',
-  name: 'Kanban',
-  description: 'Adrian Kanban lifecycle board — nine-phase projection of initiatives and subordinate tasks with actionable boundary diagnostics.',
+  name: 'Initiative Tracker',
+  description: 'Initiative Tracker lifecycle board — nine-phase projection of initiatives and subordinate tasks with actionable boundary diagnostics.',
   defaultEnabled: false,
   register(ctx) {
     const Page = () => h(AdrianKanbanPage, { ctx })
@@ -262,7 +297,7 @@ const plugin = {
         id: 'nav',
         area: SIDEBAR_NAV_AREA,
         order: 50,
-        data: { codicon: 'project', label: 'Kanban', path: '/kanban' }
+        data: { codicon: 'project', label: 'Initiative Tracker', path: '/kanban' }
       }
     ])
   }

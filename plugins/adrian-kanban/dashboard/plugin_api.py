@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import JSONResponse
 
 from gateway.trusted_authorizer_evidence import mint_tailscale_authorizer_for_peer
-from hermes_cli import kanban_db
+from hermes_cli import kanban_db, projects_db
 
 if __package__:
     from ..versioning import release_identity
@@ -126,6 +126,33 @@ def board(
     attempt_id = str(uuid.uuid4())
     envelope = _delegate("kanban_list", payload, attempt_id)
     return _respond(envelope, attempt_id, "kanban_list")
+
+
+@router.get("/projects")
+def list_projects():
+    try:
+        with projects_db.connect_closing() as conn:
+            projects = projects_db.list_projects(conn, include_archived=False)
+            result = []
+            for project in projects:
+                if (
+                    isinstance(project.board_slug, str)
+                    and project.board_slug.strip()
+                ):
+                    result.append(
+                        {
+                            "id": project.id,
+                            "slug": project.slug,
+                            "name": project.name,
+                            "board": project.board_slug.strip(),
+                        }
+                    )
+        return {"projects": result}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"failed to list projects: {exc}",
+        ) from exc
 
 
 @router.get("/tasks/{task_id}")

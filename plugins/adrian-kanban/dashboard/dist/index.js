@@ -140,12 +140,17 @@
       handshake: null,
       board: null,
       boardEnvelope: null,
-      mismatch: false
+      mismatch: false,
+      projects: []
     });
     var s = state[0];
     var set = state[1];
+    var selectedBoardState = React.useState('');
+    var selectedBoard = selectedBoardState[0];
+    var setSelectedBoard = selectedBoardState[1];
+    var selectedBoardRef = React.useRef('');
 
-    function load() {
+    function load(boardOverride) {
       set(function (prev) {
         return {
           loading: true,
@@ -153,32 +158,47 @@
           handshake: prev.handshake,
           board: prev.board,
           boardEnvelope: prev.boardEnvelope,
-          mismatch: false
+          mismatch: false,
+          projects: prev.projects
         };
       });
-      api("/handshake").then(function (handshake) {
-        return api('/board').then(function (boardEnvelope) {
-          var board = null;
-          if (boardEnvelope && boardEnvelope.result === 'ACCEPTED') {
-            board = boardEnvelope.value;
-          }
-          set({
+      var requestedBoard = typeof boardOverride === 'string' ? boardOverride : selectedBoardRef.current;
+      var boardPath = requestedBoard ? '/board?board=' + encodeURIComponent(requestedBoard) : '/board';
+      return Promise.all([
+        api('/handshake'),
+        api('/projects'),
+        api(boardPath)
+      ]).then(function (results) {
+        var handshake = results[0];
+        var projectsResponse = results[1];
+        var boardEnvelope = results[2];
+        var projects = projectsResponse && Array.isArray(projectsResponse.projects) ? projectsResponse.projects : [];
+        var board = null;
+        if (boardEnvelope && boardEnvelope.result === 'ACCEPTED') {
+          board = boardEnvelope.value;
+        }
+        set(function () {
+          return {
             loading: false,
             error: null,
             handshake: handshake,
             board: board,
             boardEnvelope: boardEnvelope,
-            mismatch: false
-          });
+            mismatch: false,
+            projects: projects
+          };
         });
       }).catch(function (err) {
-        set({
-          loading: false,
-          error: err && err.message ? err.message : 'Failed to load dashboard data',
-          handshake: null,
-          board: null,
-          boardEnvelope: null,
-          mismatch: false
+        set(function (prev) {
+          return {
+            loading: false,
+            error: err && err.message ? err.message : 'Failed to load dashboard data',
+            handshake: null,
+            board: null,
+            boardEnvelope: null,
+            mismatch: false,
+            projects: prev.projects
+          };
         });
       });
     }
@@ -236,7 +256,8 @@
                 handshake: prev.handshake,
                 board: prev.board,
                 boardEnvelope: prev.boardEnvelope,
-                mismatch: false
+                mismatch: false,
+                projects: prev.projects
               };
             });
             return;
@@ -291,7 +312,7 @@
     if (s.loading) {
       return h('div', { className: 'adrian-kanban-dashboard adrian-kanban-loading' },
         h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-info' },
-          'Loading Adrian Kanban dashboard…'));
+          'Loading Initiative Tracker…'));
     }
 
     if (s.error) {
@@ -329,8 +350,24 @@
 
     return h('div', { className: 'adrian-kanban-dashboard' },
       h('header', { className: 'adrian-kanban-toolbar' },
-        h('h1', null, 'Adrian Kanban'),
-        h('button', { className: 'adrian-kanban-refresh', onClick: load }, 'Refresh')
+        h('h1', null, 'Initiative Tracker'),
+        h('select', {
+          className: 'adrian-kanban-project-selector',
+          'aria-label': 'Project',
+          value: selectedBoard,
+          onChange: function (event) {
+            var value = event.target.value;
+            setSelectedBoard(value);
+            selectedBoardRef.current = value;
+            load(value);
+          }
+        },
+          h('option', { value: '' }, 'All projects'),
+          s.projects.map(function (project) {
+            return h('option', { key: project.board, value: project.board }, project.name);
+          })
+        ),
+        h('button', { className: 'adrian-kanban-refresh', onClick: function () { load(); } }, 'Refresh')
       ),
       !boardAccepted ? h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-error' },
         'Board boundary REJECTED or malformed: no board data is available') : null,
