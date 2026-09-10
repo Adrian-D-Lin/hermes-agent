@@ -7,7 +7,7 @@ Type=simple
 WorkingDirectory=%h/.hermes
 Environment=HERMES_HOME=%h/.hermes
 EnvironmentFile=-%h/.hermes/.env
-ExecStart=%h/.hermes/hermes-agent/.venv/bin/python -m plugins.adrian-kanban.dispatcher_service --interval 10
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python -m plugins.adrian-kanban.dispatcher_service --interval 10
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

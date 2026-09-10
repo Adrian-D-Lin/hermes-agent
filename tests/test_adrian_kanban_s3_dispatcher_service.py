@@ -331,7 +331,7 @@ def test_dispatch_service_unit_is_plugin_owned_and_restartable():
     assert "Environment=HERMES_HOME=%h/.hermes" in unit
     assert "EnvironmentFile=-%h/.hermes/.env" in unit
     assert (
-        "ExecStart=%h/.hermes/hermes-agent/.venv/bin/python "
+        "ExecStart=%h/.hermes/hermes-agent/venv/bin/python "
         "-m plugins.adrian-kanban.dispatcher_service"
     ) in unit
     assert "hermes kanban daemon" not in unit
