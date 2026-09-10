@@ -42,7 +42,7 @@ def test_dashboard_checks_protocol_before_enabling_mutation_controls():
     javascript = _asset("src/index.js")
 
     assert 'const EXPECTED_PROTOCOL_VERSION = "2"' in javascript
-    assert 'api("/handshake")' in javascript
+    assert "/handshake" in javascript
     assert "handshake.versions" in javascript
     assert "mutation_controls_enabled" in javascript
     assert "protocol_version" in javascript
@@ -121,7 +121,8 @@ def test_dashboard_executes_in_host_component_contract_and_keeps_text_utf8():
 const fs = require("fs");
 const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
-let state;
+const states = [];
+let stateIndex = 0;
 let registered;
 const effects = [];
 const calls = [];
@@ -130,8 +131,11 @@ const React = {
     return {type: type, props: props || {}, children: Array.prototype.slice.call(arguments, 2)};
   },
   useState: function (initial) {
-    if (state === undefined) state = initial;
-    return [state, function (next) { state = typeof next === "function" ? next(state) : next; }];
+    const index = stateIndex++;
+    if (states[index] === undefined) states[index] = initial;
+    return [states[index], function (next) {
+      states[index] = typeof next === "function" ? next(states[index]) : next;
+    }];
   },
   useRef: function (initial) { return {current: initial}; },
   useEffect: function (effect) { effects.push(effect); }
@@ -141,6 +145,9 @@ const responses = {
     authority: "adrian-kanban",
     versions: {protocol_version: "2"},
     mutation_controls_enabled: true
+  },
+  "/api/plugins/adrian-kanban/projects": {
+    projects: [{id: "p_probe", slug: "probe", name: "Probe", board: "probe"}]
   },
   "/api/plugins/adrian-kanban/board": {
     result: "ACCEPTED",
@@ -163,11 +170,13 @@ vm.runInNewContext(source, {window: windowObject});
 if (!registered || registered.name !== "adrian-kanban" || typeof registered.component !== "function") process.exit(10);
 const page = registered.component();
 if (!page || typeof page.type !== "function") process.exit(11);
+stateIndex = 0;
 page.type(page.props);
 if (effects.length < 1) process.exit(12);
 effects.splice(0).forEach(function (effect) { effect(); });
 setImmediate(function () {
   setImmediate(function () {
+    stateIndex = 0;
     const tree = page.type(page.props);
     function flatten(value, output) {
       if (value == null || value === false) return;
@@ -179,8 +188,26 @@ setImmediate(function () {
     const output = [];
     flatten(tree, output);
     const text = output.join(" ");
-    if (calls.join("|") !== "/api/plugins/adrian-kanban/handshake|/api/plugins/adrian-kanban/board") process.exit(13);
+    if (calls.join("|") !== "/api/plugins/adrian-kanban/handshake|/api/plugins/adrian-kanban/projects|/api/plugins/adrian-kanban/board") process.exit(13);
     if (!text.includes("Probe initiative") || !text.includes("Probe task") || !text.includes("ready") || !text.includes("S1")) process.exit(14);
+    function findType(value, type) {
+      if (value == null || value === false) return null;
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          const found = findType(item, type);
+          if (found) return found;
+        }
+        return null;
+      }
+      if (value.type === type) return value;
+      if (typeof value.type === "function") return findType(value.type(value.props || {}), type);
+      return findType(value.children, type);
+    }
+    const selector = findType(tree, "select");
+    if (!selector || typeof selector.props.onChange !== "function") process.exit(15);
+    selector.props.onChange({target: {value: "probe"}});
+    const switched = calls.slice(-3).join("|");
+    if (switched !== "/api/plugins/adrian-kanban/handshake|/api/plugins/adrian-kanban/projects|/api/plugins/adrian-kanban/board?board=probe") process.exit(16);
   });
 });
 """
@@ -198,9 +225,24 @@ def test_dashboard_styles_support_phase_columns_and_status_badges():
 
     assert ".adrian-kanban-columns" in css
     assert "overflow-x" in css
+    assert "min-width: 0" in css
+    assert "width: 100%" in css
+    assert "flex: 0 0 240px" in css
     assert ".adrian-kanban-task-status" in css
     assert ".adrian-kanban-diagnostic" in css
     assert ".adrian-kanban-controls-disabled" in css
+
+
+def test_dashboard_uses_initiative_tracker_title_and_project_board_selector():
+    javascript = _asset("src/index.js")
+    manifest = json.loads(_asset("manifest.json"))
+
+    assert manifest["label"] == "Initiative Tracker"
+    assert "Initiative Tracker" in javascript
+    assert "/projects" in javascript
+    assert "encodeURIComponent" in javascript
+    assert "All projects" in javascript
+    assert "project-selector" in javascript
 
 
 def test_unified_package_supplies_the_matching_desktop_extension():
@@ -208,14 +250,18 @@ def test_unified_package_supplies_the_matching_desktop_extension():
 
     assert "@hermes/plugin-sdk" in javascript
     assert "id: 'adrian-kanban'" in javascript
-    assert "name: 'Kanban'" in javascript
+    assert "name: 'Initiative Tracker'" in javascript
+    assert "label: 'Initiative Tracker'" in javascript
     assert "defaultEnabled: false" in javascript
     assert "ROUTES_AREA" in javascript
     assert "SIDEBAR_NAV_AREA" in javascript
     assert "path: '/kanban'" in javascript
     assert "ctx.rest" in javascript
     assert "'/handshake'" in javascript
-    assert "'/board'" in javascript
+    assert "'/projects'" in javascript
+    assert "/board" in javascript
+    assert "encodeURIComponent" in javascript
+    assert "All projects" in javascript
     assert "EXPECTED_PROTOCOL_VERSION = '2'" in javascript
     assert "mutation_controls_enabled" in javascript
     assert "/api/plugins/kanban" not in javascript

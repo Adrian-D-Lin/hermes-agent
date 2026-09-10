@@ -6,17 +6,32 @@
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   color: #1f2933;
   background: #f5f7fa;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .adrian-kanban-toolbar {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .adrian-kanban-toolbar h1 {
   font-size: 1.25rem;
   margin: 0;
+}
+
+.adrian-kanban-project-selector {
+  padding: 6px 12px;
+  border: 1px solid #cbd2d9;
+  border-radius: 6px;
+  background: #ffffff;
+  font-size: 0.9rem;
+  cursor: pointer;
 }
 
 .adrian-kanban-refresh,
@@ -76,6 +91,9 @@
   gap: 12px;
   overflow-x: auto;
   padding-bottom: 8px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .adrian-kanban-column {
