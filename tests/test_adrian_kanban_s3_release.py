@@ -49,7 +49,12 @@ def _release_inputs(tmp_path: Path, modules):
     desktop_build.write_bytes(b"closed-desktop-build")
     database_path = (tmp_path / "kanban.sqlite3").resolve()
     database_path.write_bytes(b"disposable-database")
-    profile_names = ("default", "independent-reviewer", "test-authority-reviewer")
+    profile_names = (
+        "builder-tester",
+        "default",
+        "independent-reviewer",
+        "test-authority-reviewer",
+    )
     component_names = (
         "backend",
         "desktop",
@@ -271,6 +276,7 @@ def test_dark_plan_rejects_unsorted_candidate_links(tmp_path, release_modules):
         "test-authority-reviewer": (tmp_path / "three").resolve(),
         "default": (tmp_path / "one").resolve(),
         "independent-reviewer": (tmp_path / "two").resolve(),
+        "builder-tester": (tmp_path / "four").resolve(),
     }
 
     with pytest.raises(models.ReleaseRejected):
