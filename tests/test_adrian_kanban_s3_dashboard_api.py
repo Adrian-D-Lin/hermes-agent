@@ -64,6 +64,31 @@ def test_dashboard_manifest_declares_versioned_plugin_owned_surface(
     assert manifest["tab"] == {"path": "/adrian-kanban", "position": "after:skills"}
 
 
+def test_dashboard_api_loads_through_real_serve_standalone_spec_contract():
+    root = Path(__file__).parents[1] / "plugins" / "adrian-kanban"
+    module_name = "hermes_dashboard_plugin_adrian-kanban-regression"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        root / "dashboard" / "plugin_api.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+
+        assert not module.__package__
+        assert module.release_identity() == importlib.import_module(
+            "plugins.adrian-kanban.versioning"
+        ).release_identity()
+        assert {route.path for route in module.router.routes} >= {
+            "/handshake",
+            "/board",
+        }
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_handshake_reports_one_release_identity_and_selected_authority(
     dashboard_module, client, monkeypatch
 ):

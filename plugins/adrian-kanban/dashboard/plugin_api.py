@@ -8,6 +8,7 @@ imports or invokes native dashboard handlers or native DB mutators.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import sqlite3
 import time
 import uuid
@@ -19,8 +20,16 @@ from fastapi.responses import JSONResponse
 from gateway.trusted_authorizer_evidence import mint_tailscale_authorizer_for_peer
 from hermes_cli import kanban_db
 
-from ..versioning import release_identity
-from ..notifications import list_notifications
+if __package__:
+    from ..versioning import release_identity
+    from ..notifications import list_notifications
+else:
+    release_identity = importlib.import_module(
+        "plugins.adrian-kanban.versioning"
+    ).release_identity
+    list_notifications = importlib.import_module(
+        "plugins.adrian-kanban.notifications"
+    ).list_notifications
 
 router = APIRouter()
 
