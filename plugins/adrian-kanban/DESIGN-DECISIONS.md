@@ -74,3 +74,27 @@ hook remains a policy guard rather than OS-level filesystem containment; live
 Hermes code outside the bound segment requires a lease through governed tools,
 while comprehensive prevention of alternate write routes requires a separate
 filesystem-permission or sandbox design.
+
+## Current-work board and initiative history — Adrian approved, 2026-09-11
+
+The nine-phase board is a compact current-work surface. Each initiative appears
+in its authoritative current lifecycle phase. Of that initiative's subordinate
+task cards, the board shows only open tasks whose authoritative normalized phase
+matches the initiative's current phase. Closed, completed, done, archived, and
+cancelled historical tasks do not occupy board columns and do not produce
+missing-phase diagnostics merely because a migrated legacy card has no lifecycle
+contract.
+
+Opening an initiative card presents its durable detail view. The initiative
+description, current phase and segment, transition history, and document
+references recorded in its body are immediately visible. Associated historical
+tasks and their stored evidence attachments are grouped under collapsed phase
+chevrons. The grouping uses an authoritative task phase when available; an
+explicit phase token in a legacy title may be used only as a display grouping
+fallback. No fallback classification mutates or fabricates lifecycle authority.
+
+An open task without a recognized authoritative phase remains an actionable
+diagnostic. Background board refresh preserves an open initiative detail; an
+intentional project-board change closes it before loading the other project.
+The dashboard and installed Desktop extension must implement the same behavior
+and maintain readable foreground/background contrast in light and dark themes.

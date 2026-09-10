@@ -152,8 +152,11 @@ const responses = {
   "/api/plugins/adrian-kanban/board": {
     result: "ACCEPTED",
     value: {
-      initiatives: [{initiative_id: "initiative-probe", title: "Probe initiative", current_phase: "D2", current_segment_id: null}],
-      tasks: [{task_id: "task-probe", title: "Probe task", lifecycle_phase: "DEV2", segment_id: "S1", status: "ready"}]
+      initiatives: [{initiative_id: "initiative-probe", title: "Probe initiative", current_phase: "DEV2", current_segment_id: "S1"}],
+      tasks: [
+        {task_id: "task-probe", initiative_id: "initiative-probe", title: "Probe task", lifecycle_phase: "DEV2.1", segment_id: "S1", status: "ready"},
+        {task_id: "task-done", initiative_id: "initiative-probe", title: "Historical D1 task", status: "done"}
+      ]
     }
   }
 };
@@ -190,6 +193,7 @@ setImmediate(function () {
     const text = output.join(" ");
     if (calls.join("|") !== "/api/plugins/adrian-kanban/handshake|/api/plugins/adrian-kanban/projects|/api/plugins/adrian-kanban/board") process.exit(13);
     if (!text.includes("Probe initiative") || !text.includes("Probe task") || !text.includes("ready") || !text.includes("S1")) process.exit(14);
+    if (text.includes("Historical D1 task") || text.includes("task-done") || text.includes("task_id: task-done")) process.exit(17);
     function findType(value, type) {
       if (value == null || value === false) return null;
       if (Array.isArray(value)) {
@@ -245,6 +249,56 @@ def test_dashboard_uses_initiative_tracker_title_and_project_board_selector():
     assert "project-selector" in javascript
 
 
+def test_dashboard_treats_board_as_current_work_and_detail_as_history():
+    javascript = _asset("src/index.js")
+
+    assert "CLOSED_TASK_STATUSES" in javascript
+    assert "if (!isTaskOpen(r)) return" in javascript
+    assert "if (parentPhase !== p) return" in javascript
+    assert "ctx.rest" not in javascript
+    assert "api('/initiatives/'" in javascript
+    assert "envelope.result === 'ACCEPTED'" in javascript
+    assert "envelope.value" in javascript
+    assert "Transition history (" in javascript
+    assert "phaseOf(t) || legacyPhaseOf(t) || 'Legacy/Unclassified'" in javascript
+    assert "Array.isArray(d.attachments)" in javascript
+    assert "h('details'" in javascript
+    assert "h('h3', null, 'Transition history (" in javascript
+
+
+def test_dashboard_phase_parsing_is_anchored_and_legacy_tokens_are_bounded():
+    javascript = _asset("src/index.js")
+
+    assert r"(\.[0-9A-Z]+)?$/" in javascript
+    assert r"\b(?:DEV[1-4]|D[1-4]|PC1)\b" in javascript
+
+
+def test_dashboard_styles_give_cards_and_details_explicit_contrast():
+    css = _asset("src/style.css")
+
+    for selector in (
+        ".adrian-kanban-card",
+        ".adrian-kanban-detail-panel",
+        ".adrian-kanban-detail-section",
+        ".adrian-kanban-task-entry",
+        ".adrian-kanban-attachment",
+    ):
+        assert selector in css
+    assert "var(--color-card, #" in css
+    assert "var(--color-foreground, #" in css
+
+
+def test_dashboard_refresh_preserves_open_detail_and_project_change_closes_it():
+    javascript = _asset("src/index.js")
+
+    assert "function api(path, options)" in javascript
+    assert "SDK.fetchJSON(API_ROOT + path, options)" in javascript
+    assert javascript.count("detailLoading: prev.detailLoading") >= 2
+    assert javascript.count("detailData: prev.detailData") >= 2
+    assert "Initiative detail is unavailable; close and reopen the initiative." in javascript
+    assert "closeInitiativeDetail();" in javascript
+
+
 def test_unified_package_supplies_the_matching_desktop_extension():
     javascript = DESKTOP_ENTRY.read_text(encoding="utf-8")
 
@@ -271,7 +325,7 @@ def test_desktop_extension_renders_the_complete_lifecycle_projection_and_diagnos
     javascript = DESKTOP_ENTRY.read_text(encoding="utf-8")
 
     phase_match = re.search(
-        r"const PHASES = Object\.freeze\((\[[^;]+\])\)", javascript
+        r"const PHASES = Object\.freeze\((\[[^\]]+\])\)", javascript
     )
     assert phase_match is not None
     assert json.loads(phase_match.group(1).replace("'", '"')) == [
@@ -301,6 +355,33 @@ def test_desktop_extension_renders_the_complete_lifecycle_projection_and_diagnos
         assert field in javascript
 
 
+def test_desktop_extension_matches_current_work_and_history_detail_contract():
+    javascript = DESKTOP_ENTRY.read_text(encoding="utf-8")
+
+    assert "CLOSED_TASK_STATUSES" in javascript
+    assert "if (!isTaskOpen(record)) return" in javascript
+    assert "if (parentPhase !== p) return" in javascript
+    assert "ctx.rest('/initiatives/'" in javascript
+    assert "envelope.result === 'ACCEPTED'" in javascript
+    assert "detailData: envelope.value" in javascript
+    assert "phaseOf(t) || legacyPhaseOf(t) || 'Legacy/Unclassified'" in javascript
+    assert r"\b(?:DEV[1-4]|D[1-4]|PC1)\b" in javascript
+    assert "Array.isArray(d.attachments)" in javascript
+    assert "Transition history (" in javascript
+    assert "h('details'" in javascript
+    assert "var(--color-card, #" in javascript
+    assert "var(--color-foreground, #" in javascript
+
+
+def test_desktop_refresh_preserves_open_detail_and_project_change_closes_it():
+    javascript = DESKTOP_ENTRY.read_text(encoding="utf-8")
+
+    assert javascript.count("detailLoading: prev.detailLoading") >= 2
+    assert javascript.count("detailData: prev.detailData") >= 2
+    assert "Initiative detail is unavailable; close and reopen the initiative." in javascript
+    assert "closeInitiativeDetail()" in javascript
+
+
 def test_desktop_extension_is_one_self_contained_runtime_module():
     javascript = DESKTOP_ENTRY.read_text(encoding="utf-8")
 
@@ -312,9 +393,10 @@ def test_desktop_extension_is_one_self_contained_runtime_module():
 
     parsed = subprocess.run(
         ["node", "--input-type=module", "--check"],
-        input=javascript,
+        input=javascript.encode("utf-8"),
         capture_output=True,
-        text=True,
         timeout=10,
     )
-    assert parsed.returncode == 0, parsed.stderr or parsed.stdout
+    assert parsed.returncode == 0, (parsed.stderr or parsed.stdout).decode(
+        "utf-8", errors="replace"
+    )

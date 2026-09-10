@@ -213,6 +213,25 @@ def test_cold_initiative_read_hydrates_structured_lifecycle_state(
     with sqlite3.connect(database_path, isolation_level=None) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
+            "UPDATE adrian_kanban_cards SET body = ? "
+            "WHERE card_type = 'initiative' AND initiative_id = ?",
+            ("Canonical references: Canon/design.md", "initiative-read"),
+        )
+        conn.execute(
+            "INSERT INTO task_attachments "
+            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "task-read",
+                "review-evidence.md",
+                "/private/review-evidence.md",
+                "text/markdown",
+                42,
+                "test-authority-reviewer",
+                1084,
+            ),
+        )
+        conn.execute(
             "INSERT INTO initiative_transitions "
             "(initiative_card_id, initiative_id, previous_transition_id, "
             "transition_id, from_phase, from_segment_id, to_phase, to_segment_id, "
@@ -304,12 +323,24 @@ def test_cold_initiative_read_hydrates_structured_lifecycle_state(
     assert result["result"] == "ACCEPTED"
     value = result["value"]
     assert value["card"]["card_type"] == "initiative"
+    assert value["card_body"] == "Canonical references: Canon/design.md"
+    assert value["body"] == value["card_body"]
     assert value["current_transition"]["to_phase"] == "DEV2"
     assert value["current_transition"]["to_segment_id"] == "S1"
     assert [row["result_id"] for row in value["phase_results"]] == ["result-dev1"]
     assert value["segment_projection"]["projection_id"] == "projection-1"
     assert value["workspaces"][0]["members"][0]["repository_identity"] == "hermes"
     assert value["tasks"][0]["lifecycle_contract"]["execution_profile"] == "builder-tester"
+    assert value["tasks"][0]["attachments"] == [
+        {
+            "id": 1,
+            "filename": "review-evidence.md",
+            "content_type": "text/markdown",
+            "size": 42,
+            "uploaded_by": "test-authority-reviewer",
+            "created_at": 1084,
+        }
+    ]
     assert value["open_findings"] == [
         {"id": "F-OPEN", "status": "open", "route": "DEV2"}
     ]
