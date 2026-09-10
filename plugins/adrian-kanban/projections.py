@@ -336,7 +336,7 @@ def show_projection(
 
     if initiative_id is not None:
         card_row = conn.execute(
-            "SELECT id, card_type, initiative_id, task_id, title, board_slug, record_version "
+            "SELECT id, card_type, initiative_id, task_id, title, body, board_slug, record_version "
             "FROM adrian_kanban_cards WHERE initiative_id = ? AND board_slug = ? AND card_type = 'initiative'",
             (initiative_id, board),
         ).fetchone()
@@ -346,6 +346,8 @@ def show_projection(
         card = _row_to_dict(card_row)
         card["board"] = card.pop("board_slug")
         card.pop("id")
+
+        card_body = card_row["body"]
 
         transitions = conn.execute(
             "SELECT previous_transition_id, transition_id, from_phase, from_segment_id, "
@@ -440,6 +442,7 @@ def show_projection(
             replaces_task_id = None
             if tc_dict["task_id"] in replacement_by_successor:
                 replaces_task_id = replacement_by_successor[tc_dict["task_id"]]["predecessor_task_id"]
+            attachments = _get_task_attachments(conn, tc_dict["task_id"])
             tasks_list.append({
                 "task_id": tc_dict["task_id"],
                 "title": tc_dict["title"],
@@ -449,6 +452,7 @@ def show_projection(
                 "lifecycle_contract": lifecycle,
                 "latest_candidate": latest_candidate,
                 "accepted_handoff": accepted_handoff,
+                "attachments": attachments,
                 "replaces_task_id": replaces_task_id,
             })
 
@@ -479,6 +483,8 @@ def show_projection(
 
         return {
             "card": card,
+            "card_body": card_body,
+            "body": card_body,
             "current_transition": current_transition,
             "transition_history": transition_list,
             "phase_results": pr_list,
@@ -535,7 +541,7 @@ def list_projection(
         task_clauses.append("t.status != 'archived'")
 
     init_query = """
-        SELECT c.id, c.card_type, c.initiative_id, c.task_id, c.title, c.board_slug, c.record_version, c.created_at,
+        SELECT c.id, c.card_type, c.initiative_id, c.task_id, c.title, c.body, c.board_slug, c.record_version, c.created_at,
                NULL as status, NULL as assignee
         FROM adrian_kanban_cards c
         WHERE c.card_type = 'initiative'
@@ -544,7 +550,7 @@ def list_projection(
         init_query += " AND " + " AND ".join(init_clauses)
 
     task_query = """
-        SELECT c.id, c.card_type, c.initiative_id, c.task_id, c.title, c.board_slug, c.record_version, c.created_at,
+        SELECT c.id, c.card_type, c.initiative_id, c.task_id, c.title, c.body, c.board_slug, c.record_version, c.created_at,
                t.status, t.assignee
         FROM adrian_kanban_cards c
         LEFT JOIN tasks t ON t.id = c.task_id
