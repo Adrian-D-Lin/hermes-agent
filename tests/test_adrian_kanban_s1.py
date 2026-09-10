@@ -364,6 +364,43 @@ def test_test_only_provider_delegates_admitted_operation(kanban_home: Path):
 # ---------------------------------------------------------------------------
 
 
+def test_selected_authority_resolves_only_provider_certified_workspace(
+    kanban_home: Path, tmp_path
+):
+    """The core returns only the exact path certified by the selected healthy
+    authority, never an arbitrary non-Git directory supplied by a model."""
+    db_path = str(kb.kanban_db_path().resolve())
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  mutation_authority: adrian-kanban\n"
+        f"  database_path: {Path(db_path).as_posix()}\n",
+        encoding="utf-8",
+    )
+    trusted = (tmp_path / "worktrees" / "I1" / "S1").resolve()
+    untrusted = (tmp_path / "worktrees" / "I1" / "S2").resolve()
+    trusted.mkdir(parents=True)
+    untrusted.mkdir(parents=True)
+
+    class _Provider:
+        name = "test-workspace-provider"
+
+        def is_healthy(self):
+            return True
+
+        def admit_operation(self, operation):
+            return False
+
+        def resolve_trusted_workspace_root(self, candidate):
+            return str(trusted) if Path(candidate) == trusted else None
+
+    kb.register_authority_provider(_Provider(), db_path)
+    try:
+        assert kb.resolve_trusted_authority_workspace(str(trusted)) == str(trusted)
+        assert kb.resolve_trusted_authority_workspace(str(untrusted)) is None
+    finally:
+        kb.clear_authority_providers()
+
+
 def test_unified_card_initiative_required_task_nullable(
     adrian_plugin_modules: dict[str, ModuleType], kanban_home: Path
 ):

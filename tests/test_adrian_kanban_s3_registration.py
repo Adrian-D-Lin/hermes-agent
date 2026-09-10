@@ -53,6 +53,24 @@ class _Context:
         return _Registration()
 
 
+def _configure_workspace_registry(package, monkeypatch, tmp_path):
+    controlled_root = str((tmp_path / "controlled-worktrees").resolve())
+    repository_root = str((tmp_path / "repository").resolve())
+    monkeypatch.setattr(
+        package._config,
+        "load_config_readonly",
+        lambda: {
+            "kanban": {
+                "controlled_worktree_root": controlled_root,
+                "repository_registry": {
+                    "orchestrator": {"repository_root": repository_root}
+                },
+            }
+        },
+    )
+    return controlled_root, repository_root
+
+
 def test_register_is_inert_while_native_authority_is_selected(
     package, monkeypatch
 ):
@@ -86,6 +104,9 @@ def test_register_wires_one_complete_plugin_authority_runtime(
         "resolve_authority_path",
         lambda **_kwargs: database_path,
     )
+    controlled_root, repository_root = _configure_workspace_registry(
+        package, monkeypatch, tmp_path
+    )
     context = _Context()
 
     assert package.register(context) is None
@@ -108,6 +129,10 @@ def test_register_wires_one_complete_plugin_authority_runtime(
         }
     assert "adrian_kanban_cards" in tables
     assert "adrian_kanban_command_receipts" in tables
+    provider = package._provider_cache[database_path]
+    assert provider._workspace_registry.controlled_worktree_root == controlled_root
+    registration = provider._workspace_registry.lookup("orchestrator")
+    assert registration.repository_root == repository_root
 
     delegated = package._kb.delegate_authority_operation(
         "not-a-kanban-operation",
@@ -132,6 +157,7 @@ def test_repeated_registration_reuses_one_provider_instance(
         "resolve_authority_path",
         lambda **_kwargs: database_path,
     )
+    _configure_workspace_registry(package, monkeypatch, tmp_path)
     package.register(_Context())
     first = package._provider_cache[database_path]
     package.register(_Context())
@@ -181,6 +207,7 @@ def test_runtime_health_reports_exact_versions_and_path(
         "resolve_authority_path",
         lambda **_kwargs: database_path,
     )
+    _configure_workspace_registry(package, monkeypatch, tmp_path)
     package.register(_Context())
 
     health = package.runtime_health()

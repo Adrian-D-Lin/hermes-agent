@@ -3535,6 +3535,39 @@ def require_native_mutation_authority(operation: str) -> None:
         )
 
 
+def resolve_trusted_authority_workspace(candidate: str) -> Optional[str]:
+    if not isinstance(candidate, str):
+        return None
+    candidate = candidate.strip()
+    if not candidate or not os.path.isabs(candidate):
+        return None
+    if not os.path.isdir(candidate):
+        return None
+    canonical_candidate = os.path.realpath(candidate)
+    try:
+        if resolve_selected_authority() != AUTHORITY_ADRIAN_KANBAN:
+            return None
+        authority_path = resolve_authority_path()
+        provider = _require_admitted_provider(authority_path)
+        resolver = provider.resolve_trusted_workspace_root
+        if not callable(resolver):
+            return None
+        result = resolver(candidate)
+        if not isinstance(result, str):
+            return None
+        result = result.strip()
+        if not result or not os.path.isabs(result):
+            return None
+        if not os.path.isdir(result):
+            return None
+        canonical_result = os.path.realpath(result)
+        if canonical_result == canonical_candidate:
+            return canonical_result
+        return None
+    except Exception:
+        return None
+
+
 def _require_admitted_provider(db_path: Optional[str]) -> object:
     """Return a healthy, interface-compatible provider or raise.
 

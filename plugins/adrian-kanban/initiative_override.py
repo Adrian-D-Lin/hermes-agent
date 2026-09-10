@@ -232,6 +232,75 @@ def prepare_initiative_transition_override(
     )
 
 
+def preflight_approved_initiative_transition_override(
+    conn,
+    *,
+    request_id,
+    executor_session_id,
+    executor_profile,
+):
+    """Read-only revalidation of an approved initiative gate override.
+
+    Verifies the exact stored proposal, executor session/profile, current
+    re-derivation, and an approval state that permits execution without
+    consuming the approval or mutating SQL. Returns only the exact
+    initiative/destination facts needed by the command boundary.
+    """
+    if not request_id or not isinstance(request_id, str):
+        raise ValueError("request_id is required")
+    if not executor_session_id or not isinstance(executor_session_id, str):
+        raise ValueError("executor_session_id is required")
+    if executor_profile != "default":
+        raise ValueError(
+            "initiative gate override requires the default orchestrator executor"
+        )
+
+    approval_state = conn.execute(
+        "SELECT a.state FROM gate_override_proposals p "
+        "JOIN write_gate_kanban_approvals a ON a.approval_id = p.approval_id "
+        "WHERE p.request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if approval_state is None:
+        raise ValueError(f"unknown override request {request_id!r}")
+    if approval_state[0] != "approved":
+        raise ValueError("the approval is not in the approved state")
+
+    row = conn.execute(
+        "SELECT canonical_payload FROM gate_override_proposals WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    payload = json.loads(row["canonical_payload"])
+    stored_proposal = payload["proposal"]
+    executor = payload["executor"]
+    if executor.get("session_id") != executor_session_id:
+        raise ValueError("executor session does not match the approved override")
+    if executor.get("profile") != executor_profile:
+        raise ValueError("executor profile does not match the approved override")
+
+    rederived = derive_initiative_transition_override(
+        conn,
+        initiative_id=stored_proposal["initiative_id"],
+        board=stored_proposal["board"],
+        to_phase=stored_proposal["destination"]["phase"],
+        to_segment_id=stored_proposal["destination"]["segment_id"],
+        reconciliation_ref=stored_proposal["reconciliation_ref"],
+        override_reason=stored_proposal["override_reason"],
+        executor_session_id=executor_session_id,
+        executor_profile=executor_profile,
+    )
+    if rederived != stored_proposal:
+        raise ValueError(
+            "initiative record version no longer matches the approved override"
+        )
+
+    return {
+        "initiative_id": stored_proposal["initiative_id"],
+        "to_phase": rederived["destination"]["phase"],
+        "to_segment_id": rederived["destination"]["segment_id"],
+    }
+
+
 def execute_approved_initiative_transition_override(
     conn,
     *,

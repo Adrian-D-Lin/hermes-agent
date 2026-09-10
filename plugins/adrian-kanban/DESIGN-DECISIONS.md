@@ -29,3 +29,48 @@ match the stored closure timestamp and the destination must explicitly be null.
 The same approved digest therefore binds both closure-state and phase/segment
 changes. This is an internal representation of the approved behavior, not a new
 user approval step.
+
+## Shared segment-workspace root — Adrian approved, 2026-09-10
+
+All system-managed segment workspaces reside beneath one operator-configured
+absolute root shared by every initiative and trusted repository. The physical
+layout is deterministic:
+
+`<controlled_worktree_root>/<escaped initiative_id>/<escaped segment_id>/<escaped repository_identity>`
+
+The initiative/segment directory is the logical workspace and the exact
+Session Startup, task, dispatcher, and WriteGate binding. Each repository Git
+worktree is a child member directory. Task IDs and caller-supplied paths do not
+participate in physical path selection. DEV1's immutable segment projection
+pre-assigns the workspace identity and repository-member set; the controller
+derives the path and later materializes each Git worktree from the required
+baseline. No separate human approval or path choice occurs per segment.
+
+Hermes's retained `dir` workspace behavior is reused for dispatch so every task
+for DEV2 through DEV4 of a segment resolves the same segment directory and does
+not create or remove a per-task worktree. Before launch, the plugin verifies the
+stored directory, every member's repository, branch, base containment and head,
+and the absence of another active writer for the same logical workspace.
+
+WriteGate does not exempt the configured shared root. Its ordinary exact-
+binding rule naturally permits development churn inside the active segment
+subtree and rejects sibling initiatives, sibling segments, and paths outside
+the binding. Repository-level `Canon`, `4-artifacts`, and `5-archive` roots
+remain protected within every member and require the existing bounded lease;
+an identically named directory deeper in ordinary source code is not treated as
+a protected repository root.
+
+For a top-level Hermes session in DEV2 through DEV4, Session Startup resolves
+the affirmed initiative's current segment and `segment_workspace_id`, derives
+the same exact segment directory from trusted Kanban state and operator config,
+verifies its member worktrees, moves the session there, and presents that
+derived binding for the existing human confirmation. The user confirms the
+derived authority; the user does not select or type a filesystem path. A
+dispatched worker receives the same binding through dispatcher preassignment
+and does not run the interactive Session Startup protocol.
+
+This decision does not broaden WriteGate's assurance boundary. The pre-tool
+hook remains a policy guard rather than OS-level filesystem containment; live
+Hermes code outside the bound segment requires a lease through governed tools,
+while comprehensive prevention of alternate write routes requires a separate
+filesystem-permission or sandbox design.

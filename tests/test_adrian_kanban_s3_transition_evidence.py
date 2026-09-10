@@ -169,3 +169,284 @@ def test_completed_d4_can_enter_dev1_without_requiring_dev1_to_be_completed(
             module.validate_transition_evidence(conn, **arguments)["next_route"]
             == "DEV1"
         )
+
+
+@pytest.fixture
+def dev1_segment_evidence_case(commands_module, tmp_path, monkeypatch):
+    """A DEV1.7 result is the admitted DEV1 exit result, not phase_close."""
+    path, _ = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(path)
+    definitions = [
+        {"segment_id": "S1", "ordinal": 1, "dependency_ids": []},
+        {"segment_id": "S2", "ordinal": 2, "dependency_ids": ["S1"]},
+    ]
+    with sqlite3.connect(path) as conn:
+        card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE card_type='initiative'"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE initiative_transitions SET to_phase='DEV1' "
+            "WHERE initiative_id='initiative-1'"
+        )
+        conn.execute(
+            "INSERT INTO initiative_segment_projections "
+            "(projection_id, projection_version, initiative_card_id, initiative_id, "
+            "manifest_path, manifest_sha, content_digest, parsed_segment_definitions, "
+            "readiness_refs, validation_result, projected_at) VALUES "
+            "('projection-1', 1, ?, 'initiative-1', 'segments.json', ?, ?, ?, ?, "
+            "'accepted', 2)",
+            (
+                card_id,
+                "a" * 40,
+                "b" * 64,
+                json.dumps(definitions),
+                json.dumps({"S1": "ready:S1", "S2": "ready:S2"}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO initiative_phase_results "
+            "(result_id, initiative_card_id, initiative_id, phase, segment_id, "
+            "iteration, result_kind, contract_id, contract_version, canonical_payload, "
+            "accepted_task_refs, accepted_checkpoint_refs, actor_evidence, "
+            "idempotency_key, accepted, created_at) VALUES "
+            "('dev1-close', ?, 'initiative-1', 'DEV1', NULL, 1, "
+            "'segment_manifest_projection', 'adrian-kanban.lifecycle.dev1', '1', "
+            "?, '[]', '[]', ?, 'dev1-close-key', 1, 2)",
+            (
+                card_id,
+                json.dumps(
+                    {
+                        "projection_id": "projection-1",
+                        "projection_version": 1,
+                        "readiness_refs": {"S1": "ready:S1", "S2": "ready:S2"},
+                    }
+                ),
+                json.dumps(
+                    {"source_transition_id": 1, "actor_profile": "default"}
+                ),
+            ),
+        )
+    module = importlib.import_module(
+        f"{commands_module.__package__}.transition_evidence"
+    )
+    return path, module, dict(
+        initiative_card_id=card_id,
+        initiative_id="initiative-1",
+        from_phase="DEV1",
+        from_segment_id=None,
+        to_phase="DEV2",
+        to_segment_id="S1",
+        previous_transition_id=1,
+        phase_close_ref="dev1-close",
+    )
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        None,
+        "wrong_route",
+        "not_first_segment",
+        "stale_visit",
+        "wrong_projection",
+        "incomplete_readiness",
+        "wrong_kind",
+        "source_segment",
+    ],
+)
+def test_dev1_to_first_segment_uses_exact_combined_dev1_7_result(
+    dev1_segment_evidence_case, gap
+):
+    path, module, arguments = dev1_segment_evidence_case
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        if gap == "wrong_route":
+            arguments["to_phase"] = "DEV3"
+        elif gap == "not_first_segment":
+            arguments["to_segment_id"] = "S2"
+        elif gap == "stale_visit":
+            conn.execute(
+                "UPDATE initiative_phase_results SET actor_evidence=? "
+                "WHERE result_id='dev1-close'",
+                (json.dumps({"source_transition_id": 99, "actor_profile": "default"}),),
+            )
+        elif gap == "wrong_projection":
+            payload = json.loads(
+                conn.execute(
+                    "SELECT canonical_payload FROM initiative_phase_results "
+                    "WHERE result_id='dev1-close'"
+                ).fetchone()[0]
+            )
+            payload["projection_id"] = "other"
+            conn.execute(
+                "UPDATE initiative_phase_results SET canonical_payload=? "
+                "WHERE result_id='dev1-close'",
+                (json.dumps(payload),),
+            )
+        elif gap == "incomplete_readiness":
+            payload = json.loads(
+                conn.execute(
+                    "SELECT canonical_payload FROM initiative_phase_results "
+                    "WHERE result_id='dev1-close'"
+                ).fetchone()[0]
+            )
+            payload["readiness_refs"].pop("S2")
+            conn.execute(
+                "UPDATE initiative_phase_results SET canonical_payload=? "
+                "WHERE result_id='dev1-close'",
+                (json.dumps(payload),),
+            )
+        elif gap == "wrong_kind":
+            conn.execute(
+                "UPDATE initiative_phase_results SET result_kind='phase_close' "
+                "WHERE result_id='dev1-close'"
+            )
+        elif gap == "source_segment":
+            arguments["from_segment_id"] = "S1"
+
+        before = conn.total_changes
+        if gap is None:
+            result = module.validate_transition_evidence(conn, **arguments)
+            assert result["projection_id"] == "projection-1"
+        else:
+            with pytest.raises(ValueError):
+                module.validate_transition_evidence(conn, **arguments)
+        assert conn.total_changes == before
+
+
+@pytest.fixture
+def dev4_next_segment_evidence_case(commands_module, tmp_path, monkeypatch):
+    """An accepted DEV4.5 checkpoint alone admits the exact next segment."""
+    path, _ = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(path)
+    with sqlite3.connect(path) as conn:
+        card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE card_type='initiative'"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE initiative_transitions SET to_phase='DEV4', to_segment_id='S1' "
+            "WHERE initiative_id='initiative-1'"
+        )
+        conn.execute(
+            "INSERT INTO initiative_phase_results "
+            "(result_id, initiative_card_id, initiative_id, phase, segment_id, "
+            "iteration, result_kind, contract_id, contract_version, canonical_payload, "
+            "accepted_task_refs, accepted_checkpoint_refs, actor_evidence, "
+            "idempotency_key, accepted, created_at) VALUES "
+            "('checkpoint:DEV4.5:S1', ?, 'initiative-1', 'DEV4', 'S1', 7, "
+            "'orchestration_checkpoint', 'adrian-kanban.lifecycle.dev4', '1', "
+            "?, '[]', '[\"checkpoint:DEV4.4:S1\"]', ?, "
+            "'dev4-5-key', 1, 2)",
+            (
+                card_id,
+                json.dumps(
+                    {
+                        "step": "DEV4.5",
+                        "workspace_retirement_checkpoint_ref": "checkpoint:DEV4.4:S1",
+                        "completed_segment_id": "S1",
+                        "action": "admit_next_segment",
+                        "next_segment_id": "S2",
+                        "closure_evidence_ref": "closure:S1@" + "a" * 40,
+                        "next_route": "DEV2",
+                    }
+                ),
+                json.dumps(
+                    {"source_transition_id": 1, "actor_profile": "default"}
+                ),
+            ),
+        )
+    module = importlib.import_module(
+        f"{commands_module.__package__}.transition_evidence"
+    )
+    return path, module, dict(
+        initiative_card_id=card_id,
+        initiative_id="initiative-1",
+        from_phase="DEV4",
+        from_segment_id="S1",
+        to_phase="DEV2",
+        to_segment_id="S2",
+        previous_transition_id=1,
+        phase_close_ref="checkpoint:DEV4.5:S1",
+    )
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        None,
+        "missing_ref",
+        "unaccepted",
+        "wrong_segment",
+        "wrong_step",
+        "wrong_action",
+        "wrong_completed_segment",
+        "wrong_next_segment",
+        "wrong_route",
+        "stale_visit",
+        "source_segment_missing",
+        "destination_phase",
+        "destination_segment_missing",
+    ],
+)
+def test_dev4_5_admits_only_its_exact_next_segment_transition(
+    dev4_next_segment_evidence_case, gap
+):
+    path, module, arguments = dev4_next_segment_evidence_case
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        if gap == "missing_ref":
+            arguments["phase_close_ref"] = "missing"
+        elif gap == "unaccepted":
+            conn.execute(
+                "UPDATE initiative_phase_results SET accepted=0 "
+                "WHERE result_id='checkpoint:DEV4.5:S1'"
+            )
+        elif gap == "wrong_segment":
+            conn.execute(
+                "UPDATE initiative_phase_results SET segment_id='S2' "
+                "WHERE result_id='checkpoint:DEV4.5:S1'"
+            )
+        elif gap == "stale_visit":
+            conn.execute(
+                "UPDATE initiative_phase_results SET actor_evidence=? "
+                "WHERE result_id='checkpoint:DEV4.5:S1'",
+                (json.dumps({"source_transition_id": 99, "actor_profile": "default"}),),
+            )
+        elif gap == "source_segment_missing":
+            arguments["from_segment_id"] = None
+        elif gap == "destination_phase":
+            arguments["to_phase"] = "DEV3"
+        elif gap == "destination_segment_missing":
+            arguments["to_segment_id"] = None
+        else:
+            field_values = {
+                "wrong_step": ("step", "DEV4.4"),
+                "wrong_action": ("action", "close_initiative"),
+                "wrong_completed_segment": ("completed_segment_id", "S0"),
+                "wrong_next_segment": ("next_segment_id", "S3"),
+                "wrong_route": ("next_route", "CLOSED"),
+            }
+            if gap in field_values:
+                payload = json.loads(
+                    conn.execute(
+                        "SELECT canonical_payload FROM initiative_phase_results "
+                        "WHERE result_id='checkpoint:DEV4.5:S1'"
+                    ).fetchone()[0]
+                )
+                field, value = field_values[gap]
+                payload[field] = value
+                conn.execute(
+                    "UPDATE initiative_phase_results SET canonical_payload=? "
+                    "WHERE result_id='checkpoint:DEV4.5:S1'",
+                    (json.dumps(payload),),
+                )
+
+        before = conn.total_changes
+        if gap is None:
+            result = module.validate_transition_evidence(conn, **arguments)
+            assert result["action"] == "admit_next_segment"
+            assert result["next_segment_id"] == "S2"
+        else:
+            with pytest.raises(ValueError):
+                module.validate_transition_evidence(conn, **arguments)
+        assert conn.total_changes == before

@@ -37,6 +37,7 @@ def modules():
         "provider": importlib.import_module(f"{package_name}.provider"),
         "schema": importlib.import_module(f"{package_name}.schema"),
         "task_inputs": importlib.import_module(f"{package_name}.task_inputs"),
+        "workspace": importlib.import_module(f"{package_name}.workspace"),
     }
     yield loaded
     for module_name in tuple(sys.modules):
@@ -148,7 +149,7 @@ def _preparer(task_inputs):
     return prepare
 
 
-def _boundary(modules, database_path, provider):
+def _boundary(modules, database_path, provider, *, workspace_registry=None):
     commands = modules["commands"]
     return commands._CommandBoundary(
         database_path=str(database_path),
@@ -161,6 +162,7 @@ def _boundary(modules, database_path, provider):
             "builder-tester",
         },
         task_input_preparer=_preparer(modules["task_inputs"]),
+        workspace_registry=workspace_registry,
     )
 
 
@@ -545,6 +547,122 @@ def test_segment_lifecycle_create_requires_exact_active_workspace(
         assert conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE id = 'task-dev2'"
         ).fetchone()[0] == 0
+
+
+def test_segment_lifecycle_create_derives_shared_segment_directory(
+    modules, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, modules)
+    card_id = _seed_initiative(database_path, "DEV2", "S1")
+    shared_root = (tmp_path / "all-segment-worktrees").resolve()
+    repository = (tmp_path / "repository").resolve()
+    repository.mkdir()
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            "INSERT INTO initiative_segment_projections ("
+            "projection_id, projection_version, initiative_card_id, initiative_id, "
+            "manifest_path, manifest_sha, content_digest, parsed_segment_definitions, "
+            "readiness_refs, validation_result, projected_at) VALUES ("
+            "'projection-1', 1, ?, 'initiative-1', 'segments.json', ?, ?, ?, ?, "
+            "'accepted', 1)",
+            (
+                card_id,
+                "a" * 40,
+                "b" * 64,
+                json.dumps([{"segment_id": "S1", "ordinal": 1}]),
+                json.dumps({"S1": "ready:S1"}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO segment_workspaces ("
+            "workspace_id, initiative_card_id, initiative_id, segment_id, "
+            "projection_id, lifecycle_state, controller_binding_ref, active, "
+            "created_at, updated_at) VALUES ('workspace-S1', ?, 'initiative-1', "
+            "'S1', 'projection-1', 'active', "
+            "'adrian-kanban:workspace-controller:v1', 1, 1, 1)",
+            (card_id,),
+        )
+        conn.execute(
+            "INSERT INTO segment_workspace_members ("
+            "workspace_id, repository_identity, relative_path, branch, "
+            "required_base_sha, observed_head, member_state, observed_at) "
+            "VALUES ('workspace-S1', 'repo-1', 'initiative-1/S1/repo-1', "
+            "'initiative-1/S1', NULL, NULL, 'planned', 1)"
+        )
+    workspace = modules["workspace"]
+    registry = workspace._TrustedRepositoryRegistry(
+        (
+            workspace._RepositoryRegistration(
+                "repo-1", str(repository), str(shared_root)
+            ),
+        )
+    )
+    contract = _contract(
+        step="DEV2.1",
+        governing_source_refs=[],
+        prior_record_refs=["2-design/review.md"],
+        segment_id="S1",
+        segment_workspace_id="workspace-S1",
+    )
+    payload = _payload(
+        task_id="task-dev2",
+        title="DEV2 brief draft",
+        body="initiative_id: initiative-1\nstep: DEV2.1\nsegment_id: S1",
+        lifecycle_contract_v1=contract,
+    )
+
+    result = _submit(
+        _boundary(
+            modules,
+            database_path,
+            provider,
+            workspace_registry=registry,
+        ),
+        payload,
+        "create-derived-workspace",
+    )
+
+    assert result["result"] == "ACCEPTED"
+    with sqlite3.connect(database_path) as conn:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks "
+            "WHERE id = 'task-dev2'"
+        ).fetchone()
+    assert row == (
+        "dir",
+        str((shared_root / "initiative-1" / "S1").resolve()),
+    )
+
+
+def test_segment_lifecycle_create_rejects_caller_selected_workspace(
+    modules, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, modules)
+    _seed_initiative(database_path, "DEV2", "S1")
+    payload = _payload(
+        task_id="task-dev2",
+        title="DEV2 brief draft",
+        body="initiative_id: initiative-1\nstep: DEV2.1\nsegment_id: S1",
+        lifecycle_contract_v1=_contract(
+            step="DEV2.1",
+            governing_source_refs=[],
+            prior_record_refs=["2-design/review.md"],
+            segment_id="S1",
+            segment_workspace_id="workspace-S1",
+        ),
+        workspace_kind="worktree",
+        workspace_path=str((tmp_path / "caller-selected").resolve()),
+    )
+
+    result = _submit(
+        _boundary(modules, database_path, provider),
+        payload,
+        "reject-caller-workspace",
+    )
+
+    assert result["result"] == "REJECTED"
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
 def _sequence_snapshot(commands, step, predecessor_ref):

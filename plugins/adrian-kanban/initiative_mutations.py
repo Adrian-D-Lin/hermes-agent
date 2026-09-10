@@ -16,6 +16,7 @@ from typing import Any
 from writegate.kanban_approvals import (
     KanbanInitiativeApprovalConsumption,
     consume_approved,
+    validate_approved,
 )
 
 from .initiative_checkpoints import admit_orchestration_checkpoint
@@ -97,7 +98,7 @@ def _load_approval(conn: Any, approval_id: str) -> Any:
     row = conn.execute(
         "SELECT approval_id, operation, initiative_id, proposed_creation_id, "
         "expected_version, canonical_digest, authorizer_evidence, session_id, "
-        "expires_at FROM write_gate_kanban_approvals WHERE approval_id = ?",
+        "expires_at, approved_at FROM write_gate_kanban_approvals WHERE approval_id = ?",
         (approval_id,),
     ).fetchone()
     if row is None:
@@ -105,7 +106,7 @@ def _load_approval(conn: Any, approval_id: str) -> Any:
     return row
 
 
-def _consume_approval(
+def _approval_consumption(
     conn: Any,
     context: Any,
     approval_id: str,
@@ -114,9 +115,9 @@ def _consume_approval(
     payload: dict[str, Any],
     initiative_id: str | None,
     proposed_creation_id: str | None,
-) -> None:
+) -> KanbanInitiativeApprovalConsumption:
     row = _load_approval(conn, approval_id)
-    consumption = KanbanInitiativeApprovalConsumption(
+    return KanbanInitiativeApprovalConsumption(
         approval_id=approval_id,
         request_id=context.attempt_id,
         operation=operation,
@@ -131,7 +132,52 @@ def _consume_approval(
         consumed_mutation_id=context.attempt_id,
         consumed_idempotency_ref=context.idempotency_key,
     )
+
+
+def _consume_approval(
+    conn: Any,
+    context: Any,
+    approval_id: str,
+    operation: str,
+    expected_version: int,
+    payload: dict[str, Any],
+    initiative_id: str | None,
+    proposed_creation_id: str | None,
+) -> None:
+    consumption = _approval_consumption(
+        conn,
+        context,
+        approval_id,
+        operation,
+        expected_version,
+        payload,
+        initiative_id,
+        proposed_creation_id,
+    )
     consume_approved(conn, consumption, now=int(time.time()))
+
+
+def _validate_approval(
+    conn: Any,
+    context: Any,
+    approval_id: str,
+    operation: str,
+    expected_version: int,
+    payload: dict[str, Any],
+    initiative_id: str | None,
+    proposed_creation_id: str | None,
+) -> None:
+    consumption = _approval_consumption(
+        conn,
+        context,
+        approval_id,
+        operation,
+        expected_version,
+        payload,
+        initiative_id,
+        proposed_creation_id,
+    )
+    validate_approved(conn, consumption, now=int(time.time()))
 
 
 def _advance_initiative_version(
@@ -263,6 +309,124 @@ def _handle_create_initiative(context: Any) -> dict[str, Any]:
         "phase": "D1",
         "record_version": expected_version,
     }
+
+
+def _preflight_dev4_workspace_checkpoint_effect(context: Any) -> dict[str, Any] | None:
+    payload = context.payload
+    if context.operation != "kanban_update_initiative":
+        return None
+    unknown = set(payload.keys()) - {
+        "initiative_id",
+        "update_kind",
+        "update",
+        "approval_id",
+        "board",
+    }
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+    initiative_id = payload.get("initiative_id")
+    update_kind = payload.get("update_kind")
+    update = payload.get("update")
+    approval_id = payload.get("approval_id")
+    board = payload.get("board")
+    if not (type(initiative_id) is str and initiative_id.strip()):
+        raise ValueError("initiative_id must be a nonblank string")
+    if not (type(update_kind) is str and update_kind.strip()):
+        raise ValueError("update_kind must be a nonblank string")
+    if not isinstance(update, dict):
+        raise ValueError("update must be an object")
+    if not (type(approval_id) is str and approval_id.strip()):
+        raise ValueError("approval_id must be a nonblank string")
+    if not (type(board) is str and board.strip()):
+        raise ValueError("board must be a nonblank string")
+    initiative_id = initiative_id.strip()
+    update_kind = update_kind.strip()
+    board = board.strip()
+    if update_kind != "orchestration_checkpoint":
+        return None
+    result = update.get("result")
+    step = result.get("step") if isinstance(result, dict) else None
+    if step not in {"DEV4.3", "DEV4.4"}:
+        return None
+
+    card = context.connection.execute(
+        "SELECT id, record_version FROM adrian_kanban_cards "
+        "WHERE initiative_id = ? AND board_slug = ? "
+        "AND card_type = 'initiative' AND task_id IS NULL AND closed_at IS NULL",
+        (initiative_id, board),
+    ).fetchone()
+    if card is None:
+        raise ValueError("open initiative card not found")
+    card_id = card["id"]
+    current_version = card["record_version"]
+    expected_version = context.binding.expected_version
+    if current_version != expected_version:
+        raise ValueError("stale initiative version")
+    if context.binding.actor_profile != "default":
+        raise ValueError("actor profile must be default")
+
+    _validate_approval(
+        context.connection,
+        context,
+        approval_id,
+        "kanban_update_initiative",
+        expected_version,
+        payload,
+        initiative_id,
+        None,
+    )
+
+    try:
+        admission = admit_orchestration_checkpoint(
+            context.connection,
+            initiative_card_id=card_id,
+            initiative_id=initiative_id,
+            actor_profile=context.binding.actor_profile,
+            update=update,
+            prepared_execution=context.prepared_phase_result,
+            approval_id=approval_id,
+            require_effect_state=False,
+        )
+    except ValueError as exc:
+        raise CommandRejected(
+            failed_checks=(
+                FailedCheck(
+                    code="ORCHESTRATION_CHECKPOINT_EVIDENCE",
+                    target="update.result",
+                    expected="valid orchestration checkpoint evidence for the requested step",
+                    observed=str(exc),
+                    accepted_format="recognized D4/DEV1 checkpoint result schema with complete prior checkpoint and task evidence",
+                    remediation="correct the checkpoint evidence so it matches the exact accepted predecessor records and retry",
+                    responsible_actor="orchestrator",
+                    retry="same_operation",
+                ),
+            ),
+        ) from None
+
+    row = _load_approval(context.connection, approval_id)
+    approved_at = row["approved_at"]
+    if not (type(approved_at) is int and approved_at > 0):
+        raise ValueError("approval approved_at must be a positive integer")
+
+    effect: dict[str, Any] = {
+        "initiative_id": initiative_id,
+        "segment_id": update.get("segment_id"),
+        "approved_at": approved_at,
+        "step": step,
+    }
+    if step == "DEV4.3":
+        member_merges = result.get("member_merges")
+        if not isinstance(member_merges, list):
+            raise ValueError("result.member_merges must be a list")
+        accepted_member_heads = tuple(
+            {
+                "repository_identity": entry["repository_identity"],
+                "accepted_sha": entry["dev3_accepted_sha"],
+            }
+            for entry in member_merges
+        )
+        effect["accepted_member_heads"] = accepted_member_heads
+    return effect
 
 
 def _handle_update_initiative(context: Any) -> dict[str, Any]:
@@ -506,6 +670,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
                 actor_profile=context.binding.actor_profile,
                 update=update,
                 prepared_execution=context.prepared_phase_result,
+                approval_id=approval_id,
             )
         except ValueError as exc:
             raise CommandRejected(
@@ -545,10 +710,21 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
             sort_keys=True,
             separators=(",", ":"),
         )
+        latest_row = context.connection.execute(
+            "SELECT transition_id FROM initiative_transitions "
+            "WHERE initiative_id = ? ORDER BY transition_id DESC LIMIT 1",
+            (initiative_id,),
+        ).fetchone()
+        if latest_row is None:
+            raise ValueError("no initiative transition found")
+        source_transition_id = latest_row["transition_id"]
+        if not (type(source_transition_id) is int and source_transition_id > 0):
+            raise ValueError("latest transition ID must be a positive integer")
         actor_evidence = json.dumps(
             {
                 "session_id": context.binding.session_id,
                 "actor_profile": context.binding.actor_profile,
+                "source_transition_id": source_transition_id,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -566,7 +742,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
                 card_id,
                 initiative_id,
                 admission.phase,
-                None,
+                update.get("segment_id"),
                 admission.iteration,
                 "orchestration_checkpoint",
                 admission.contract_id,
@@ -1219,7 +1395,7 @@ def _validate_transition_payload(payload: dict) -> dict:
     return normalized
 
 
-def _handle_transition_initiative(context: Any) -> dict[str, Any]:
+def _preflight_transition_initiative(context: Any) -> dict[str, Any]:
     payload = context.payload
     normalized = _validate_transition_payload(payload)
     initiative_id = normalized["initiative_id"]
@@ -1311,6 +1487,46 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
                 ),
             ),
         ) from None
+    _validate_approval(
+        context.connection,
+        context,
+        approval_id,
+        "kanban_transition_initiative",
+        expected_version,
+        payload,
+        initiative_id,
+        None,
+    )
+    return {
+        "initiative_id": initiative_id,
+        "to_phase": to_phase,
+        "to_segment_id": to_segment_id,
+        "reconciliation_ref": reconciliation_ref,
+        "phase_close_ref": phase_close_ref,
+        "approval_id": approval_id,
+        "board": board,
+        "card_id": card_id,
+        "expected_version": expected_version,
+        "predecessor_id": predecessor_id,
+        "from_phase": from_phase,
+        "from_segment_id": from_segment_id,
+    }
+
+
+def _handle_transition_initiative(context: Any) -> dict[str, Any]:
+    payload = context.payload
+    preflight = _preflight_transition_initiative(context)
+    initiative_id = preflight["initiative_id"]
+    to_phase = preflight["to_phase"]
+    to_segment_id = preflight["to_segment_id"]
+    reconciliation_ref = preflight["reconciliation_ref"]
+    phase_close_ref = preflight["phase_close_ref"]
+    approval_id = preflight["approval_id"]
+    card_id = preflight["card_id"]
+    expected_version = preflight["expected_version"]
+    predecessor_id = preflight["predecessor_id"]
+    from_phase = preflight["from_phase"]
+    from_segment_id = preflight["from_segment_id"]
     _consume_approval(
         context.connection,
         context,
@@ -1381,18 +1597,34 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
 
 def _handle_close_initiative(context: Any) -> dict[str, Any]:
     payload = context.payload
+    composition_fields = {
+        "dev4_5_checkpoint_ref",
+        "final_summary_ref",
+        "repository_reconciliation_ref",
+        "resolved_phase_result_refs",
+        "cancelled_task_refs",
+    }
     unknown = set(payload.keys()) - {
         "initiative_id",
         "closure_result_ref",
         "approval_id",
         "board",
-    }
+    } - composition_fields
     if unknown:
         raise ValueError(f"unknown fields: {sorted(unknown)}")
+    present_composition = composition_fields & set(payload.keys())
+    if present_composition and present_composition != composition_fields:
+        raise ValueError("closure composition fields are all-or-none")
+    public_composition = bool(present_composition)
     initiative_id = payload.get("initiative_id")
     closure_result_ref = payload.get("closure_result_ref")
     approval_id = payload.get("approval_id")
     board = payload.get("board")
+    dev4_5_checkpoint_ref = payload.get("dev4_5_checkpoint_ref")
+    final_summary_ref = payload.get("final_summary_ref")
+    repository_reconciliation_ref = payload.get("repository_reconciliation_ref")
+    resolved_phase_result_refs = payload.get("resolved_phase_result_refs")
+    cancelled_task_refs = payload.get("cancelled_task_refs")
     if not (type(initiative_id) is str and initiative_id.strip()):
         raise ValueError("initiative_id must be a nonblank string")
     if not (type(closure_result_ref) is str and closure_result_ref.strip()):
@@ -1401,6 +1633,41 @@ def _handle_close_initiative(context: Any) -> dict[str, Any]:
         raise ValueError("approval_id must be a nonblank string")
     if not (type(board) is str and board.strip()):
         raise ValueError("board must be a nonblank string")
+    if public_composition:
+        if not (
+            type(dev4_5_checkpoint_ref) is str and dev4_5_checkpoint_ref.strip()
+        ):
+            raise ValueError("dev4_5_checkpoint_ref must be a nonblank string")
+        if not (type(final_summary_ref) is str and final_summary_ref.strip()):
+            raise ValueError("final_summary_ref must be a nonblank string")
+        if not (
+            type(repository_reconciliation_ref) is str
+            and repository_reconciliation_ref.strip()
+        ):
+            raise ValueError("repository_reconciliation_ref must be a nonblank string")
+        if not isinstance(resolved_phase_result_refs, list):
+            raise ValueError("resolved_phase_result_refs must be a list")
+        for ref in resolved_phase_result_refs:
+            if not (type(ref) is str and ref.strip()):
+                raise ValueError(
+                    "resolved_phase_result_refs must contain nonblank strings"
+                )
+        if len(resolved_phase_result_refs) != len(set(resolved_phase_result_refs)):
+            raise ValueError("resolved_phase_result_refs must be unique")
+        if not isinstance(cancelled_task_refs, list):
+            raise ValueError("cancelled_task_refs must be a list")
+        for ref in cancelled_task_refs:
+            if not (type(ref) is str and ref.strip()):
+                raise ValueError(
+                    "cancelled_task_refs must contain nonblank strings"
+                )
+        if len(cancelled_task_refs) != len(set(cancelled_task_refs)):
+            raise ValueError("cancelled_task_refs must be unique")
+        dev4_5_checkpoint_ref = dev4_5_checkpoint_ref.strip()
+        final_summary_ref = final_summary_ref.strip()
+        repository_reconciliation_ref = repository_reconciliation_ref.strip()
+        resolved_phase_result_refs = [ref.strip() for ref in resolved_phase_result_refs]
+        cancelled_task_refs = [ref.strip() for ref in cancelled_task_refs]
     initiative_id = initiative_id.strip()
     closure_result_ref = closure_result_ref.strip()
     board = board.strip()
@@ -1437,6 +1704,137 @@ def _handle_close_initiative(context: Any) -> dict[str, Any]:
     if current_phase == "PC1" and current_segment_id is not None:
         raise ValueError(
             "PC1 closure must be milestone-scoped (segment_id must be NULL)"
+        )
+    if public_composition:
+        if current_phase != "DEV4":
+            raise ValueError("public closure composition requires DEV4")
+        if current_segment_id is None:
+            raise ValueError("public closure composition requires a segment")
+
+    if public_composition:
+        checkpoint_rows = context.connection.execute(
+            "SELECT result_id, initiative_card_id, initiative_id, phase, segment_id, "
+            "result_kind, contract_id, contract_version, accepted, iteration, "
+            "canonical_payload, actor_evidence "
+            "FROM initiative_phase_results WHERE result_id = ?",
+            (dev4_5_checkpoint_ref,),
+        ).fetchall()
+        if len(checkpoint_rows) != 1:
+            raise ValueError("final checkpoint not found exactly once")
+        checkpoint_row = checkpoint_rows[0]
+        if checkpoint_row["initiative_card_id"] != card_id:
+            raise ValueError("checkpoint card mismatch")
+        if checkpoint_row["initiative_id"] != initiative_id:
+            raise ValueError("checkpoint initiative mismatch")
+        if checkpoint_row["phase"] != "DEV4":
+            raise ValueError("checkpoint phase mismatch")
+        if checkpoint_row["segment_id"] != current_segment_id:
+            raise ValueError("checkpoint segment mismatch")
+        if checkpoint_row["result_kind"] != "orchestration_checkpoint":
+            raise ValueError("checkpoint kind mismatch")
+        if checkpoint_row["contract_id"] != "adrian-kanban.lifecycle.dev4":
+            raise ValueError("checkpoint contract mismatch")
+        if checkpoint_row["contract_version"] != "1":
+            raise ValueError("checkpoint contract version mismatch")
+        if checkpoint_row["accepted"] != 1:
+            raise ValueError("checkpoint not accepted")
+        try:
+            checkpoint_payload = json.loads(checkpoint_row["canonical_payload"])
+        except (json.JSONDecodeError, TypeError):
+            raise ValueError("invalid checkpoint payload")
+        if not isinstance(checkpoint_payload, dict):
+            raise ValueError("checkpoint payload must be an object")
+        checkpoint_required_keys = {
+            "step",
+            "workspace_retirement_checkpoint_ref",
+            "completed_segment_id",
+            "action",
+            "next_segment_id",
+            "closure_evidence_ref",
+            "next_route",
+        }
+        if set(checkpoint_payload.keys()) != checkpoint_required_keys:
+            raise ValueError("checkpoint payload must contain exact fields")
+        if checkpoint_payload.get("step") != "DEV4.5":
+            raise ValueError("checkpoint step must be DEV4.5")
+        for key in (
+            "workspace_retirement_checkpoint_ref",
+            "completed_segment_id",
+            "closure_evidence_ref",
+            "next_route",
+        ):
+            value = checkpoint_payload.get(key)
+            if not (type(value) is str and value.strip()):
+                raise ValueError(f"checkpoint {key} must be nonblank")
+        if checkpoint_payload.get("action") != "close_initiative":
+            raise ValueError("checkpoint action must close the initiative")
+        if checkpoint_payload.get("completed_segment_id") != current_segment_id:
+            raise ValueError("checkpoint completed segment mismatch")
+        if checkpoint_payload.get("next_segment_id") is not None:
+            raise ValueError("checkpoint next segment must be null")
+        if checkpoint_payload.get("next_route") != "CLOSED":
+            raise ValueError("checkpoint next route must be CLOSED")
+        if checkpoint_payload.get("closure_evidence_ref") != final_summary_ref:
+            raise ValueError("checkpoint closure evidence mismatch")
+        try:
+            checkpoint_actor = json.loads(checkpoint_row["actor_evidence"])
+        except (json.JSONDecodeError, TypeError):
+            raise ValueError("invalid checkpoint actor evidence")
+        if not isinstance(checkpoint_actor, dict):
+            raise ValueError("checkpoint actor evidence must be an object")
+        source_transition_id = checkpoint_actor.get("source_transition_id")
+        if not (
+            type(source_transition_id) is int
+            and not isinstance(source_transition_id, bool)
+            and source_transition_id > 0
+        ):
+            raise ValueError("checkpoint source transition must be positive")
+        if source_transition_id != latest["transition_id"]:
+            raise ValueError("checkpoint source transition mismatch")
+
+        existing_closure = context.connection.execute(
+            "SELECT 1 FROM initiative_phase_results WHERE result_id = ?",
+            (closure_result_ref,),
+        ).fetchone()
+        if existing_closure is not None:
+            raise ValueError("closure result already present")
+
+        closure_payload = {
+            "final_summary_ref": final_summary_ref,
+            "user_approval_ref": approval_id,
+            "repository_reconciliation_ref": repository_reconciliation_ref,
+            "resolved_phase_result_refs": resolved_phase_result_refs,
+            "cancelled_task_refs": cancelled_task_refs,
+            "closure_conclusion": "approved",
+        }
+        context.connection.execute(
+            "INSERT INTO initiative_phase_results ("
+            "result_id, initiative_card_id, initiative_id, phase, segment_id, "
+            "iteration, result_kind, contract_id, contract_version, canonical_payload, "
+            "accepted_task_refs, accepted_checkpoint_refs, actor_evidence, "
+            "idempotency_key, accepted, created_at) VALUES "
+            "(?, ?, ?, ?, ?, ?, 'initiative_closure', ?, '1', ?, '[]', ?, ?, ?, 1, ?)",
+            (
+                closure_result_ref,
+                card_id,
+                initiative_id,
+                current_phase,
+                current_segment_id,
+                checkpoint_row["iteration"] + 1,
+                "adrian-kanban.lifecycle.dev4",
+                json.dumps(closure_payload, sort_keys=True, separators=(",", ":")),
+                json.dumps([dev4_5_checkpoint_ref]),
+                json.dumps(
+                    {
+                        "session_id": getattr(context, "session_id", None),
+                        "actor_profile": "default",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                context.idempotency_key,
+                int(time.time()),
+            ),
         )
 
     closure_row = context.connection.execute(

@@ -56,9 +56,23 @@ def test_derive_project_root_finds_git(tmp_path, recovery_mods):
     assert root == str(tmp_path / "proj")
 
 
-def test_derive_project_root_falls_back_for_non_git(tmp_path, recovery_mods):
+def test_derive_project_root_falls_back_for_non_git(
+    tmp_path, recovery_mods, monkeypatch
+):
     worktree = tmp_path / "no-git"
     worktree.mkdir()
+    # The constrained test environment may place pytest temp directories
+    # beneath a real Git worktree.  Mask only parent ``.git`` discovery so
+    # this case remains the intended non-Git binding without changing normal
+    # directory existence checks.
+    real_isdir = recovery_mods.recovery.os.path.isdir
+    monkeypatch.setattr(
+        recovery_mods.recovery.os.path,
+        "isdir",
+        lambda path: False
+        if recovery_mods.recovery.os.path.basename(path) == ".git"
+        else real_isdir(path),
+    )
     root = recovery_mods.recovery.derive_project_root(str(worktree))
     assert root == str(worktree)
 

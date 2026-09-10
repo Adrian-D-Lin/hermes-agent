@@ -71,16 +71,21 @@ Before performing phase work, resolve the active segment and workspace:
 5. If exactly one task is eligible for this profile, anchor to it. If
    multiple tasks are eligible, present them for selection. If none is
    eligible, report the missing or blocked work.
-6. Resolve the segment workspace from the task card's
-   `segment_workspace_ref`.
-   <!-- TODO: deterministic workspace resolution logic — to be provided
-   when the Kanban workspace resolver is implemented. -->
-   Verify the worktree exists, is on the expected branch, and its base
-   SHA matches the segment register's recorded base SHA.
-7. Obtain the trusted workspace binding
-   (CONFIRMED_WORKTREE_BINDING v1). Confirm the binding's
-   `segment_id`, `worktree_path`, and `git_branch` match the resolved
-   segment workspace.
+6. The plugin—not the caller—derives the physical segment root from the
+   active `segment_workspace_id` in the task's immutable
+   `lifecycle_contract_v1` and the trusted repository registry. The task
+   card projection exposes `lifecycle_phase`, `segment_id`, and
+   `segment_workspace_id`; an absolute path is not accepted from the task
+   caller. On dispatch, the controller checks the worktree/repository
+   identity, the expected branch, required base ancestry, and one active
+   single writer. Legitimate commits may advance HEAD after
+   materialization.
+7. Read the task's `task_input_manifest_v1`, which exactly covers the
+   declared reference paths (`baseline_refs`, `governing_source_refs`,
+   `prior_record_refs`, and, after the first sequence item,
+   `predecessor_ref`). Each entry is pinned by `sha256` and either a Git
+   `source_locator` or a stored snapshot attachment; `context_ref` gives
+   the reading instruction for that entry.
 8. Retain the tuple `initiative_id + segment_id + phase + task_id +
    worktree_path + binding` as the session anchor. Revalidate it before
    governed mutations. If the initiative has advanced (a newer
@@ -96,12 +101,14 @@ worktree:
 - The active segment is not in the segment register.
 - The task card's `segment_id` does not match the active segment from
   the chain.
-- The task card's `segment_workspace_ref` is missing or does not
-  match the expected path.
-- The worktree does not exist, is on the wrong branch, or its base SHA
-  does not match.
-- The workspace binding is missing or does not match the segment
-  workspace.
+- The task card's `segment_workspace_id` is missing from the
+  `lifecycle_contract_v1`, or the system-derived segment root cannot be
+  resolved through the trusted repository registry.
+- The worktree does not exist, is on the wrong branch, fails required
+  base ancestry, or has more than one active writer.
+- The task's `task_input_manifest_v1` does not exactly cover the
+  declared reference paths, or an entry's `sha256` / `source_locator`
+  pin does not verify.
 - The segment's dependencies are not all closed.
 - The DEV3 exit gate has not been satisfied for this segment.
 
@@ -371,7 +378,10 @@ segment documentation file.
 
 ## DEV4.3 — Segment Merge and Integration
 
-The orchestrator merges the segment into `origin/main`.
+DEV4.3 is coordinator-owned. Paths and delivery heads are not
+caller-selected. The orchestrator verifies the accepted DEV3 heads,
+seals each current delivery head, performs the ancestry-preserving
+merges into `origin/main`, and records the accepted merge checkpoint.
 
 Prerequisites before merge:
 - The DEV4.1 archival disposition is executed.
@@ -382,13 +392,15 @@ Prerequisites before merge:
   DEV4 evidence.
 
 The orchestrator:
-1. Commits any remaining DEV4 evidence to the segment workspace.
-2. Merges the segment branch into `origin/main`.
+1. Verifies the accepted DEV3 heads and seals each current delivery
+   head.
+2. Merges the sealed segment branch into `origin/main` with
+   ancestry preserved.
 3. Verifies the merge: the merged SHA is recorded, the merge
    introduces no new test failures against the exhaustive test store,
    and the segment boundary is preserved in the merged state.
-4. Records the merge evidence (branch, source SHA, target SHA, merge
-   commit SHA) under `2-design/<segment-id>/`.
+4. Records the accepted merge checkpoint (branch, source SHA, target
+   SHA, merge commit SHA) under `2-design/<segment-id>/`.
 
 A failed Kanban transition after a successful Git merge is a Kanban
 mechanics failure. The merge evidence remains valid; the Kanban
@@ -399,24 +411,32 @@ is not invalidated.
 
 ## DEV4.4 — Workspace Retirement
 
-The orchestrator retires the segment workspace.
+DEV4.4 is coordinator-owned retirement. The orchestrator verifies the
+merged state, marks every member and the workspace retired/inactive,
+and records the accepted retirement checkpoint. The worktree is not
+deleted merely as an agent instruction.
 
 After the merge is verified and the Kanban transition is recorded, the
 segment workspace is no longer the writable authority. The
 orchestrator:
-1. Confirms no pending writes remain in the segment workspace.
-2. Records the retirement in the segment register at
-   `2-design/segment-register.md` (state updated to retired).
-3. Releases the `segment_workspace_ref` binding on the task card.
-   <!-- TODO: exact workspace retirement mechanism to be confirmed
-   once the Kanban workspace resolver is implemented. -->
+1. Verifies the merged state and confirms no pending writes remain in
+   the segment workspace.
+2. Marks every member and the workspace retired/inactive, recording the
+   retirement in the segment register at `2-design/segment-register.md`
+   (state updated to retired).
+3. Records the accepted retirement checkpoint and releases the
+   `segment_workspace_id` binding on the task.
 
 The retired workspace is not deleted. It remains as a reference until
 the repository lifecycle determines its final disposition.
 
-**Output:** Workspace retirement record.
+**Output:** Accepted retirement checkpoint.
 
 ## DEV4.5 — Next-Segment Admission
+
+DEV4.5 cites the accepted DEV4.4 retirement checkpoint through its exact
+`predecessor_ref` and records either the next-segment DEV2 route or the
+final initiative closure route.
 
 The orchestrator determines the next action based on the segment
 register:
@@ -427,11 +447,13 @@ register:
   from the updated `origin/main` (which now includes this segment's
   merge). The orchestrator performs the controlled transition and
   dispatches DEV2 for the next segment.
-- **If no more segments remain:** The initiative is closed. The
-  orchestrator records the closure on the Kanban initiative card.
+- **If no more segments remain:** The initiative is closed. The public
+  close operation requires the final accepted DEV4.5 checkpoint and the
+  exact approved closure evidence. The orchestrator records the closure
+  on the Kanban initiative card.
 
-**Output:** Next-segment transition record or initiative closure
-record.
+**Output:** Accepted DEV4.5 checkpoint recording the next-segment
+transition or the initiative closure.
 
 ## Records
 
@@ -459,10 +481,9 @@ record.
 - Kanban: each DEV4 dispatch (DEV4.1a, DEV4.1b, DEV4.1c, DEV4.2a)
   creates a child card linked to the initiative. DEV4.2b, DEV4.2c,
   DEV4.2d, DEV4.2e, DEV4.3, DEV4.4, and DEV4.5 are orchestrator
-  actions recorded on the initiative card.
-  <!-- TODO: exact Kanban card fields, transition record schema,
-  and workspace binding details to be confirmed once the Kanban
-  field contract is finalized. -->
+  actions recorded on the initiative card. DEV4.3 and DEV4.4 are
+  coordinator-owned; their accepted checkpoints are cited by later tasks
+  through the exact `predecessor_ref`.
 
 ## Phase outcome and route
 
@@ -531,10 +552,16 @@ initiative is closed and PC1 may be triggered at milestone closure.
 - The segment register at `2-design/segment-register.md` — the
   read-only reference for segment identity, boundary, dependencies,
   dispatch package reference, current state, and retirement.
-- The task card's `segment_workspace_ref` — the source of truth for
-  the segment worktree path until retirement.
-  <!-- TODO: deterministic workspace resolution, multi-repository
-  binding behavior, and single-writer constraint details to be
-  confirmed once the Kanban field contract is finalized. -->
+- The task's immutable `lifecycle_contract_v1` (`segment_id`,
+  `segment_workspace_id`, `baseline_refs`, `governing_source_refs`,
+  `prior_record_refs`, and, after the first sequence item,
+  `predecessor_ref`) and its `task_input_manifest_v1` (each entry pinned
+  by `sha256` and a Git `source_locator` or stored snapshot attachment;
+  `context_ref` gives the reading instruction). The plugin—not the
+  caller—derives the physical segment root from the active
+  `segment_workspace_id` and the trusted repository registry; on
+  dispatch the controller checks worktree/repository identity, expected
+  branch, required base ancestry, and one active single writer. Paths
+  and delivery heads are not caller-selected.
 - The Kanban initiative card — the single reference point for the
   initiative's lifecycle state and DEV4 closing result.

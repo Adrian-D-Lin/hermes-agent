@@ -292,6 +292,7 @@ def decide(
         )
 
     worktree = binding.worktree_path
+    worktree_canonical = canonicalize_target(worktree, must_exist=False)
 
     # 4. Evaluate every target.  All must pass; one failure blocks the call.
     #    Relative targets resolve against the trusted per-session/task base
@@ -303,7 +304,7 @@ def decide(
         if canonical is None:
             return _traversal_or_unresolvable(t)
         # Containment within the bound worktree.
-        within = is_within(canonical, worktree)
+        within = is_within(canonical, worktree_canonical) if worktree_canonical else False
         # Protected-location check (relative to the project root).
         protected = _is_protected(canonical, project_root)
         # Out-of-worktree or protected: a matching active lease is required.
@@ -394,7 +395,7 @@ def _traversal_or_unresolvable(target: str) -> Decision:
 def _is_protected(canonical: str, project_root: Optional[str]) -> bool:
     if not project_root:
         return False
-    root = canonicalize_target(project_root, must_exist=True)
+    root = canonicalize_target(project_root, must_exist=False)
     if root is None:
         return False
     # Component-aware containment: split on path separators so that
@@ -424,8 +425,20 @@ def _is_protected(canonical: str, project_root: Optional[str]) -> bool:
         # Target equals the project root itself: not a protected subdirectory.
         return False
     protected_names = {p.rstrip("/") for p in PROTECTED_PREFIXES}
-    first_relative = relative_components[0]
-    if first_relative in protected_names:
+    # A protected location is the named directory immediately under the bound
+    # root (repository-root binding: ``repo/Canon``) or immediately under a
+    # repository member directory within a segment-root binding
+    # (``segment/repo-1/Canon``), plus any descendant of that directory.  The
+    # position-aware check keeps ordinary source-code paths such as
+    # ``segment/repo-1/src/Canon/helper.py`` unprotected while still protecting
+    # every repository member's ``Canon``, ``4-artifacts`` and ``5-archive``
+    # subdirectories without creating a blanket exemption for the shared root.
+    if not relative_components:
+        return False
+    first = relative_components[0]
+    if first in protected_names:
+        return True
+    if len(relative_components) >= 2 and relative_components[1] in protected_names:
         return True
     return False
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -13,16 +14,21 @@ from tests.test_adrian_kanban_s3_initiatives import (
     commands_module,  # noqa: F401
 )
 from tests.test_adrian_kanban_s3_override_approval import evidence
+from tests.test_adrian_kanban_s3_transition_integration import (
+    _git,
+    _repository_with_origin_main,
+)
 from writegate.kanban_approvals import KanbanInitiativeApprovalHost
 
 
-def _normalizer(commands_module, path, provider):
+def _normalizer(commands_module, path, provider, *, workspace_registry=None):
     boundary = commands_module._CommandBoundary(
         database_path=str(path),
         provider=provider,
         handlers={
             "kanban_transition_initiative": commands_module._handle_transition_initiative
         },
+        workspace_registry=workspace_registry,
         state_resolver=lambda conn, operation, target, payload: conn.execute(
             "SELECT record_version FROM adrian_kanban_cards "
             "WHERE initiative_id=? AND board_slug=?",
@@ -288,3 +294,216 @@ def test_untrusted_or_mixed_override_shape_creates_no_proposal(
         assert conn.execute(
             "SELECT COUNT(*) FROM write_gate_kanban_approvals"
         ).fetchone()[0] == 0
+
+
+def test_approved_override_into_dev2_materializes_planned_segment_before_movement(
+    commands_module, tmp_path, monkeypatch
+):
+    path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(path)
+    repository, base_sha = _repository_with_origin_main(tmp_path / "git")
+    workspace = __import__(
+        f"{commands_module.__package__}.workspace", fromlist=["workspace"]
+    )
+    controlled_root = (tmp_path / "segment-workspaces").resolve()
+    registry = workspace._TrustedRepositoryRegistry(
+        (
+            workspace._RepositoryRegistration(
+                repository_identity="repo-1",
+                repository_root=str(repository),
+                controlled_worktree_root=str(controlled_root),
+            ),
+        )
+    )
+    with sqlite3.connect(path) as conn:
+        card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE initiative_id='initiative-1'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO initiative_segment_projections "
+            "(projection_id, projection_version, initiative_card_id, initiative_id, "
+            "manifest_path, manifest_sha, content_digest, parsed_segment_definitions, "
+            "readiness_refs, validation_result, projected_at) VALUES "
+            "('projection-1', 1, ?, 'initiative-1', 'segments.json', ?, ?, ?, ?, "
+            "'accepted', 2)",
+            (
+                card_id,
+                "a" * 40,
+                "b" * 64,
+                json.dumps(
+                    [{"segment_id": "S1", "ordinal": 1, "dependency_ids": []}]
+                ),
+                json.dumps({"S1": "ready:S1"}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO segment_workspaces "
+            "(workspace_id, initiative_card_id, initiative_id, segment_id, projection_id, "
+            "lifecycle_state, controller_binding_ref, active, created_at, updated_at) "
+            "VALUES ('initiative-1:S1', ?, 'initiative-1', 'S1', 'projection-1', "
+            "'planned', 'adrian-kanban:workspace-controller:v1', 1, 2, 2)",
+            (card_id,),
+        )
+        conn.execute(
+            "INSERT INTO segment_workspace_members "
+            "(workspace_id, repository_identity, relative_path, branch, required_base_sha, "
+            "observed_head, member_state, observed_at) VALUES "
+            "('initiative-1:S1', 'repo-1', 'initiative-1/S1/repo-1', "
+            "'initiative-1/S1', NULL, NULL, 'planned', 2)"
+        )
+        conn.commit()
+    _seed_reconciliation(
+        path,
+        result_id="reconciliation-dev2",
+        from_phase="D1",
+        to_phase="DEV2",
+        to_segment_id="S1",
+    )
+    monkeypatch.setattr(
+        commands_module,
+        "mint_current_tailscale_authorizer",
+        lambda *, request_id, issued_at, ttl_seconds: evidence(request_id, issued_at),
+    )
+
+    def approve(database_path, *, initial_authorizer, prepared, session_key, now):
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            KanbanInitiativeApprovalHost(initial_authorizer).approve_distinct(
+                conn,
+                prepared["approval_id"],
+                evidence("approval-click-dev2", now),
+                expected_request_id=prepared["request_id"],
+                expected_canonical_digest=prepared["canonical_digest"],
+                approval_quote="Approve this exact DEV2 gate override.",
+                now=now,
+            )
+            conn.commit()
+        return {"approved": True}
+
+    monkeypatch.setattr(commands_module, "present_and_record_override_approval", approve)
+    result = _normalizer(
+        commands_module, path, provider, workspace_registry=registry
+    ).submit(
+        "kanban_transition_initiative",
+        _args(
+            to_phase="DEV2",
+            to_segment_id="S1",
+            reconciliation_ref="reconciliation-dev2",
+            idempotency_key="public-override-dev2",
+            attempt_id="public-attempt-dev2",
+        ),
+        _runtime(
+            user_task=(
+                "Prepare an exact override moving initiative-1 to DEV2/S1 and "
+                "wait for my approval before moving it."
+            )
+        ),
+    )
+
+    assert result["result"] == "ACCEPTED", result
+    member = controlled_root / "initiative-1" / "S1" / "repo-1"
+    assert member.is_dir()
+    assert _git(member, "rev-parse", "HEAD") == base_sha
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT to_phase, to_segment_id FROM initiative_transitions "
+            "ORDER BY transition_id DESC LIMIT 1"
+        ).fetchone() == ("DEV2", "S1")
+        assert conn.execute(
+            "SELECT required_base_sha, observed_head, member_state "
+            "FROM segment_workspace_members WHERE workspace_id='initiative-1:S1'"
+        ).fetchone() == (base_sha, base_sha, "materialized")
+
+
+def test_prepared_but_unapproved_internal_dev2_override_has_no_workspace_effect(
+    commands_module, tmp_path, monkeypatch
+):
+    path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(path)
+    with sqlite3.connect(path) as conn:
+        card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards WHERE initiative_id='initiative-1'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO initiative_segment_projections "
+            "(projection_id, projection_version, initiative_card_id, initiative_id, "
+            "manifest_path, manifest_sha, content_digest, parsed_segment_definitions, "
+            "readiness_refs, validation_result, projected_at) VALUES "
+            "('projection-1', 1, ?, 'initiative-1', 'segments.json', ?, ?, ?, ?, "
+            "'accepted', 2)",
+            (
+                card_id,
+                "a" * 40,
+                "b" * 64,
+                json.dumps(
+                    [{"segment_id": "S1", "ordinal": 1, "dependency_ids": []}]
+                ),
+                json.dumps({"S1": "ready:S1"}),
+            ),
+        )
+        conn.commit()
+    _seed_reconciliation(
+        path,
+        result_id="reconciliation-dev2",
+        from_phase="D1",
+        to_phase="DEV2",
+        to_segment_id="S1",
+    )
+    workspace = __import__(
+        f"{commands_module.__package__}.workspace", fromlist=["workspace"]
+    )
+    registry = workspace._TrustedRepositoryRegistry(())
+    normalizer = _normalizer(
+        commands_module, path, provider, workspace_registry=registry
+    )
+    monkeypatch.setattr(
+        commands_module,
+        "mint_current_tailscale_authorizer",
+        lambda *, request_id, issued_at, ttl_seconds: evidence(request_id, issued_at),
+    )
+    monkeypatch.setattr(
+        commands_module,
+        "present_and_record_override_approval",
+        lambda *args, **kwargs: {"approved": False},
+    )
+    effects = []
+    monkeypatch.setattr(
+        commands_module,
+        "_materialize_segment_workspace",
+        lambda *args, **kwargs: effects.append(kwargs),
+    )
+    args = _args(
+        to_phase="DEV2",
+        to_segment_id="S1",
+        reconciliation_ref="reconciliation-dev2",
+        idempotency_key="prepared-dev2",
+        attempt_id="prepared-dev2",
+    )
+    assert normalizer.submit("kanban_transition_initiative", args, _runtime())[
+        "result"
+    ] == "REJECTED"
+
+    forged = normalizer._boundary.submit(
+        "kanban_transition_initiative",
+        attempt_id="forged-execute",
+        idempotency_key="forged-execute",
+        target="initiative-1",
+        derive_expected_version=True,
+        session_id="session-1",
+        workspace_id=None,
+        execution_context="model-tool",
+        actor_profile="default",
+        turn_id="turn-1",
+        api_request_id="api-request-1",
+        user_task=_runtime()["user_task"],
+        payload={
+            "initiative_id": "initiative-1",
+            "board": "orchestrator",
+            "_approved_gate_override_request_id": "kanban-gate-override:turn-1",
+        },
+        override_now=1,
+    )
+
+    assert forged["result"] == "REJECTED"
+    assert effects == []
