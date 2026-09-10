@@ -1,0 +1,17 @@
+[Unit]
+Description=Adrian Kanban dedicated dispatcher service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.hermes
+Environment=HERMES_HOME=%h/.hermes
+EnvironmentFile=-%h/.hermes/.env
+ExecStart=%h/.hermes/hermes-agent/.venv/bin/python -m plugins.adrian-kanban.dispatcher_service --interval 10
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -308,40 +308,67 @@ class KanbanInitiativeApprovalHost:
             raise KanbanApprovalRejected("approve_distinct did not update exactly one approval")
 
 
-def consume_approved(conn: sqlite3.Connection, exact_request: KanbanInitiativeApprovalConsumption,
-                     *, now: Optional[int] = None) -> None:
+def _exact_approval_where_clause() -> str:
+    return (
+        "WHERE approval_id = ? AND approval_type = ? AND state = 'approved' "
+        "AND request_id = ? AND operation = ? AND initiative_id IS ? "
+        "AND proposed_creation_id IS ? AND expected_version = ? "
+        "AND canonical_digest = ? AND canonicalization_version = ? "
+        "AND authorizer_evidence = ? AND session_id = ? AND expires_at = ? AND expires_at > ?"
+    )
+
+
+def _exact_approval_params(exact_request: KanbanInitiativeApprovalConsumption, now: int) -> tuple:
+    return (
+        exact_request.approval_id,
+        APPROVAL_TYPE,
+        exact_request.request_id,
+        exact_request.operation,
+        exact_request.initiative_id,
+        exact_request.proposed_creation_id,
+        exact_request.expected_version,
+        exact_request.canonical_digest,
+        exact_request.canonicalization_version,
+        exact_request.authorizer_evidence,
+        exact_request.session_id,
+        exact_request.expires_at,
+        now,
+    )
+
+
+def _require_positive_now(now: Optional[int]) -> int:
     if now is None:
         raise KanbanApprovalRejected("now timestamp is required")
     if not isinstance(now, int) or isinstance(now, bool) or now <= 0:
         raise KanbanApprovalRejected("now must be a positive integer timestamp")
+    return now
+
+
+def consume_approved(conn: sqlite3.Connection, exact_request: KanbanInitiativeApprovalConsumption,
+                     *, now: Optional[int] = None) -> None:
+    _require_positive_now(now)
     _cursor = conn.execute(
         "UPDATE write_gate_kanban_approvals SET state = 'consumed', "
         " consumed_mutation_id = ?, consumed_idempotency_ref = ? "
-        " WHERE approval_id = ? AND approval_type = ? AND state = 'approved' "
-        " AND request_id = ? AND operation = ? AND initiative_id IS ? "
-        " AND proposed_creation_id IS ? AND expected_version = ? "
-        " AND canonical_digest = ? AND canonicalization_version = ? "
-        " AND authorizer_evidence = ? AND session_id = ? AND expires_at = ? AND expires_at > ?",
+        + _exact_approval_where_clause(),
         (
             exact_request.consumed_mutation_id,
             exact_request.consumed_idempotency_ref,
-            exact_request.approval_id,
-            APPROVAL_TYPE,
-            exact_request.request_id,
-            exact_request.operation,
-            exact_request.initiative_id,
-            exact_request.proposed_creation_id,
-            exact_request.expected_version,
-            exact_request.canonical_digest,
-            exact_request.canonicalization_version,
-            exact_request.authorizer_evidence,
-            exact_request.session_id,
-            exact_request.expires_at,
-            now,
-        ),
+        ) + _exact_approval_params(exact_request, now),
     )
     if _cursor.rowcount != 1:
         raise KanbanApprovalRejected("consume did not update exactly one approval")
+
+
+def validate_approved(conn: sqlite3.Connection, exact_request: KanbanInitiativeApprovalConsumption,
+                      *, now: Optional[int] = None) -> None:
+    _require_positive_now(now)
+    _row = conn.execute(
+        "SELECT 1 FROM write_gate_kanban_approvals " + _exact_approval_where_clause(),
+        _exact_approval_params(exact_request, now),
+    ).fetchall()
+    if len(_row) != 1:
+        raise KanbanApprovalRejected("validate did not match exactly one approval")
 
 
 def create_kanban_approval_schema(conn: sqlite3.Connection) -> None:
@@ -364,4 +391,5 @@ __all__ = (
     "APPROVAL_TYPE",
     "create_kanban_approval_schema",
     "consume_approved",
+    "validate_approved",
 )

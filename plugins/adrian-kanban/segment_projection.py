@@ -330,6 +330,15 @@ def persist_segment_projection(
     _validate_nonblank(idempotency_key, "idempotency_key")
     _validate_positive_int(created_at, "created_at")
 
+    latest_transition_id = conn.execute(
+        "SELECT transition_id FROM initiative_transitions "
+        "WHERE initiative_card_id = ? AND initiative_id = ? "
+        "ORDER BY transition_id DESC LIMIT 1",
+        (admission.initiative_card_id, admission.initiative_id),
+    ).fetchone()[0]
+    _validate_positive_int(latest_transition_id, "latest transition_id")
+    actor_evidence["source_transition_id"] = latest_transition_id
+
     payload = {
         "content_digest": admission.content_digest,
         "manifest_path": admission.manifest_path,

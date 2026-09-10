@@ -325,6 +325,36 @@ def test_confirm_binding_non_git_cwd_rejected(cwd_recorder, approve, reg, mods, 
     assert "cannot present" in data["error"]
 
 
+def test_confirm_binding_accepts_trusted_active_segment_container(
+    cwd_recorder, approve, reg, mods, tmp_path, monkeypatch
+):
+    """A multi-repository segment root is not itself a Git worktree, but the
+    selected Kanban authority may certify that exact host-owned cwd as an
+    active system-derived workspace."""
+    from hermes_cli import kanban_db as kb
+    from tools.terminal_tool import record_session_cwd
+
+    segment_root = (tmp_path / "worktrees" / "initiative-1" / "S1").resolve()
+    (segment_root / "repo-1").mkdir(parents=True)
+    record_session_cwd("sess-segment", str(segment_root))
+    seen = []
+
+    def resolve(candidate):
+        seen.append(candidate)
+        return str(segment_root) if Path(candidate) == segment_root else None
+
+    monkeypatch.setattr(kb, "resolve_trusted_authority_workspace", resolve)
+    approve("once")
+    out = mods.tool.write_gate_tool(
+        action="confirm_binding", session_id="sess-segment"
+    )
+
+    data = json.loads(out)
+    assert data["status"] == "bound", data
+    assert Path(data["binding"]["worktree_path"]) == segment_root
+    assert seen == [str(segment_root)]
+
+
 def test_confirm_binding_model_path_spoof_rejected(cwd_recorder, approve, reg, mods, git_repo):
     """The model may not supply the binding path: a spoof hint is ignored even
     on ``once`` approval, and the real Git root is bound instead."""

@@ -408,6 +408,79 @@ def test_decide_outside_worktree_no_lease_names_exception_flow(reg, mods, tmp_pa
     assert "write_file or patch" in msg
 
 
+def test_segment_root_binding_allows_member_but_not_sibling_segment(
+    reg, mods, tmp_path
+):
+    shared_root = tmp_path / "worktrees"
+    segment = shared_root / "initiative-1" / "S1"
+    member = segment / "repo-1"
+    sibling = shared_root / "initiative-1" / "S2" / "repo-1"
+    member.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    reg.create_binding(session_id="segment-session", worktree_path=str(segment))
+
+    inside = mods.enforcement.decide(
+        tool_name="write_file",
+        args={"path": str(member / "src" / "feature.py")},
+        session_id="segment-session",
+        reg=reg,
+        project_root=str(segment),
+        base_dir=str(segment),
+    )
+    outside = mods.enforcement.decide(
+        tool_name="write_file",
+        args={"path": str(sibling / "src" / "feature.py")},
+        session_id="segment-session",
+        reg=reg,
+        project_root=str(segment),
+        base_dir=str(segment),
+    )
+
+    assert inside.allowed is True
+    assert outside.allowed is False
+    assert "outside the bound worktree" in outside.reason
+
+
+def test_segment_root_binding_keeps_member_canon_protected(reg, mods, tmp_path):
+    segment = tmp_path / "worktrees" / "initiative-1" / "S1"
+    member = segment / "repo-1"
+    (member / "Canon").mkdir(parents=True)
+    reg.create_binding(session_id="segment-canon", worktree_path=str(segment))
+
+    decision = mods.enforcement.decide(
+        tool_name="write_file",
+        args={"path": str(member / "Canon" / "policy.md")},
+        session_id="segment-canon",
+        reg=reg,
+        project_root=str(segment),
+        base_dir=str(segment),
+    )
+
+    assert decision.allowed is False
+    assert "protected location" in decision.reason
+    assert "request_exception" in decision.remediation
+
+
+def test_segment_root_binding_does_not_protect_unrelated_deep_canon_name(
+    reg, mods, tmp_path
+):
+    segment = tmp_path / "worktrees" / "initiative-1" / "S1"
+    nested = segment / "repo-1" / "src" / "Canon"
+    nested.mkdir(parents=True)
+    reg.create_binding(session_id="segment-nested-canon", worktree_path=str(segment))
+
+    decision = mods.enforcement.decide(
+        tool_name="write_file",
+        args={"path": str(nested / "helper.py")},
+        session_id="segment-nested-canon",
+        reg=reg,
+        project_root=str(segment),
+        base_dir=str(segment),
+    )
+
+    assert decision.allowed is True
+
+
 # -- pre_tool_call: missing host session id includes stop/operator guidance ---
 
 def test_pre_tool_call_missing_session_id_includes_stop_operator_guidance(plugin, mods):

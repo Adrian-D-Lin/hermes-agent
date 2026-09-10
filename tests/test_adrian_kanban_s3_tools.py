@@ -142,6 +142,11 @@ def test_initiative_tools_are_explicit_and_not_task_mutation_aliases(commands_mo
         "kanban_close_initiative": {
             "initiative_id",
             "closure_result_ref",
+            "dev4_5_checkpoint_ref",
+            "final_summary_ref",
+            "repository_reconciliation_ref",
+            "resolved_phase_result_refs",
+            "cancelled_task_refs",
             "approval_id",
         },
     }

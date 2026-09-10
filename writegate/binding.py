@@ -265,12 +265,32 @@ def resolve_trusted_worktree(
 
     # Walk up to the real Git worktree root when the record sits inside one.
     worktree = _resolve_git_worktree_root(candidate)
-    if worktree is None:
-        # The record is a real directory but not inside a Git project. There is
-        # no Git worktree to bind; reject rather than binding an arbitrary path.
-        return None
+    if worktree is not None:
+        return worktree
 
-    return worktree
+    # The record is a real directory but not inside a Git project. The only
+    # remaining trusted source is the Kanban authority resolver, which may
+    # certify that exact host-owned cwd as an active system-derived workspace.
+    try:
+        from hermes_cli import kanban_db
+    except Exception:
+        return None
+    resolver = getattr(kanban_db, "resolve_trusted_authority_workspace", None)
+    if not callable(resolver):
+        return None
+    try:
+        resolved = resolver(candidate)
+    except Exception:
+        return None
+    if not isinstance(resolved, str):
+        return None
+    try:
+        resolved_canonical = canonicalize_target(resolved, must_exist=True)
+    except Exception:
+        return None
+    if resolved_canonical != candidate:
+        return None
+    return candidate
 
 
 def _is_untrusted_remote_cwd(session_id: str, cwd: str) -> bool:

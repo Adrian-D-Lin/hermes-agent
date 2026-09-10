@@ -44,6 +44,7 @@ def plugin_modules():
             "task_inputs",
         )
     }
+    modules["package"] = package
     yield modules
     for module_name in tuple(sys.modules):
         if module_name == package_name or module_name.startswith(f"{package_name}."):
@@ -151,6 +152,64 @@ def _manifest(*, initiative_id: str = "initiative-1") -> dict:
             },
         ],
     }
+
+
+def test_runtime_repository_registry_uses_one_configured_shared_root(
+    plugin_modules, tmp_path, monkeypatch
+):
+    package = plugin_modules["package"]
+    first = (tmp_path / "first-repository").resolve()
+    second = (tmp_path / "second-repository").resolve()
+    shared = (tmp_path / "all-segment-worktrees").resolve()
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.setattr(
+        package._config,
+        "load_config_readonly",
+        lambda: {
+            "kanban": {
+                "controlled_worktree_root": str(shared),
+                "repository_registry": {
+                    "repo-1": {"repository_root": str(first)},
+                    "repo-2": {"repository_root": str(second)},
+                },
+            }
+        },
+    )
+
+    registry = package._trusted_repository_registry_getter()
+
+    assert registry.controlled_worktree_root == str(shared)
+    assert registry.lookup("repo-1").repository_root == str(first)
+    assert registry.lookup("repo-2").controlled_worktree_root == str(shared)
+
+
+@pytest.mark.parametrize(
+    "kanban_config",
+    (
+        {"repository_registry": {"repo-1": {"repository_root": "/repo"}}},
+        {
+            "controlled_worktree_root": "/worktrees",
+            "repository_registry": {"repo-1": "not-a-mapping"},
+        },
+        {
+            "controlled_worktree_root": "/worktrees",
+            "repository_registry": {"repo-1": {}},
+        },
+    ),
+)
+def test_runtime_repository_registry_rejects_incomplete_configuration(
+    plugin_modules, monkeypatch, kanban_config
+):
+    package = plugin_modules["package"]
+    monkeypatch.setattr(
+        package._config,
+        "load_config_readonly",
+        lambda: {"kanban": kanban_config},
+    )
+
+    with pytest.raises(ValueError):
+        package._trusted_repository_registry_getter()
 
 
 def _request() -> dict:
@@ -632,7 +691,9 @@ def test_projection_admission_is_atomic_and_preassigns_every_workspace_member(
         assert json.loads(phase_result["accepted_checkpoint_refs"]) == [
             "checkpoint:DEV1.3"
         ]
-        assert json.loads(phase_result["actor_evidence"])["actor_profile"] == "default"
+        actor_evidence = json.loads(phase_result["actor_evidence"])
+        assert actor_evidence["actor_profile"] == "default"
+        assert actor_evidence["source_transition_id"] == 1
         assert phase_result["accepted"] == 1
         assert (
             conn.execute("SELECT state FROM write_gate_kanban_approvals").fetchone()[0]

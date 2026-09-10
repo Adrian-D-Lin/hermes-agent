@@ -57,16 +57,21 @@ Before performing phase work, resolve the active segment and workspace:
 5. If exactly one task is eligible for this profile, anchor to it. If
    multiple tasks are eligible, present them for selection. If none is
    eligible, report the missing or blocked work.
-6. Resolve the segment workspace from the task card's
-   `segment_workspace_ref`.
-   <!-- TODO: deterministic workspace resolution logic — to be provided
-   when the Kanban workspace resolver is implemented. -->
-   Verify the worktree exists, is on the expected branch, and its base
-   SHA matches the segment register's recorded base SHA.
-7. Obtain the trusted workspace binding
-   (CONFIRMED_WORKTREE_BINDING v1). Confirm the binding's
-   `segment_id`, `worktree_path`, and `git_branch` match the resolved
-   segment workspace.
+6. The plugin—not the caller—derives the physical segment root from the
+   active `segment_workspace_id` in the task's immutable
+   `lifecycle_contract_v1` and the trusted repository registry. The task
+   card projection exposes `lifecycle_phase`, `segment_id`, and
+   `segment_workspace_id`; an absolute path is not accepted from the task
+   caller. On dispatch, the controller checks the worktree/repository
+   identity, the expected branch, required base ancestry, and one active
+   single writer. Legitimate commits may advance HEAD after
+   materialization.
+7. Read the task's `task_input_manifest_v1`, which exactly covers the
+   declared reference paths (`baseline_refs`, `governing_source_refs`,
+   `prior_record_refs`, and, after the first sequence item,
+   `predecessor_ref`). Each entry is pinned by `sha256` and either a Git
+   `source_locator` or a stored snapshot attachment; `context_ref` gives
+   the reading instruction for that entry.
 8. Retain the tuple `initiative_id + segment_id + phase + task_id +
    worktree_path + binding` as the session anchor. Revalidate it before
    governed mutations. If the initiative has advanced (a newer
@@ -82,12 +87,14 @@ worktree:
 - The active segment is not in the segment register.
 - The task card's `segment_id` does not match the active segment from the
   chain.
-- The task card's `segment_workspace_ref` is missing or does not match
-  the expected path.
-- The worktree does not exist, is on the wrong branch, or its base SHA
-  does not match.
-- The workspace binding is missing or does not match the segment
-  workspace.
+- The task card's `segment_workspace_id` is missing from the
+  `lifecycle_contract_v1`, or the system-derived segment root cannot be
+  resolved through the trusted repository registry.
+- The worktree does not exist, is on the wrong branch, fails required
+  base ancestry, or has more than one active writer.
+- The task's `task_input_manifest_v1` does not exactly cover the
+  declared reference paths, or an entry's `sha256` / `source_locator`
+  pin does not verify.
 - The segment's dependencies are not all closed.
 
 ### Phase-specific continuation (DEV2)
@@ -130,11 +137,13 @@ Dispatch protocol:
   initiative.
 - The card identifies the exact dispatch-ready segment package (path
   + commit SHA from DEV1.7) and the verified design baseline (path +
-  commit SHA recorded at D4).
-  <!-- TODO: exact card fields and workspace binding to be confirmed
-  once the Kanban field contract is finalized. -->
+  commit SHA recorded at D4). Its `task_input_manifest_v1` pins those
+  declared reference paths by `sha256` and Git `source_locator`, and its
+  `context_ref` gives the reading instruction for each entry.
 - The card states what the independent-reviewer must produce: a
-candidate implementation brief with the nine required sections.
+candidate implementation brief with the nine required sections. On
+completion the candidate submission is recorded as an immutable
+`task_candidate_handoffs` record.
 - The card must NOT reference findings from other segments or
   initiatives. Each brief is scoped to its own segment.
 - Wait for the contract's accepted completion or checkpoint before
@@ -171,12 +180,13 @@ Dispatch protocol:
   parent initiative.
 - The card identifies the exact candidate brief (path + commit SHA or
   card reference) and the verified design baseline (path + commit SHA
-  recorded at D4).
-  <!-- TODO: exact card fields and workspace binding to be confirmed
-  once the Kanban field contract is finalized. -->
+  recorded at D4). Its `task_input_manifest_v1` pins those declared
+  reference paths by `sha256` and Git `source_locator`, and its
+  `context_ref` gives the reading instruction for each entry.
 - The card states what the test-authority-reviewer must produce: a
 Design to Brief Check record with accepted conclusions or required
-findings.
+findings. Reviewer acceptance is recorded as an immutable
+`task_reviewer_verdicts` record.
 - The baseline path must be reachable in the card's worktree or
   attached as a content-addressed bundle with a stated SHA the worker
   must verify before starting.
@@ -203,11 +213,10 @@ The orchestrator performs the convergence loop and handoff:
 3. Confirm that the final brief is the version that passed the check.
 4. Confirm that no design issue remains concealed as an
    implementation instruction.
-5. Record the checked final brief and its handoff package for DEV3.
-   <!-- TODO: DEV2-to-DEV3 SHA handoff mechanism to be confirmed once
-   the Kanban field contract is finalized. The handoff must identify
-   the accepted brief commit SHA so DEV3 can verify the worktree state
-   before proceeding. -->
+5. Record the accepted orchestration checkpoint for this segment. The
+   DEV3 first task carries that resulting accepted record through its
+   exact `predecessor_ref`, and its `task_input_manifest_v1` pins the
+   accepted brief file through its Git `source_locator` and `sha256`.
 
 Output: Ratified implementation brief and brief-ratification record.
 
@@ -235,10 +244,12 @@ Output: Ratified implementation brief and brief-ratification record.
 - Kanban: the DEV2 phase is tracked on the parent initiative card.
   Each dispatch (DEV2.1, DEV2.2) creates a child card linked to the
   initiative. DEV2.3 is the orchestrator's final convergence and
-  handoff, recorded on the initiative card.
-  <!-- TODO: exact Kanban card fields, transition record schema,
-  and workspace binding details to be confirmed once the Kanban
-  field contract is finalized. -->
+  handoff, recorded on the initiative card as the accepted orchestration
+  checkpoint. Candidate submissions are immutable `task_candidate_handoffs`;
+  reviewer acceptance is immutable `task_reviewer_verdicts`. Sequence
+  release is through the exact immutable `predecessor_ref`: either an
+  accepted candidate handoff/reviewer verdict or an accepted
+  orchestration checkpoint, as declared by the lifecycle contract.
 
 ## Phase outcome and route
 
@@ -302,10 +313,15 @@ this; DEV2.3 must not silently resolve it.
 - The segment register at `2-design/segment-register.md` - the
   read-only reference for segment identity, boundary, dependencies,
   dispatch package reference, and current state.
-- The task card's `segment_workspace_ref` - the source of truth for
-  the segment worktree path.
-  <!-- TODO: deterministic workspace resolution, multi-repository
-  binding behavior, and single-writer constraint details to be
-  confirmed once the Kanban field contract is finalized. -->
+- The task's immutable `lifecycle_contract_v1` (`segment_id`,
+  `segment_workspace_id`, `baseline_refs`, `governing_source_refs`,
+  `prior_record_refs`, and, after the first sequence item,
+  `predecessor_ref`) and its `task_input_manifest_v1` (each entry pinned
+  by `sha256` and a Git `source_locator` or stored snapshot attachment;
+  `context_ref` gives the reading instruction). The plugin—not the
+  caller—derives the physical segment root from the active
+  `segment_workspace_id` and the trusted repository registry; on
+  dispatch the controller checks worktree/repository identity, expected
+  branch, required base ancestry, and one active single writer.
 - The Kanban initiative card - the single reference point for the
   initiative's lifecycle state and DEV2 closing result.

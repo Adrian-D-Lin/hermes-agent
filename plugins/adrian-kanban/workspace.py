@@ -107,6 +107,47 @@ class _WorkspaceMember:
                 )
 
 
+def _common_segment_root(
+    members: Tuple[_WorkspaceMember, ...],
+    controlled_worktree_root: str,
+    initiative_id: str,
+    segment_id: str,
+) -> str:
+    """Return the one common parent directory above all repository-member
+    worktrees.
+
+    With the existing projection this is ``<shared root>/<escaped
+    initiative>/<escaped segment>``.  Every member's stored relative path must
+    project to exactly that location; a plan whose members do not share one
+    segment root is rejected.
+    """
+    from .segment_manifest import _percent_encode
+
+    expected = os.path.normpath(
+        os.path.join(
+            controlled_worktree_root,
+            _percent_encode(initiative_id),
+            _percent_encode(segment_id),
+        )
+    )
+    for m in members:
+        parts = m.relative_path.replace("\\", "/").split("/")
+        if len(parts) < 2:
+            raise _WorkspaceRejected(
+                f"member {m.repository_identity} relative path does not project "
+                "to a shared segment root"
+            )
+        projected = os.path.normpath(
+            os.path.join(m.controlled_worktree_root, *parts[:-1])
+        )
+        if projected != expected:
+            raise _WorkspaceRejected(
+                f"members do not share one segment root: "
+                f"{projected!r} differs from {expected!r}"
+            )
+    return expected
+
+
 @dataclass(frozen=True)
 class _WorkspacePlan:
     workspace_id: str
@@ -114,6 +155,7 @@ class _WorkspacePlan:
     segment_id: str
     controller_binding_ref: str
     members: Tuple[_WorkspaceMember, ...]
+    segment_root: str
 
     def __post_init__(self):
         _validate_nonblank_str(self.workspace_id, "workspace_id")
@@ -127,6 +169,7 @@ class _WorkspacePlan:
         for m in self.members:
             if not isinstance(m, _WorkspaceMember):
                 raise _WorkspaceRejected("members must contain _WorkspaceMember")
+        _validate_absolute_str(self.segment_root, "segment_root")
 
 
 @dataclass(frozen=True)
@@ -161,13 +204,34 @@ class _TrustedRepositoryRegistry:
         if not isinstance(registrations, tuple):
             raise _WorkspaceRejected("registrations must be tuple")
         seen = set()
+        shared_root = None
         for r in registrations:
             if not isinstance(r, _RepositoryRegistration):
                 raise _WorkspaceRejected("registrations must contain _RepositoryRegistration")
             if r.repository_identity in seen:
                 raise _WorkspaceRejected(f"duplicate repository_identity in registry: {r.repository_identity}")
             seen.add(r.repository_identity)
+            normalized = os.path.normpath(r.controlled_worktree_root)
+            if shared_root is None:
+                shared_root = normalized
+            elif normalized != shared_root:
+                raise _WorkspaceRejected(
+                    "all trusted repository registrations must share one "
+                    f"identical controlled worktree root; got a different "
+                    f"root than the shared root {shared_root!r}"
+                )
         self._registrations = registrations
+        self._controlled_worktree_root = shared_root
+
+    @property
+    def controlled_worktree_root(self) -> Optional[str]:
+        """The one canonical controlled worktree root shared by every
+        registered repository, or ``None`` when the registry is empty.
+
+        Mixed roots are a configuration error: every trusted repository
+        registration must use the identical shared root.
+        """
+        return self._controlled_worktree_root
 
     def lookup(self, repository_identity: str) -> _RepositoryRegistration:
         _validate_nonblank_str(repository_identity, "repository_identity")
@@ -285,12 +349,21 @@ class _SegmentWorkspaceController:
                 )
             )
 
+        members_tuple = tuple(members)
+        segment_root = _common_segment_root(
+            members_tuple,
+            self._registry.controlled_worktree_root,
+            initiative_id,
+            segment_id,
+        )
+
         return _WorkspacePlan(
             workspace_id=workspace_id,
             initiative_id=initiative_id,
             segment_id=segment_id,
             controller_binding_ref=controller_binding_ref,
-            members=tuple(members),
+            members=members_tuple,
+            segment_root=segment_root,
         )
 
     def pin_planned_member_base(
@@ -1114,6 +1187,107 @@ class _JournaledWorkspaceOperations:
                 raise _WorkspaceRejected("consume")
             return v
         return self._owned_transaction(_consume)
+    def activate_workspace(self, plan, *, activated_at):
+        if self._conn.in_transaction:
+            raise _WorkspaceRejected("active transaction not allowed")
+        if type(plan) is not _WorkspacePlan:
+            raise _WorkspaceRejected("plan must be _WorkspacePlan")
+        if type(activated_at) is not int or activated_at <= 0:
+            raise _WorkspaceRejected("activated_at must be positive exact int")
+
+        ws = tuple(self._conn.execute(
+            "SELECT controller_binding_ref, lifecycle_state, active, updated_at "
+            "FROM segment_workspaces WHERE workspace_id = ?",
+            (plan.workspace_id,),
+        ).fetchone())
+        if ws[0] != plan.controller_binding_ref:
+            raise _WorkspaceRejected("workspace binding mismatch")
+
+        members = [
+            tuple(row)
+            for row in self._conn.execute(
+                "SELECT repository_identity, observed_head, member_state, observed_at "
+                "FROM segment_workspace_members WHERE workspace_id = ? "
+                "ORDER BY repository_identity",
+                (plan.workspace_id,),
+            )
+        ]
+        member_identities = tuple(m[0] for m in members)
+        if member_identities != tuple(m.repository_identity for m in plan.members):
+            raise _WorkspaceRejected("member identities mismatch")
+
+        plan_member_map = {m.repository_identity: m for m in plan.members}
+        for plan_member in plan.members:
+            if plan_member.required_base_sha is None:
+                raise _WorkspaceRejected("required_base_sha is null")
+
+        # Idempotent path: already active. Reverify all members; keep original
+        # updated_at.
+        if ws[1] == "active" and ws[2] == 1:
+            for m in members:
+                if m[2] != "materialized" or m[1] is None:
+                    raise _WorkspaceRejected("all members must be materialized")
+                _validate_sha(m[1], "observed_head")
+                plan_member = plan_member_map[m[0]]
+                v = self._executor.verify(plan_member)
+                if not v.ready:
+                    raise _WorkspaceRejected("verification failed")
+                if v.observed_head != m[1]:
+                    raise _WorkspaceRejected("head mismatch")
+            return member_identities
+
+        # Normal path: planned -> active.
+        if ws[1] != "planned" or ws[2] != 1:
+            raise _WorkspaceRejected("workspace not planned")
+
+        for m in members:
+            if m[2] != "materialized" or m[1] is None:
+                raise _WorkspaceRejected("all members must be materialized")
+            _validate_sha(m[1], "observed_head")
+            plan_member = plan_member_map[m[0]]
+            v = self._executor.verify(plan_member)
+            if not v.ready:
+                raise _WorkspaceRejected("verification failed")
+            if v.observed_head != m[1]:
+                raise _WorkspaceRejected("head mismatch")
+
+        preflight_ws = ws
+        preflight_members = list(members)
+
+        def _activate():
+            ws_new = tuple(self._conn.execute(
+                "SELECT controller_binding_ref, lifecycle_state, active, updated_at "
+                "FROM segment_workspaces WHERE workspace_id = ?",
+                (plan.workspace_id,),
+            ).fetchone())
+            if ws_new != preflight_ws:
+                raise _WorkspaceRejected("workspace state changed")
+
+            members_new = [
+                tuple(row)
+                for row in self._conn.execute(
+                    "SELECT repository_identity, observed_head, member_state, observed_at "
+                    "FROM segment_workspace_members WHERE workspace_id = ? "
+                    "ORDER BY repository_identity",
+                    (plan.workspace_id,),
+                )
+            ]
+            if members_new != preflight_members:
+                raise _WorkspaceRejected("member state changed")
+
+            cur = self._conn.execute(
+                "UPDATE segment_workspaces SET lifecycle_state = 'active', updated_at = ? "
+                "WHERE workspace_id = ? AND controller_binding_ref = ? "
+                "AND lifecycle_state = 'planned' AND active = 1",
+                (activated_at, plan.workspace_id, plan.controller_binding_ref),
+            )
+            if cur.rowcount != 1:
+                raise _WorkspaceRejected("workspace update failed")
+
+            return member_identities
+
+        return self._owned_transaction(_activate)
+
     def _validate_merge_intent(self, intent, member, expected_main_sha, expected_source_head):
         if type(member) is not _WorkspaceMember:
             raise _WorkspaceRejected("member must be _WorkspaceMember")
@@ -1319,3 +1493,417 @@ class _JournaledWorkspaceOperations:
                 recovery_disposition=recovery_disposition,
             )
         return self._owned_transaction(_append)
+
+
+def _materialize_segment_workspace(conn, registry, *, initiative_id, segment_id, materialized_at) -> str:
+    if conn.in_transaction:
+        raise _WorkspaceRejected("active transaction not allowed")
+    if type(registry) is not _TrustedRepositoryRegistry:
+        raise _WorkspaceRejected("registry must be trusted")
+    if not isinstance(initiative_id, str) or not initiative_id.strip():
+        raise _WorkspaceRejected("initiative_id must be nonblank")
+    if not isinstance(segment_id, str) or not segment_id.strip():
+        raise _WorkspaceRejected("segment_id must be nonblank")
+    if type(materialized_at) is not int or materialized_at <= 0:
+        raise _WorkspaceRejected("materialized_at must be positive exact int")
+
+    rows = tuple(
+        conn.execute(
+            "SELECT workspace_id FROM segment_workspaces "
+            "WHERE initiative_id = ? AND segment_id = ? AND active = 1",
+            (initiative_id, segment_id),
+        ).fetchall()
+    )
+    if len(rows) != 1:
+        raise _WorkspaceRejected("workspace state missing or ambiguous")
+    workspace_id = rows[0][0]
+
+    controller = _SegmentWorkspaceController(conn, registry)
+    journal = ExternalOperationJournal(conn)
+    operations = _JournaledWorkspaceOperations(conn, journal, _GitWorkspaceExecutor())
+
+    binding = conn.execute(
+        "SELECT controller_binding_ref FROM segment_workspaces WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchone()[0]
+
+    plan = controller.load(
+        workspace_id=workspace_id,
+        expected_initiative_id=initiative_id,
+        expected_segment_id=segment_id,
+        expected_controller_binding=binding,
+    )
+
+    for member in sorted(plan.members, key=lambda m: m.repository_identity):
+        if member.member_state == "materialized":
+            continue
+        if member.member_state != "planned":
+            raise _WorkspaceRejected("member state unexpected")
+        controller.pin_planned_member_base(workspace_id, member.repository_identity, pinned_at=materialized_at)
+        plan = controller.load(
+            workspace_id=workspace_id,
+            expected_initiative_id=initiative_id,
+            expected_segment_id=segment_id,
+            expected_controller_binding=binding,
+        )
+        member = next(m for m in plan.members if m.repository_identity == member.repository_identity)
+        op_id = f"workspace-materialize-{workspace_id}-{member.repository_identity}"
+        intent = JournalIntent(
+            operation_kind="workspace_materialize",
+            operation_id=op_id,
+            idempotency_id=op_id,
+            member_target=member.repository_identity,
+            workspace_id=workspace_id,
+            repository_identity=member.repository_identity,
+            actor_evidence="system:workspace-controller",
+            intended_git_evidence=(
+                f"base={member.required_base_sha};branch={member.branch}"
+            ),
+            intended_filesystem_evidence=f"target={member.target_path}",
+            created_at=materialized_at,
+        )
+        try:
+            action = journal.recovery_action(intent.operation_id, intent.member_target)
+            if action == "prepare":
+                operations.prepare_materialize(intent, member)
+            operations.run_materialize(intent, member, outcome_at=materialized_at)
+            operations.consume_materialization(intent, member, consumed_at=materialized_at)
+        except Exception:
+            raise _WorkspaceRejected(f"materialization failed for {member.repository_identity}")
+        plan = controller.load(
+            workspace_id=workspace_id,
+            expected_initiative_id=initiative_id,
+            expected_segment_id=segment_id,
+            expected_controller_binding=plan.controller_binding_ref,
+        )
+
+    operations.activate_workspace(plan, activated_at=materialized_at)
+    return plan.segment_root
+
+
+def _validate_40hex(value, name):
+    if not isinstance(value, str) or len(value) != 40:
+        raise _WorkspaceRejected(f"{name} must be 40-char hex")
+    for c in value:
+        if c not in "0123456789abcdef":
+            raise _WorkspaceRejected(f"{name} must be lowercase hex")
+    return value
+
+
+def _load_active_segment_workspace(conn, registry, *, initiative_id, segment_id):
+    if conn.in_transaction:
+        raise _WorkspaceRejected("active transaction not allowed")
+    if type(registry) is not _TrustedRepositoryRegistry:
+        raise _WorkspaceRejected("registry must be trusted")
+    if not isinstance(initiative_id, str) or not initiative_id.strip():
+        raise _WorkspaceRejected("initiative_id must be nonblank")
+    if not isinstance(segment_id, str) or not segment_id.strip():
+        raise _WorkspaceRejected("segment_id must be nonblank")
+    rows = tuple(
+        conn.execute(
+            "SELECT workspace_id FROM segment_workspaces "
+            "WHERE initiative_id = ? AND segment_id = ? AND active = 1",
+            (initiative_id, segment_id),
+        ).fetchall()
+    )
+    if len(rows) != 1:
+        raise _WorkspaceRejected("workspace state missing or ambiguous")
+    workspace_id = rows[0][0]
+    binding = conn.execute(
+        "SELECT controller_binding_ref FROM segment_workspaces WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchone()[0]
+    controller = _SegmentWorkspaceController(conn, registry)
+    plan = controller.load(
+        workspace_id=workspace_id,
+        expected_initiative_id=initiative_id,
+        expected_segment_id=segment_id,
+        expected_controller_binding=binding,
+    )
+    return workspace_id, controller, plan
+
+
+def _load_segment_workspace(conn, registry, *, initiative_id, segment_id):
+    """Load the exact workspace by initiative/segment without requiring active=1.
+
+    Used by retirement where the workspace may already be retired (idempotent
+    retry).  Rejects missing or ambiguous workspaces.
+    """
+    if conn.in_transaction:
+        raise _WorkspaceRejected("active transaction not allowed")
+    if type(registry) is not _TrustedRepositoryRegistry:
+        raise _WorkspaceRejected("registry must be trusted")
+    if not isinstance(initiative_id, str) or not initiative_id.strip():
+        raise _WorkspaceRejected("initiative_id must be nonblank")
+    if not isinstance(segment_id, str) or not segment_id.strip():
+        raise _WorkspaceRejected("segment_id must be nonblank")
+    rows = tuple(
+        conn.execute(
+            "SELECT workspace_id, initiative_id, segment_id, controller_binding_ref "
+            "FROM segment_workspaces "
+            "WHERE initiative_id = ? AND segment_id = ?",
+            (initiative_id, segment_id),
+        ).fetchall()
+    )
+    if len(rows) != 1:
+        raise _WorkspaceRejected("workspace state missing or ambiguous")
+    workspace_id, stored_initiative, stored_segment, binding = rows[0]
+    if stored_initiative != initiative_id or stored_segment != segment_id:
+        raise _WorkspaceRejected("workspace identity mismatch")
+    # Build the plan manually since controller.load requires active=1.
+    cur = conn.execute(
+        "SELECT repository_identity, relative_path, branch, required_base_sha, "
+        "observed_head, member_state FROM segment_workspace_members "
+        "WHERE workspace_id=? ORDER BY repository_identity",
+        (workspace_id,),
+    )
+    mrows = cur.fetchall()
+    if not mrows:
+        raise _WorkspaceRejected("workspace must have at least one member")
+    members = []
+    for mrow in mrows:
+        rid, rel_path, branch, base_sha, obs_head, mstate = mrow
+        reg = registry.lookup(rid)
+        controlled_root = reg.controlled_worktree_root
+        if os.path.isabs(rel_path):
+            raise _WorkspaceRejected(f"relative path must not be absolute: {rel_path}")
+        parts = rel_path.replace("\\", "/").split("/")
+        for part in parts:
+            if part in ("", ".", ".."):
+                raise _WorkspaceRejected(f"relative path contains invalid component: {part}")
+        resolved_target = os.path.normpath(os.path.join(controlled_root, rel_path))
+        try:
+            Path(resolved_target).resolve().relative_to(Path(controlled_root).resolve())
+        except ValueError:
+            raise _WorkspaceRejected(f"relative path resolves outside controlled root: {rel_path}")
+        members.append(
+            _WorkspaceMember(
+                workspace_id=workspace_id,
+                repository_identity=rid,
+                repository_root=reg.repository_root,
+                controlled_worktree_root=controlled_root,
+                relative_path=rel_path,
+                target_path=resolved_target,
+                branch=branch,
+                required_base_sha=base_sha,
+                observed_head=obs_head,
+                member_state=mstate,
+            )
+        )
+    members_tuple = tuple(members)
+    segment_root = _common_segment_root(
+        members_tuple,
+        registry.controlled_worktree_root,
+        initiative_id,
+        segment_id,
+    )
+    plan = _WorkspacePlan(
+        workspace_id=workspace_id,
+        initiative_id=initiative_id,
+        segment_id=segment_id,
+        controller_binding_ref=binding,
+        members=members_tuple,
+        segment_root=segment_root,
+    )
+    return workspace_id, None, plan
+
+
+def _parse_merge_commit_sha(observed_git_evidence):
+    if observed_git_evidence is None:
+        raise _WorkspaceRejected("no verified journal evidence")
+    merge_sha = None
+    remote_sha = None
+    for part in observed_git_evidence.split(";"):
+        if part.startswith("merge="):
+            merge_sha = part[len("merge="):]
+        elif part.startswith("remote="):
+            remote_sha = part[len("remote="):]
+    if merge_sha is None:
+        raise _WorkspaceRejected("no merge commit in journal evidence")
+    _validate_40hex(merge_sha, "merge_commit_sha")
+    if remote_sha is not None:
+        _validate_40hex(remote_sha, "remote_main_head")
+        if remote_sha != merge_sha:
+            raise _WorkspaceRejected("remote containment failed")
+    return merge_sha
+
+
+def _merge_segment_workspace(conn, registry, *, initiative_id, segment_id, accepted_member_heads, merged_at) -> dict:
+    if type(merged_at) is not int or merged_at <= 0:
+        raise _WorkspaceRejected("merged_at must be positive exact int")
+    if not isinstance(accepted_member_heads, tuple):
+        raise _WorkspaceRejected("accepted_member_heads must be tuple")
+
+    workspace_id, controller, plan = _load_active_segment_workspace(
+        conn, registry, initiative_id=initiative_id, segment_id=segment_id
+    )
+
+    # Validate and sort accepted_member_heads by repository_identity
+    entries = []
+    seen_ids = set()
+    for entry in accepted_member_heads:
+        if not isinstance(entry, dict):
+            raise _WorkspaceRejected("accepted_member_heads entries must be dicts")
+        if set(entry.keys()) != {"repository_identity", "accepted_sha"}:
+            raise _WorkspaceRejected("accepted_member_heads entry keys mismatch")
+        rid = entry["repository_identity"]
+        sha = entry["accepted_sha"]
+        if not isinstance(rid, str) or not rid.strip():
+            raise _WorkspaceRejected("repository_identity must be nonblank")
+        _validate_40hex(sha, "accepted_sha")
+        if rid in seen_ids:
+            raise _WorkspaceRejected(f"duplicate repository_identity: {rid}")
+        seen_ids.add(rid)
+        entries.append((rid, sha))
+    entries.sort(key=lambda x: x[0])
+
+    member_by_id = {m.repository_identity: m for m in plan.members}
+    if set(member_by_id.keys()) != seen_ids:
+        raise _WorkspaceRejected("accepted_member_heads does not cover all members exactly once")
+
+    accepted_map = dict(entries)
+    executor = _GitWorkspaceExecutor()
+    journal = ExternalOperationJournal(conn)
+    operations = _JournaledWorkspaceOperations(conn, journal, executor)
+
+    # Preflight every not-yet-merged member before any DB or journal mutation.
+    # Already-merged members are reverified but their delivery SHA is read from
+    # the stored observed_head (the sealed head).
+    delivery_shas = {}
+    for member in sorted(plan.members, key=lambda m: m.repository_identity):
+        if member.member_state == "merged":
+            # Reverify an already-merged member; use its stored observed_head.
+            _validate_40hex(member.observed_head, "observed_head")
+            delivery_shas[member.repository_identity] = member.observed_head
+            continue
+        if member.member_state != "materialized":
+            raise _WorkspaceRejected(f"member {member.repository_identity} not materialized")
+        v = executor.verify(member)
+        if not v.ready:
+            raise _WorkspaceRejected(
+                f"preflight verification failed for {member.repository_identity}: {v.failures}"
+            )
+        status = executor._git(member.target_path, "status", "--porcelain")
+        if status != "":
+            raise _WorkspaceRejected(
+                f"worktree not clean for {member.repository_identity}"
+            )
+        delivery_sha = v.observed_head
+        _validate_40hex(delivery_sha, "delivery_sha")
+        accepted_sha = accepted_map[member.repository_identity]
+        if not executor._is_ancestor(member.target_path, accepted_sha, delivery_sha):
+            raise _WorkspaceRejected(
+                f"accepted SHA not ancestor of delivery for {member.repository_identity}"
+            )
+        delivery_shas[member.repository_identity] = delivery_sha
+
+    # Head-seal: update every materialized member's observed_head to its verified
+    # delivery SHA in one owned BEGIN IMMEDIATE transaction.
+    def _seal_heads():
+        for member in sorted(plan.members, key=lambda m: m.repository_identity):
+            if member.member_state == "merged":
+                continue
+            cur = conn.execute(
+                "UPDATE segment_workspace_members SET observed_head = ?, observed_at = ? "
+                "WHERE workspace_id = ? AND repository_identity = ? "
+                "AND member_state = 'materialized' AND observed_head = ?",
+                (
+                    delivery_shas[member.repository_identity],
+                    merged_at,
+                    workspace_id,
+                    member.repository_identity,
+                    member.observed_head,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise _WorkspaceRejected("head seal update failed")
+    operations._owned_transaction(_seal_heads)
+
+    # Reload plan after head-seal
+    plan = controller.load(
+        workspace_id=workspace_id,
+        expected_initiative_id=initiative_id,
+        expected_segment_id=segment_id,
+        expected_controller_binding=plan.controller_binding_ref,
+    )
+    member_by_id = {m.repository_identity: m for m in plan.members}
+
+    # Merge each member in repository order
+    member_merges = []
+    for member in sorted(plan.members, key=lambda m: m.repository_identity):
+        op_id = f"workspace-merge-{workspace_id}-{member.repository_identity}-{delivery_shas[member.repository_identity]}"
+        intent = JournalIntent(
+            operation_kind="workspace_merge",
+            operation_id=op_id,
+            idempotency_id=op_id,
+            member_target=member.repository_identity,
+            workspace_id=workspace_id,
+            repository_identity=member.repository_identity,
+            actor_evidence="system:workspace-controller",
+            intended_git_evidence=(
+                f"base={member.required_base_sha};source={delivery_shas[member.repository_identity]};branch={member.branch}"
+            ),
+            intended_filesystem_evidence=f"target={member.target_path};retain=true",
+            created_at=merged_at,
+        )
+        try:
+            action = journal.recovery_action(intent.operation_id, intent.member_target)
+            if action == "prepare":
+                operations.prepare_merge(
+                    intent, member,
+                    member.required_base_sha,
+                    delivery_shas[member.repository_identity],
+                )
+            operations.run_merge(
+                intent, member,
+                member.required_base_sha,
+                delivery_shas[member.repository_identity],
+                outcome_at=merged_at,
+            )
+            operations.consume_merge(
+                intent, member,
+                member.required_base_sha,
+                delivery_shas[member.repository_identity],
+                consumed_at=merged_at,
+            )
+        except Exception:
+            raise _WorkspaceRejected(
+                f"merge failed for {member.repository_identity}"
+            )
+        evidence = journal.verified_evidence(intent.operation_id, intent.member_target)
+        if evidence is None:
+            raise _WorkspaceRejected(
+                f"no verified journal evidence for {member.repository_identity}"
+            )
+        merge_commit_sha = _parse_merge_commit_sha(evidence.observed_git_evidence)
+        member_merges.append({
+            "repository_identity": member.repository_identity,
+            "dev3_accepted_sha": accepted_map[member.repository_identity],
+            "segment_delivery_sha": delivery_shas[member.repository_identity],
+            "merge_operation_id": op_id,
+            "merge_commit_sha": merge_commit_sha,
+        })
+
+    return {
+        "workspace_id": workspace_id,
+        "member_merges": member_merges,
+    }
+
+
+def _retire_segment_workspace(conn, registry, *, initiative_id, segment_id, retired_at) -> dict:
+    if type(retired_at) is not int or retired_at <= 0:
+        raise _WorkspaceRejected("retired_at must be positive exact int")
+
+    workspace_id, controller, plan = _load_segment_workspace(
+        conn, registry, initiative_id=initiative_id, segment_id=segment_id
+    )
+
+    journal = ExternalOperationJournal(conn)
+    operations = _JournaledWorkspaceOperations(conn, journal, _GitWorkspaceExecutor())
+    member_ids = operations.retire_workspace(plan, retired_at=retired_at)
+
+    return {
+        "workspace_id": workspace_id,
+        "retired_member_ids": sorted(member_ids),
+        "retired_at": retired_at,
+    }

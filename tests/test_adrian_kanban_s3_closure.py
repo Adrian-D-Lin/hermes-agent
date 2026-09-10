@@ -242,7 +242,7 @@ def _payload():
     }
 
 
-def _submit(commands_module, database_path, provider, key="key-close"):
+def _submit(commands_module, database_path, provider, key="key-close", payload=None):
     boundary = commands_module._CommandBoundary(
         database_path=str(database_path),
         provider=provider,
@@ -258,8 +258,168 @@ def _submit(commands_module, database_path, provider, key="key-close"):
         workspace_id=None,
         execution_context="model-tool",
         actor_profile="default",
-        payload=_payload(),
+        payload=_payload() if payload is None else payload,
     )
+
+
+def _public_closure_payload():
+    return {
+        "initiative_id": "initiative-1",
+        "closure_result_ref": "closure-result",
+        "dev4_5_checkpoint_ref": "checkpoint-DEV4.5",
+        "final_summary_ref": "final-summary.md@" + "e" * 40,
+        "repository_reconciliation_ref": "reconciliation-close",
+        "resolved_phase_result_refs": _seed_result_refs(),
+        "cancelled_task_refs": [],
+        "approval_id": "approval-close",
+        "board": "orchestrator",
+    }
+
+
+def _replace_seeded_closure_with_final_checkpoint(database_path):
+    with sqlite3.connect(database_path) as conn:
+        card_id = conn.execute(
+            "SELECT id FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1' AND card_type='initiative'"
+        ).fetchone()[0]
+        conn.execute(
+            "DELETE FROM initiative_phase_results WHERE result_id='closure-result'"
+        )
+        result = {
+            "step": "DEV4.5",
+            "workspace_retirement_checkpoint_ref": "checkpoint-DEV4.4",
+            "completed_segment_id": "S1",
+            "action": "close_initiative",
+            "next_segment_id": None,
+            "closure_evidence_ref": "final-summary.md@" + "e" * 40,
+            "next_route": "CLOSED",
+        }
+        conn.execute(
+            "INSERT INTO initiative_phase_results ("
+            "result_id,initiative_card_id,initiative_id,phase,segment_id,iteration,"
+            "result_kind,contract_id,contract_version,canonical_payload,"
+            "accepted_task_refs,accepted_checkpoint_refs,actor_evidence,"
+            "idempotency_key,accepted,created_at) VALUES ("
+            "'checkpoint-DEV4.5',?,'initiative-1','DEV4','S1',2,"
+            "'orchestration_checkpoint','adrian-kanban.lifecycle.dev4','1',?,"
+            "'[]','[\"checkpoint-DEV4.4\"]',?,'key-checkpoint-DEV4.5',1,11)",
+            (
+                card_id,
+                json.dumps(result, sort_keys=True, separators=(",", ":")),
+                json.dumps(
+                    {
+                        "session_id": "session",
+                        "actor_profile": "default",
+                        "source_transition_id": 2,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+
+
+def test_public_close_composes_closure_record_from_final_checkpoint_atomically(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_closable(database_path)
+    _replace_seeded_closure_with_final_checkpoint(database_path)
+    payload = _public_closure_payload()
+    _approve(database_path, payload)
+
+    result = _submit(
+        commands_module,
+        database_path,
+        provider,
+        "key-public-close",
+        payload=payload,
+    )
+
+    assert result["result"] == "ACCEPTED"
+    with sqlite3.connect(database_path) as conn:
+        row = conn.execute(
+            "SELECT result_kind,canonical_payload,accepted_checkpoint_refs,"
+            "idempotency_key,accepted FROM initiative_phase_results "
+            "WHERE result_id='closure-result'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "initiative_closure"
+        assert json.loads(row[1]) == {
+            "cancelled_task_refs": [],
+            "closure_conclusion": "approved",
+            "final_summary_ref": payload["final_summary_ref"],
+            "repository_reconciliation_ref": "reconciliation-close",
+            "resolved_phase_result_refs": _seed_result_refs(),
+            "user_approval_ref": "approval-close",
+        }
+        assert json.loads(row[2]) == ["checkpoint-DEV4.5"]
+        assert row[3] == "key-public-close"
+        assert row[4] == 1
+        assert conn.execute(
+            "SELECT closed_at FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1'"
+        ).fetchone()[0] is not None
+        assert conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals "
+            "WHERE approval_id='approval-close'"
+        ).fetchone()[0] == "consumed"
+
+
+@pytest.mark.parametrize("defect", ("missing", "wrong_action", "wrong_summary"))
+def test_public_close_rejects_invalid_final_checkpoint_without_spending_approval(
+    commands_module, tmp_path, monkeypatch, defect
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_closable(database_path)
+    _replace_seeded_closure_with_final_checkpoint(database_path)
+    payload = _public_closure_payload()
+    with sqlite3.connect(database_path) as conn:
+        if defect == "missing":
+            conn.execute(
+                "DELETE FROM initiative_phase_results "
+                "WHERE result_id='checkpoint-DEV4.5'"
+            )
+        else:
+            checkpoint = json.loads(
+                conn.execute(
+                    "SELECT canonical_payload FROM initiative_phase_results "
+                    "WHERE result_id='checkpoint-DEV4.5'"
+                ).fetchone()[0]
+            )
+            if defect == "wrong_action":
+                checkpoint["action"] = "admit_next_segment"
+            else:
+                checkpoint["closure_evidence_ref"] = "other-summary"
+            conn.execute(
+                "UPDATE initiative_phase_results SET canonical_payload=? "
+                "WHERE result_id='checkpoint-DEV4.5'",
+                (json.dumps(checkpoint, sort_keys=True, separators=(",", ":")),),
+            )
+    _approve(database_path, payload)
+
+    result = _submit(
+        commands_module,
+        database_path,
+        provider,
+        f"key-public-{defect}",
+        payload=payload,
+    )
+
+    assert result["result"] == "REJECTED"
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM initiative_phase_results "
+            "WHERE result_id='closure-result'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT closed_at FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1'"
+        ).fetchone()[0] is None
+        assert conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals "
+            "WHERE approval_id='approval-close'"
+        ).fetchone()[0] == "approved"
 
 
 def test_closure_is_atomic_idempotent_and_removes_initiative_from_active_state(

@@ -24,6 +24,8 @@ predicate logic so it is unit-testable without a live human.
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
@@ -53,27 +55,16 @@ class ExceptionRequest:
         from the deepest file until the common prefix holds.  Never trusts the
         model to name the folder.
         """
-        parents = []
-        for f in self.affected_files:
-            p = f.rstrip("/")
-            if "/" in p:
-                p = p.rsplit("/", 1)[0] or "/"
-            else:
-                p = "."
-            parents.append(p)
-        if not parents:
+        if not self.affected_files:
             raise ApprovalError("request_exception requires at least one file")
-        common = parents[0].split("/")
-        for p in parents[1:]:
-            parts = p.split("/")
-            n = 0
-            for a, b in zip(common, parts):
-                if a != b:
-                    break
-                n += 1
-            common = common[:n] or [""]
-        folder = "/".join(common)
-        return folder or "/"
+        try:
+            parents = [os.path.dirname(os.path.normpath(f)) for f in self.affected_files]
+            folder = os.path.commonpath(parents)
+        except ValueError as exc:
+            raise ApprovalError(f"invalid common path: {exc}") from exc
+        if not folder:
+            raise ApprovalError("invalid common path")
+        return folder
 
     def to_presentation(self) -> Dict[str, Any]:
         folder = self.narrowest_common_folder()

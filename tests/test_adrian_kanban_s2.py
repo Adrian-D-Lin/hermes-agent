@@ -27,6 +27,7 @@ from writegate.kanban_approvals import (
     KanbanInitiativeApprovalPreparation,
     consume_approved,
     create_kanban_approval_schema,
+    validate_approved,
 )
 
 
@@ -277,6 +278,43 @@ def test_h02_exact_approval_consumes_in_the_callers_transaction():
     assert row["approval_type"] == APPROVAL_TYPE
     assert row["consumed_mutation_id"] == "mutation-1"
     assert row["consumed_idempotency_ref"] == "idempotency-1"
+
+
+def test_exact_approval_can_be_validated_read_only_before_external_effects():
+    conn = _connection()
+    evidence, _ = _prepared_and_approved(conn)
+    exact = _consumption(evidence._canonical_for_writegate())
+
+    validate_approved(conn, exact, now=1_030)
+
+    row = _approval_row(conn)
+    assert row["state"] == "approved"
+    assert row["consumed_mutation_id"] is None
+    assert row["consumed_idempotency_ref"] is None
+
+
+@pytest.mark.parametrize(
+    ("change", "now"),
+    [
+        ({"request_id": "wrong-request"}, 1_030),
+        ({"operation": "kanban_archive_initiative"}, 1_030),
+        ({"canonical_digest": "sha256:wrong"}, 1_030),
+        ({"session_id": "wrong-session"}, 1_030),
+        ({}, 1_200),
+    ],
+)
+def test_read_only_approval_validation_rejects_mismatch_or_expiry(change, now):
+    conn = _connection()
+    evidence, _ = _prepared_and_approved(conn)
+    exact = replace(
+        _consumption(evidence._canonical_for_writegate()),
+        **change,
+    )
+
+    with pytest.raises(KanbanApprovalRejected, match="validate"):
+        validate_approved(conn, exact, now=now)
+
+    assert _approval_row(conn)["state"] == "approved"
 
 
 def test_h02_proposed_creation_target_uses_same_exact_contract():
@@ -1247,6 +1285,125 @@ def test_workspace_plan_uses_only_registry_root_and_stored_relative_member(
     conn.close()
 
 
+def test_workspace_registry_requires_one_shared_root_across_repository_members(
+    provider_modules, tmp_path
+):
+    """A logical segment has one containment root, even when it spans repos."""
+    workspace_mod = provider_modules["workspace"]
+    first_repo = (tmp_path / "first").resolve()
+    second_repo = (tmp_path / "second").resolve()
+    first_repo.mkdir()
+    second_repo.mkdir()
+    shared_root = (tmp_path / "worktrees").resolve()
+
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1", str(first_repo), str(shared_root)
+            ),
+            workspace_mod._RepositoryRegistration(
+                "repo-2", str(second_repo), str(shared_root)
+            ),
+        )
+    )
+    assert registry.controlled_worktree_root == str(shared_root)
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="shared.*root"):
+        workspace_mod._TrustedRepositoryRegistry(
+            (
+                workspace_mod._RepositoryRegistration(
+                    "repo-1", str(first_repo), str(shared_root)
+                ),
+                workspace_mod._RepositoryRegistration(
+                    "repo-2", str(second_repo), str(tmp_path / "other-root")
+                ),
+            )
+        )
+
+
+def test_workspace_plan_exposes_one_segment_root_above_all_repository_members(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    first_repo, first_base = _disposable_repository(tmp_path / "first-source")
+    second_repo, second_base = _disposable_repository(tmp_path / "second-source")
+    shared_root = (tmp_path / "worktrees").resolve()
+    conn.execute(
+        "UPDATE segment_workspace_members SET required_base_sha = ? "
+        "WHERE workspace_id = ? AND repository_identity = ?",
+        (first_base, "workspace-1", "repo-1"),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspace_members "
+        "(workspace_id, repository_identity, relative_path, branch, "
+        "required_base_sha, observed_head, member_state, observed_at) "
+        "VALUES (?, ?, ?, ?, ?, NULL, 'planned', ?)",
+        (
+            "workspace-1",
+            "repo-2",
+            "initiative-1/S1/repo-2",
+            "initiative-1/S1",
+            second_base,
+            1,
+        ),
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1", str(first_repo), str(shared_root)
+            ),
+            workspace_mod._RepositoryRegistration(
+                "repo-2", str(second_repo), str(shared_root)
+            ),
+        )
+    )
+
+    plan = workspace_mod._SegmentWorkspaceController(conn, registry).load(
+        workspace_id="workspace-1",
+        expected_initiative_id="initiative-1",
+        expected_segment_id="S1",
+        expected_controller_binding="controller-1",
+    )
+
+    assert plan.segment_root == str((shared_root / "initiative-1" / "S1").resolve())
+    assert {member.target_path for member in plan.members} == {
+        str((shared_root / "initiative-1" / "S1" / "repo-1").resolve()),
+        str((shared_root / "initiative-1" / "S1" / "repo-2").resolve()),
+    }
+    conn.close()
+
+
+def test_segment_root_uses_projected_path_when_ids_require_percent_encoding(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    shared_root = str((tmp_path / "worktrees").resolve())
+    target = str(
+        (tmp_path / "worktrees" / "initiative%2FA" / "S%201" / "repo-1").resolve()
+    )
+    member = workspace_mod._WorkspaceMember(
+        workspace_id="workspace-encoded",
+        repository_identity="repo-1",
+        repository_root=str(tmp_path.resolve()),
+        controlled_worktree_root=shared_root,
+        relative_path="initiative%2FA/S%201/repo-1",
+        target_path=target,
+        branch="initiative%2FA/S%201",
+        required_base_sha=None,
+        observed_head=None,
+        member_state="planned",
+    )
+
+    root = workspace_mod._common_segment_root(
+        (member,), shared_root, "initiative/A", "S 1"
+    )
+
+    assert root == str(
+        (tmp_path / "worktrees" / "initiative%2FA" / "S%201").resolve()
+    )
+
+
 def test_workspace_plan_rejects_escape_missing_registry_and_binding_mismatch(
     provider_modules, tmp_path
 ):
@@ -1685,6 +1842,261 @@ def test_materialization_consumption_requires_exact_verified_evidence(
     conn.close()
 
 
+def test_workspace_activation_requires_all_members_materialized_and_verified(
+    provider_modules, tmp_path
+):
+    """A planned segment becomes dispatchable only after its members are real."""
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn,
+        journal_mod.ExternalOperationJournal(conn),
+        workspace_mod._GitWorkspaceExecutor(),
+    )
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="materialized"):
+        operations.activate_workspace(plan, activated_at=2_010)
+    assert conn.execute(
+        "SELECT lifecycle_state FROM segment_workspaces WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[0] == "planned"
+
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    operations.run_materialize(intent, member, outcome_at=2_011)
+    operations.consume_materialization(intent, member, consumed_at=2_012)
+
+    assert operations.activate_workspace(plan, activated_at=2_013) == ("repo-1",)
+    assert tuple(
+        conn.execute(
+            "SELECT lifecycle_state, active, updated_at FROM segment_workspaces "
+            "WHERE workspace_id = ?",
+            (plan.workspace_id,),
+        ).fetchone()
+    ) == ("active", 1, 2_013)
+    conn.close()
+
+
+def test_workspace_activation_rechecks_external_member_state_before_state_change(
+    provider_modules, tmp_path
+):
+    """Consumed database evidence cannot hide a subsequently invalid worktree."""
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn,
+        journal_mod.ExternalOperationJournal(conn),
+        workspace_mod._GitWorkspaceExecutor(),
+    )
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    operations.run_materialize(intent, member, outcome_at=2_021)
+    operations.consume_materialization(intent, member, consumed_at=2_022)
+    _git(Path(member.target_path), "checkout", "-b", "wrong-activation-branch")
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="verification"):
+        operations.activate_workspace(plan, activated_at=2_023)
+    assert conn.execute(
+        "SELECT lifecycle_state FROM segment_workspaces WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[0] == "planned"
+    conn.close()
+
+
+def test_workspace_activation_retry_is_idempotent_and_still_verifies_members(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    journal_mod = provider_modules["journal"]
+    conn, _, _, plan = _workspace_plan(provider_modules, tmp_path)
+    member = plan.members[0]
+    operations = workspace_mod._JournaledWorkspaceOperations(
+        conn,
+        journal_mod.ExternalOperationJournal(conn),
+        workspace_mod._GitWorkspaceExecutor(),
+    )
+    intent = _workspace_materialize_intent(journal_mod, member)
+    operations.prepare_materialize(intent, member)
+    operations.run_materialize(intent, member, outcome_at=2_031)
+    operations.consume_materialization(intent, member, consumed_at=2_032)
+
+    assert operations.activate_workspace(plan, activated_at=2_033) == ("repo-1",)
+    assert operations.activate_workspace(plan, activated_at=2_034) == ("repo-1",)
+    assert tuple(
+        conn.execute(
+            "SELECT lifecycle_state, updated_at FROM segment_workspaces "
+            "WHERE workspace_id = ?",
+            (plan.workspace_id,),
+        ).fetchone()
+    ) == ("active", 2_033)
+
+    _git(Path(member.target_path), "checkout", "-b", "wrong-retry-branch")
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="verification"):
+        operations.activate_workspace(plan, activated_at=2_035)
+    conn.close()
+
+
+def test_segment_materialization_coordinator_pins_current_main_and_activates(
+    provider_modules, tmp_path
+):
+    """The system-owned coordinator performs the complete pre-DEV2 operation."""
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    conn.execute(
+        "UPDATE segment_workspace_members SET required_base_sha = NULL "
+        "WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1", str(repository), plan.members[0].controlled_worktree_root
+            ),
+        )
+    )
+
+    segment_root = workspace_mod._materialize_segment_workspace(
+        conn,
+        registry,
+        initiative_id="initiative-1",
+        segment_id="S1",
+        materialized_at=2_040,
+    )
+
+    assert segment_root == plan.segment_root
+    assert tuple(
+        conn.execute(
+            "SELECT lifecycle_state, active, updated_at FROM segment_workspaces "
+            "WHERE workspace_id = ?",
+            (plan.workspace_id,),
+        ).fetchone()
+    ) == ("active", 1, 2_040)
+    assert tuple(
+        conn.execute(
+            "SELECT required_base_sha, observed_head, member_state "
+            "FROM segment_workspace_members WHERE workspace_id = ?",
+            (plan.workspace_id,),
+        ).fetchone()
+    ) == (base_sha, base_sha, "materialized")
+    assert [
+        row[0]
+        for row in conn.execute(
+            "SELECT state FROM external_operation_journal ORDER BY event_id"
+        )
+    ] == ["prepared", "verified"]
+
+    # A retry verifies the same result without replaying Git or journal effects.
+    assert workspace_mod._materialize_segment_workspace(
+        conn,
+        registry,
+        initiative_id="initiative-1",
+        segment_id="S1",
+        materialized_at=2_041,
+    ) == plan.segment_root
+    assert conn.execute(
+        "SELECT COUNT(*) FROM external_operation_journal"
+    ).fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT updated_at FROM segment_workspaces WHERE workspace_id = ?",
+        (plan.workspace_id,),
+    ).fetchone()[0] == 2_040
+    conn.close()
+
+
+def test_segment_materialization_coordinator_resumes_only_failed_member(
+    provider_modules, tmp_path, monkeypatch
+):
+    """A multi-repository retry preserves completed members and resumes the gap."""
+    workspace_mod = provider_modules["workspace"]
+    conn = _journal_connection(provider_modules["schema"])
+    first_repo, first_base = _disposable_repository(tmp_path / "first")
+    second_repo, second_base = _disposable_repository(tmp_path / "second")
+    shared_root = str((tmp_path / "worktrees").resolve())
+    conn.execute(
+        "UPDATE segment_workspace_members SET required_base_sha = NULL "
+        "WHERE workspace_id = 'workspace-1' AND repository_identity = 'repo-1'"
+    )
+    conn.execute(
+        "INSERT INTO segment_workspace_members "
+        "(workspace_id, repository_identity, relative_path, branch, "
+        "required_base_sha, observed_head, member_state, observed_at) "
+        "VALUES ('workspace-1', 'repo-2', 'initiative-1/S1/repo-2', "
+        "'initiative-1/S1', NULL, NULL, 'planned', 1)"
+    )
+    registry = workspace_mod._TrustedRepositoryRegistry(
+        (
+            workspace_mod._RepositoryRegistration(
+                "repo-1", str(first_repo), shared_root
+            ),
+            workspace_mod._RepositoryRegistration(
+                "repo-2", str(second_repo), shared_root
+            ),
+        )
+    )
+    original_materialize = workspace_mod._GitWorkspaceExecutor.materialize
+    fail_second = {"enabled": True}
+
+    def injected_failure(self, member):
+        if member.repository_identity == "repo-2" and fail_second["enabled"]:
+            raise workspace_mod._WorkspaceRejected("injected second-member failure")
+        return original_materialize(self, member)
+
+    monkeypatch.setattr(
+        workspace_mod._GitWorkspaceExecutor, "materialize", injected_failure
+    )
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="materialization"):
+        workspace_mod._materialize_segment_workspace(
+            conn,
+            registry,
+            initiative_id="initiative-1",
+            segment_id="S1",
+            materialized_at=2_050,
+        )
+
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT repository_identity, required_base_sha, observed_head, "
+            "member_state FROM segment_workspace_members "
+            "WHERE workspace_id='workspace-1' ORDER BY repository_identity"
+        )
+    ] == [
+        ("repo-1", first_base, first_base, "materialized"),
+        ("repo-2", second_base, None, "planned"),
+    ]
+    assert conn.execute(
+        "SELECT lifecycle_state FROM segment_workspaces WHERE workspace_id='workspace-1'"
+    ).fetchone()[0] == "planned"
+
+    fail_second["enabled"] = False
+    workspace_mod._materialize_segment_workspace(
+        conn,
+        registry,
+        initiative_id="initiative-1",
+        segment_id="S1",
+        materialized_at=2_051,
+    )
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT repository_identity, observed_head, member_state "
+            "FROM segment_workspace_members WHERE workspace_id='workspace-1' "
+            "ORDER BY repository_identity"
+        )
+    ] == [
+        ("repo-1", first_base, "materialized"),
+        ("repo-2", second_base, "materialized"),
+    ]
+    assert conn.execute(
+        "SELECT lifecycle_state FROM segment_workspaces WHERE workspace_id='workspace-1'"
+    ).fetchone()[0] == "active"
+    conn.close()
+
+
 def _commit_workspace_feature(member):
     target = Path(member.target_path)
     (target / "feature.txt").write_text("segment feature\n", encoding="utf-8")
@@ -2110,6 +2522,7 @@ def _two_repository_workspace_plan(provider_modules, tmp_path):
     conn = _journal_connection(provider_modules["schema"])
     repository_one, base_one = _disposable_repository(tmp_path / "one")
     repository_two, base_two = _disposable_repository(tmp_path / "two")
+    shared_root = tmp_path / "worktrees"
     conn.execute(
         "UPDATE segment_workspace_members SET required_base_sha = ? "
         "WHERE workspace_id = ? AND repository_identity = ?",
@@ -2139,12 +2552,12 @@ def _two_repository_workspace_plan(provider_modules, tmp_path):
             workspace_mod._RepositoryRegistration(
                 "repo-1",
                 str(repository_one),
-                str(repository_one / ".segment-worktrees"),
+                str(shared_root),
             ),
             workspace_mod._RepositoryRegistration(
                 "repo-2",
                 str(repository_two),
-                str(repository_two / ".segment-worktrees"),
+                str(shared_root),
             ),
         )
     )
@@ -3702,6 +4115,296 @@ def _dispatch_attempt(
         workspace=None,
         board="default",
     )
+
+
+def _insert_ready_segment_dispatch_task(provider_modules, conn, tmp_path):
+    """Stage one DEV2 task whose physical workspace is system-derived."""
+    workspace = provider_modules["workspace"]
+    initiative_card_id = conn.execute(
+        "SELECT id FROM adrian_kanban_cards "
+        "WHERE card_type = 'initiative' AND initiative_id = 'I1'"
+    ).fetchone()[0]
+    shared_root = (tmp_path / "all-segment-worktrees").resolve()
+    repository_root = (tmp_path / "source-repository").resolve()
+    segment_root = shared_root / "I1" / "S1"
+    member_root = segment_root / "repo-1"
+    repository_root.mkdir()
+    member_root.mkdir(parents=True)
+    conn.execute(
+        "UPDATE initiative_transitions SET to_phase = 'DEV2', "
+        "to_segment_id = 'S1' WHERE initiative_id = 'I1'"
+    )
+    conn.execute(
+        "INSERT INTO initiative_segment_projections "
+        "(projection_id, projection_version, initiative_card_id, initiative_id, "
+        "manifest_path, manifest_sha, content_digest, parsed_segment_definitions, "
+        "readiness_refs, validation_result, projected_at) "
+        "VALUES ('projection-dispatch', 1, ?, 'I1', 'segments.json', ?, "
+        "'sha256:manifest', '{}', '[]', 'valid', 20)",
+        (initiative_card_id, "a" * 40),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspaces "
+        "(workspace_id, initiative_card_id, initiative_id, segment_id, "
+        "projection_id, lifecycle_state, controller_binding_ref, active, "
+        "created_at, updated_at) VALUES "
+        "('workspace-segment', ?, 'I1', 'S1', 'projection-dispatch', "
+        "'active', 'controller-1', 1, 21, 21)",
+        (initiative_card_id,),
+    )
+    conn.execute(
+        "INSERT INTO segment_workspace_members "
+        "(workspace_id, repository_identity, relative_path, branch, "
+        "required_base_sha, observed_head, member_state, observed_at) "
+        "VALUES ('workspace-segment', 'repo-1', 'I1/S1/repo-1', 'I1/S1', "
+        "?, ?, 'materialized', 22)",
+        ("b" * 40, "c" * 40),
+    )
+    task_id = "task:DEV2.1"
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, assignee, status, priority, created_at, workspace_kind, "
+        "workspace_path) VALUES (?, ?, 'independent-reviewer', 'ready', 1, "
+        "23, 'dir', ?)",
+        (task_id, task_id, str(segment_root)),
+    )
+    task_card_id = conn.execute(
+        "INSERT INTO adrian_kanban_cards "
+        "(card_type, initiative_id, task_id, title, created_at) "
+        "VALUES ('task', 'I1', ?, ?, 23)",
+        (task_id, task_id),
+    ).lastrowid
+    snapshot = provider_modules["contracts"].expand_contract(
+        step="DEV2.1",
+        initiative_id="I1",
+        baseline_refs=("baseline",),
+        prior_record_refs=("record",),
+        segment_id="S1",
+        segment_workspace_id="workspace-segment",
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    record = provider_modules["lifecycle"].LifecycleContractRepository(conn).attach(
+        task_id=task_id,
+        snapshot=snapshot,
+        skill=provider_modules["lifecycle"].SkillBinding(
+            skill_id="skill:DEV2.1", skill_version="1", skill_hash="skill-hash"
+        ),
+        created_at=24,
+    )
+    conn.commit()
+    registry = workspace._TrustedRepositoryRegistry(
+        (
+            workspace._RepositoryRegistration(
+                repository_identity="repo-1",
+                repository_root=str(repository_root),
+                controlled_worktree_root=str(shared_root),
+            ),
+        )
+    )
+    return record, registry, segment_root, member_root
+
+
+def test_h11_segment_dispatch_derives_exact_shared_root_and_workspace_health(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    workspace = provider_modules["workspace"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record, registry, segment_root, _member_root = _insert_ready_segment_dispatch_task(
+        provider_modules, conn, tmp_path
+    )
+    monkeypatch.setattr(
+        workspace._GitWorkspaceExecutor,
+        "verify",
+        lambda self, member: workspace._MemberVerification(
+            repository_identity=member.repository_identity,
+            target_path=member.target_path,
+            observed_head=member.observed_head,
+            branch_matches=True,
+            base_contained=True,
+            common_repository=str(tmp_path / "git-common"),
+            ready=True,
+            failures=(),
+        ),
+    )
+    spawned = []
+
+    def spawn(task, resolved_workspace, **kwargs):
+        spawned.append((task, resolved_workspace, kwargs))
+        return 4243
+
+    try:
+        outcome = dispatcher._LifecycleDispatcher(
+            provider,
+            conn,
+            spawn_fn=spawn,
+            workspace_registry=registry,
+        ).dispatch(_dispatch_attempt(provider_modules, record))
+
+        assert outcome.decision.admitted is True
+        assert Path(spawned[0][1]) == segment_root
+        assert spawned[0][0].workspace_kind == "dir"
+        assert Path(spawned[0][0].workspace_path) == segment_root
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_provider_certifies_only_exact_active_derived_segment_root(
+    provider_modules, tmp_path, monkeypatch
+):
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    _record, registry, segment_root, _member_root = _insert_ready_segment_dispatch_task(
+        provider_modules, conn, tmp_path
+    )
+    sibling = segment_root.parent / "S2"
+    sibling.mkdir()
+    try:
+        provider.bind_workspace_registry(registry)
+        assert provider.resolve_trusted_workspace_root(str(segment_root)) == str(
+            segment_root
+        )
+        assert provider.resolve_trusted_workspace_root(str(sibling)) is None
+        conn.execute(
+            "UPDATE segment_workspaces SET active = 0 "
+            "WHERE workspace_id = 'workspace-segment'"
+        )
+        assert provider.resolve_trusted_workspace_root(str(segment_root)) is None
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u09_segment_dispatch_rejects_task_path_not_equal_to_derived_segment_root(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record, registry, _segment_root, _member_root = _insert_ready_segment_dispatch_task(
+        provider_modules, conn, tmp_path
+    )
+    conn.execute(
+        "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+        (str((tmp_path / "wrong-segment").resolve()), record.task_id),
+    )
+    try:
+        with pytest.raises(dispatcher._DispatcherRejected, match="workspace path"):
+            dispatcher._LifecycleDispatcher(
+                provider,
+                conn,
+                spawn_fn=lambda *args, **kwargs: 4244,
+                workspace_registry=registry,
+            ).dispatch(_dispatch_attempt(provider_modules, record))
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
+
+
+def test_u09_segment_dispatch_rejects_unready_or_contested_derived_workspace(
+    provider_modules, tmp_path, monkeypatch
+):
+    dispatcher = provider_modules["dispatcher"]
+    conn, provider = _staged_dispatch_database(
+        provider_modules, tmp_path, monkeypatch
+    )
+    record, registry, segment_root, _member_root = _insert_ready_segment_dispatch_task(
+        provider_modules, conn, tmp_path
+    )
+    conn.execute(
+        "UPDATE segment_workspace_members SET member_state = 'planned', "
+        "required_base_sha = NULL, observed_head = NULL "
+        "WHERE workspace_id = 'workspace-segment'"
+    )
+    spawned = []
+    try:
+        outcome = dispatcher._LifecycleDispatcher(
+            provider,
+            conn,
+            spawn_fn=lambda *args, **kwargs: spawned.append(args),
+            workspace_registry=registry,
+        ).dispatch(_dispatch_attempt(provider_modules, record))
+        assert outcome.decision.admitted is False
+        assert "WORKSPACE_CONTROLLER_NOT_READY" in _diagnostic_codes(
+            outcome.decision
+        )[0]
+        assert spawned == []
+
+        conn.execute(
+            "UPDATE segment_workspace_members SET member_state = 'materialized', "
+            "required_base_sha = ?, observed_head = ? "
+            "WHERE workspace_id = 'workspace-segment'",
+            ("b" * 40, "c" * 40),
+        )
+        other_id = "task:other-segment-writer"
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, assignee, status, priority, created_at, workspace_kind, "
+            "workspace_path) VALUES (?, ?, 'test-authority-reviewer', 'running', "
+            "1, 25, 'dir', ?)",
+            (other_id, other_id, str(segment_root)),
+        )
+        other_card_id = conn.execute(
+            "INSERT INTO adrian_kanban_cards "
+            "(card_type, initiative_id, task_id, title, created_at) "
+            "VALUES ('task', 'I1', ?, ?, 25)",
+            (other_id, other_id),
+        ).lastrowid
+        other_snapshot = provider_modules["contracts"].expand_contract(
+            step="DEV3.1",
+            initiative_id="I1",
+            baseline_refs=("baseline",),
+            prior_record_refs=("record",),
+            segment_id="S1",
+            segment_workspace_id="workspace-segment",
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        provider_modules["lifecycle"].LifecycleContractRepository(conn).attach(
+            task_id=other_id,
+            snapshot=other_snapshot,
+            skill=provider_modules["lifecycle"].SkillBinding(
+                skill_id="skill:DEV3.1",
+                skill_version="1",
+                skill_hash="skill-hash",
+            ),
+            created_at=26,
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            provider_modules["workspace"]._GitWorkspaceExecutor,
+            "verify",
+            lambda self, member: provider_modules["workspace"]._MemberVerification(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                observed_head=member.observed_head,
+                branch_matches=True,
+                base_contained=True,
+                common_repository=str(tmp_path / "git-common"),
+                ready=True,
+                failures=(),
+            ),
+        )
+        outcome = dispatcher._LifecycleDispatcher(
+            provider,
+            conn,
+            spawn_fn=lambda *args, **kwargs: spawned.append(args),
+            workspace_registry=registry,
+        ).dispatch(
+            _dispatch_attempt(provider_modules, record, attempt_id="contested")
+        )
+        assert outcome.decision.admitted is False
+        assert "WORKSPACE_WRITER_CONTESTED" in _diagnostic_codes(
+            outcome.decision
+        )[0]
+        assert spawned == []
+    finally:
+        kb.clear_authority_providers()
+        conn.close()
 
 
 def test_h11_dispatcher_launches_only_policy_selected_task_and_preserves_native_lineage(

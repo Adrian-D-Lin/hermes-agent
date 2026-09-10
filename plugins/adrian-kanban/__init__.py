@@ -7,6 +7,7 @@ surface, and verified-input pre-tool hook.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 
 from hermes_cli import kanban_db as _kb
@@ -17,15 +18,59 @@ from .versioning import PLUGIN_NAME, PLUGIN_VERSION, release_identity
 _provider_cache: dict[str, "AdrianKanbanAuthorityProvider"] = {}
 
 
-def _trusted_repository_ids_getter() -> frozenset[str]:
+def _trusted_repository_registry_getter():
+    from .workspace import _RepositoryRegistration, _TrustedRepositoryRegistry
+
     config = _config.load_config_readonly()
     kanban_config = config.get("kanban")
     if not isinstance(kanban_config, dict):
         raise ValueError("kanban config must be a mapping")
+    worktree_root = kanban_config.get("controlled_worktree_root")
+    if not isinstance(worktree_root, str) or not worktree_root.strip():
+        raise ValueError("kanban.controlled_worktree_root must be nonblank")
     registry = kanban_config.get("repository_registry")
     if not isinstance(registry, dict):
         raise ValueError("kanban.repository_registry must be a mapping")
-    return frozenset(registry.keys())
+    shared_root = os.path.normpath(os.path.expanduser(worktree_root))
+    if not os.path.isabs(shared_root):
+        raise ValueError(
+            "kanban.controlled_worktree_root must be an absolute path"
+        )
+    registrations = []
+    for repository_id, entry in registry.items():
+        if not isinstance(repository_id, str) or not repository_id.strip():
+            raise ValueError("repository registry ID must be nonblank")
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"kanban.repository_registry.{repository_id} must be a mapping"
+            )
+        repository_root = entry.get("repository_root")
+        if not isinstance(repository_root, str) or not repository_root.strip():
+            raise ValueError(
+                f"kanban.repository_registry.{repository_id}.repository_root "
+                "must be nonblank"
+            )
+        resolved_root = os.path.normpath(os.path.expanduser(repository_root))
+        if not os.path.isabs(resolved_root):
+            raise ValueError(
+                f"kanban.repository_registry.{repository_id}.repository_root "
+                "must be an absolute path"
+            )
+        registrations.append(
+            _RepositoryRegistration(
+                repository_identity=repository_id,
+                repository_root=resolved_root,
+                controlled_worktree_root=shared_root,
+            )
+        )
+    return _TrustedRepositoryRegistry(tuple(registrations))
+
+
+def _trusted_repository_ids_getter() -> frozenset[str]:
+    return frozenset(
+        registration.repository_identity
+        for registration in _trusted_repository_registry_getter()._registrations
+    )
 
 
 def register(ctx) -> None:
@@ -83,6 +128,8 @@ def register(ctx) -> None:
     else:
         provider = AdrianKanbanAuthorityProvider(database_path)
         _provider_cache[database_path] = provider
+    trusted_registry = _trusted_repository_registry_getter()
+    provider.bind_workspace_registry(trusted_registry)
     preparer = GitTaskInputPreparer()
     segment_preparer = GitSegmentManifestPreparer(_trusted_repository_ids_getter)
     handlers = {
@@ -123,6 +170,7 @@ def register(ctx) -> None:
             task_input_preparer=preparer,
             segment_manifest_preparer=segment_preparer,
             phase_result_preparer=GitPhaseResultPreparer(),
+            workspace_registry=trusted_registry,
         )
         provider.bind_command_boundary(boundary)
         register_provider(provider)

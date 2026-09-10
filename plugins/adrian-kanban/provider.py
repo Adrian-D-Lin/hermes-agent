@@ -8,6 +8,7 @@ from hermes_cli import kanban_db as _kb
 
 from .capability import CapabilityBinding, CapabilityRegistry, CapabilityRejected
 from .versioning import PLUGIN_NAME, PLUGIN_VERSION, PROTOCOL_VERSION
+from .workspace import _SegmentWorkspaceController
 
 PROVIDER_NAME = PLUGIN_NAME
 
@@ -25,6 +26,61 @@ class AdrianKanbanAuthorityProvider:
         self._registry = CapabilityRegistry()
         self._healthy = True
         self._command_boundary = None
+        self._workspace_registry = None
+
+    def bind_workspace_registry(self, registry) -> None:
+        from .workspace import _TrustedRepositoryRegistry
+
+        if type(registry) is not _TrustedRepositoryRegistry:
+            raise CapabilityRejected(
+                "workspace registry must be a _TrustedRepositoryRegistry"
+            )
+        if self._workspace_registry is None:
+            self._workspace_registry = registry
+            return
+        if getattr(registry, "_registrations", None) != getattr(
+            self._workspace_registry, "_registrations", None
+        ):
+            raise CapabilityRejected("conflicting workspace registry already bound")
+
+    def resolve_trusted_workspace_root(self, candidate):
+        registry = self._workspace_registry
+        if registry is None or not isinstance(candidate, str):
+            return None
+        candidate = candidate.strip()
+        if not candidate:
+            return None
+        candidate_path = Path(candidate).resolve()
+        if not candidate_path.is_absolute() or not candidate_path.is_dir():
+            return None
+        conn = sqlite3.connect(f"file:{self.database_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT workspace_id, initiative_id, segment_id,
+                       controller_binding_ref
+                FROM segment_workspaces
+                WHERE active = 1 AND lifecycle_state = 'active'
+                ORDER BY workspace_id
+                """
+            ).fetchall()
+            for row in rows:
+                try:
+                    plan = _SegmentWorkspaceController(conn, registry).load(
+                        workspace_id=row["workspace_id"],
+                        expected_initiative_id=row["initiative_id"],
+                        expected_segment_id=row["segment_id"],
+                        expected_controller_binding=row["controller_binding_ref"],
+                    )
+                except Exception:
+                    continue
+                root = Path(plan.segment_root).resolve()
+                if root.is_dir() and root == candidate_path:
+                    return str(root)
+            return None
+        finally:
+            conn.close()
 
     def bind_command_boundary(self, boundary) -> None:
         if not callable(getattr(boundary, "submit", None)):

@@ -41,6 +41,8 @@ from .initiative_mutations import (
     _handle_create_initiative,
     _handle_transition_initiative as _ordinary_handle_transition_initiative,
     _handle_update_initiative,
+    _preflight_dev4_workspace_checkpoint_effect,
+    _preflight_transition_initiative,
 )
 from .initiative_override import (
     execute_approved_initiative_transition_override,
@@ -65,6 +67,13 @@ from .task_inputs import (
     TaskInputPreparationContext,
     finalize_task_input_manifest,
     validate_contract_input_coverage,
+)
+from .workspace import (
+    _SegmentWorkspaceController,
+    _TrustedRepositoryRegistry,
+    _materialize_segment_workspace,
+    _merge_segment_workspace,
+    _retire_segment_workspace,
 )
 
 # Public operation taxonomy. These sets are frozen by the ratified Canon
@@ -890,6 +899,30 @@ TOOL_SCHEMAS: dict[str, Any] = {
                     "type": "string",
                     "description": ("Reference describing the closure outcome."),
                 },
+                "dev4_5_checkpoint_ref": {
+                    "type": "string",
+                    "description": (
+                        "Reference to the accepted DEV4.5 final-segment checkpoint."
+                    ),
+                },
+                "final_summary_ref": {
+                    "type": "string",
+                    "description": "Reference to the closure final summary.",
+                },
+                "repository_reconciliation_ref": {
+                    "type": "string",
+                    "description": "Reference to the repository reconciliation result.",
+                },
+                "resolved_phase_result_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "References to all resolved phase results.",
+                },
+                "cancelled_task_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "References to cancelled tasks.",
+                },
                 "approval_id": {
                     "type": "string",
                     "description": "Approval reference authorizing closure.",
@@ -910,6 +943,11 @@ TOOL_SCHEMAS: dict[str, Any] = {
             "required": [
                 "initiative_id",
                 "closure_result_ref",
+                "dev4_5_checkpoint_ref",
+                "final_summary_ref",
+                "repository_reconciliation_ref",
+                "resolved_phase_result_refs",
+                "cancelled_task_refs",
                 "approval_id",
                 "idempotency_key",
             ],
@@ -1657,6 +1695,14 @@ def _handle_create(context: Any) -> dict[str, Any]:
                 "both be set or both null"
             )
 
+        if segment_id is not None:
+            if "workspace_kind" in payload or "workspace_path" in payload:
+                raise ValueError(
+                    "segment lifecycle tasks derive their workspace from the "
+                    "system; caller-selected workspace_kind or workspace_path "
+                    "is not allowed"
+                )
+
         try:
             lifecycle_snapshot = expand_contract(
                 step=step,
@@ -1770,6 +1816,7 @@ def _handle_create(context: Any) -> dict[str, Any]:
         raise ValueError("initiative card not found")
     initiative_card_id = row["id"]
 
+    segment_workspace_plan = None
     if lifecycle_snapshot is not None:
         if assignee != lifecycle_snapshot.execution_profile:
             raise ValueError("assignee does not match lifecycle execution profile")
@@ -1789,7 +1836,8 @@ def _handle_create(context: Any) -> dict[str, Any]:
         if lifecycle_snapshot.segment_id is not None:
             workspace_row = context.connection.execute(
                 "SELECT workspace_id, initiative_card_id, initiative_id, "
-                "segment_id, active, lifecycle_state FROM segment_workspaces "
+                "segment_id, active, lifecycle_state, controller_binding_ref "
+                "FROM segment_workspaces "
                 "WHERE workspace_id = ?",
                 (lifecycle_snapshot.segment_workspace_id,),
             ).fetchone()
@@ -1805,6 +1853,19 @@ def _handle_create(context: Any) -> dict[str, Any]:
                 raise ValueError("segment workspace is not active")
             if workspace_row["lifecycle_state"] != "active":
                 raise ValueError("segment workspace lifecycle state is not active")
+            if context.workspace_registry is None:
+                raise ValueError("workspace registry is required for segment tasks")
+            try:
+                segment_workspace_plan = _SegmentWorkspaceController(
+                    context.connection, context.workspace_registry
+                ).load(
+                    workspace_id=lifecycle_snapshot.segment_workspace_id,
+                    expected_initiative_id=initiative_id,
+                    expected_segment_id=lifecycle_snapshot.segment_id,
+                    expected_controller_binding=workspace_row["controller_binding_ref"],
+                )
+            except Exception as exc:
+                raise ValueError(f"segment workspace plan load failed: {exc}") from exc
 
         if lifecycle_snapshot.predecessor_ref is not None:
             _validate_lifecycle_predecessor(
@@ -1832,6 +1893,10 @@ def _handle_create(context: Any) -> dict[str, Any]:
     ):
         if optional_field in payload:
             kwargs[optional_field] = payload[optional_field]
+
+    if segment_workspace_plan is not None:
+        kwargs["workspace_kind"] = "dir"
+        kwargs["workspace_path"] = segment_workspace_plan.segment_root
 
     context.mutation_executor._create_in_active_transaction(
         context.capability,
@@ -3398,6 +3463,7 @@ class _CommandContext:
         prepared_phase_result: Any = None,
         initial_authorizer: Any = None,
         override_now: Any = None,
+        workspace_registry: _TrustedRepositoryRegistry | None = None,
     ) -> None:
         self.operation = operation
         self.payload = payload
@@ -3418,6 +3484,7 @@ class _CommandContext:
         self.prepared_phase_result = prepared_phase_result
         self.initial_authorizer = initial_authorizer
         self.override_now = override_now
+        self.workspace_registry = workspace_registry
 
 
 class _CommandBoundary:
@@ -3432,9 +3499,14 @@ class _CommandBoundary:
         task_input_preparer: Any = None,
         segment_manifest_preparer: Any = None,
         phase_result_preparer: Any = None,
+        workspace_registry: _TrustedRepositoryRegistry | None = None,
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise TypeError("provider must be an AdrianKanbanAuthorityProvider")
+        if workspace_registry is not None and not isinstance(
+            workspace_registry, _TrustedRepositoryRegistry
+        ):
+            raise TypeError("workspace_registry must be a _TrustedRepositoryRegistry")
         if not isinstance(database_path, str) or not database_path.strip():
             raise ValueError("database_path must be a nonblank string")
         if state_resolver is not None and not callable(state_resolver):
@@ -3464,6 +3536,7 @@ class _CommandBoundary:
         self._task_input_preparer = task_input_preparer
         self._segment_manifest_preparer = segment_manifest_preparer
         self._phase_result_preparer = phase_result_preparer
+        self._workspace_registry = workspace_registry
 
     @property
     def database_path(self) -> str:
@@ -3560,6 +3633,7 @@ class _CommandBoundary:
                 connection=conn,
                 attempt_id=attempt_id,
                 known_profiles=self._known_profiles,
+                workspace_registry=self._workspace_registry,
             )
             result = handler(context)
             if not isinstance(result, dict):
@@ -3828,6 +3902,150 @@ class _CommandBoundary:
                     actor_profile.strip() if actor_profile is not None else None
                 ),
             )
+            if (
+                action == "kanban_transition_initiative"
+                and "_approved_gate_override_request_id" in payload
+            ):
+                from .initiative_override import preflight_approved_initiative_transition_override
+
+                override_preflight = preflight_approved_initiative_transition_override(
+                    conn,
+                    request_id=payload["_approved_gate_override_request_id"],
+                    executor_session_id=session_id,
+                    executor_profile=(
+                        actor_profile.strip() if actor_profile is not None else None
+                    ),
+                )
+                if override_preflight["to_phase"] == "DEV2":
+                    if self._workspace_registry is None:
+                        raise ValueError(
+                            "workspace_registry is required for DEV2 transition materialization"
+                        )
+                    to_segment_id = override_preflight["to_segment_id"]
+                    if to_segment_id is None:
+                        raise ValueError("DEV2 transition requires a target segment")
+                    _materialize_segment_workspace(
+                        conn,
+                        self._workspace_registry,
+                        initiative_id=override_preflight["initiative_id"],
+                        segment_id=to_segment_id,
+                        materialized_at=int(time.time()),
+                    )
+
+            if (
+                action == "kanban_transition_initiative"
+                and "gate_override" not in payload
+                and "_approved_gate_override_request_id" not in payload
+            ):
+                preflight_context = _CommandContext(
+                    operation=action,
+                    payload=payload,
+                    connection=conn,
+                    attempt_id=attempt_id,
+                    capability=None,
+                    binding=binding,
+                    mutation_executor=None,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    user_task=user_task,
+                    known_profiles=self._known_profiles,
+                    prepared_attachment=prepared_attachment,
+                    idempotency_key=idempotency_key,
+                    prepared_manifest=prepared_manifest,
+                    prepared_segment_manifest=prepared_segment_manifest,
+                    prepared_successor_manifest=prepared_successor_manifest,
+                    prepared_phase_result=prepared_phase_result,
+                    initial_authorizer=fields.get("initial_authorizer"),
+                    override_now=fields.get("override_now"),
+                    workspace_registry=self._workspace_registry,
+                )
+                preflight_result = _preflight_transition_initiative(preflight_context)
+                if preflight_result["to_phase"] == "DEV2":
+                    if self._workspace_registry is None:
+                        raise ValueError(
+                            "workspace_registry is required for DEV2 transition materialization"
+                        )
+                    to_segment_id = preflight_result["to_segment_id"]
+                    if to_segment_id is None:
+                        raise ValueError("DEV2 transition requires a target segment")
+                    _materialize_segment_workspace(
+                        conn,
+                        self._workspace_registry,
+                        initiative_id=preflight_result["initiative_id"],
+                        segment_id=to_segment_id,
+                        materialized_at=int(time.time()),
+                    )
+
+            if (
+                action == "kanban_update_initiative"
+                and payload.get("update_kind") == "orchestration_checkpoint"
+            ):
+                preflight_context = _CommandContext(
+                    operation=action,
+                    payload=payload,
+                    connection=conn,
+                    attempt_id=attempt_id,
+                    capability=None,
+                    binding=binding,
+                    mutation_executor=None,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    user_task=user_task,
+                    known_profiles=self._known_profiles,
+                    prepared_attachment=prepared_attachment,
+                    idempotency_key=idempotency_key,
+                    prepared_manifest=prepared_manifest,
+                    prepared_segment_manifest=prepared_segment_manifest,
+                    prepared_successor_manifest=prepared_successor_manifest,
+                    prepared_phase_result=prepared_phase_result,
+                    initial_authorizer=fields.get("initial_authorizer"),
+                    override_now=fields.get("override_now"),
+                    workspace_registry=self._workspace_registry,
+                )
+                dev4_effect = _preflight_dev4_workspace_checkpoint_effect(
+                    preflight_context
+                )
+                if dev4_effect is not None:
+                    if self._workspace_registry is None:
+                        raise ValueError(
+                            "workspace_registry is required for DEV4 checkpoint effect"
+                        )
+                    registry = self._workspace_registry
+                    step = dev4_effect["step"]
+                    if step == "DEV4.3":
+                        merge_result = _merge_segment_workspace(
+                            conn,
+                            registry,
+                            initiative_id=dev4_effect["initiative_id"],
+                            segment_id=dev4_effect["segment_id"],
+                            accepted_member_heads=dev4_effect["accepted_member_heads"],
+                            merged_at=dev4_effect["approved_at"],
+                        )
+                        approved = payload["update"]["result"]
+                        if merge_result["workspace_id"] != approved["workspace_id"]:
+                            raise ValueError("DEV4.3 merge workspace mismatch")
+                        projected_merges = [
+                            {k: v for k, v in m.items() if k != "merge_commit_sha"}
+                            for m in merge_result["member_merges"]
+                        ]
+                        if projected_merges != approved["member_merges"]:
+                            raise ValueError("DEV4.3 merge member mismatch")
+                    elif step == "DEV4.4":
+                        retire_result = _retire_segment_workspace(
+                            conn,
+                            registry,
+                            initiative_id=dev4_effect["initiative_id"],
+                            segment_id=dev4_effect["segment_id"],
+                            retired_at=dev4_effect["approved_at"],
+                        )
+                        approved = payload["update"]["result"]
+                        if retire_result["workspace_id"] != approved["workspace_id"]:
+                            raise ValueError("DEV4.4 retire workspace mismatch")
+                        if sorted(retire_result["retired_member_ids"]) != approved[
+                            "retired_member_ids"
+                        ]:
+                            raise ValueError("DEV4.4 retire member mismatch")
+
             capability = self._provider._mint_after_admission(binding)
             adapter = self._provider._create_mutation_executor(conn)
 
@@ -3878,6 +4096,7 @@ class _CommandBoundary:
                     prepared_phase_result=prepared_phase_result,
                     initial_authorizer=fields.get("initial_authorizer"),
                     override_now=fields.get("override_now"),
+                    workspace_registry=self._workspace_registry,
                 )
                 try:
                     result = handler(context)

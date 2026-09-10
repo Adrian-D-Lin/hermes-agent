@@ -114,16 +114,22 @@ def is_within(target_canonical: str, root_canonical: str) -> bool:
     r = _normalize(root_canonical)
     if t == r:
         return True
-    # r must be a strict prefix of t at component boundaries.  Joining with the
-    # separator and comparing avoids the string-prefix footgun where
-    # ``/home/proj-evil`` looks inside ``/home/proj``.
-    if not t.startswith(r + os.sep):
+    # Component-aware containment: split both sides on the normalised "/"
+    # separator so the check is correct regardless of the native OS separator
+    # (Windows paths use "\\" while canonical forms are "/").  The root's
+    # components must be an exact leading run of the target's components, which
+    # also avoids the string-prefix footgun where ``/home/proj-evil`` looks
+    # inside ``/home/proj``.
+    root_components = [c for c in r.split("/") if c]
+    target_components = [c for c in t.split("/") if c]
+    if len(target_components) <= len(root_components):
         return False
-    # The character right after the prefix is os.sep by construction, so the
-    # remainder must not itself be a traversal.  (canonicalize_target already
-    # rejected raw traversal, but guard defensively for callers that pass a
-    # pre-built path.)
-    remainder = t[len(r) + len(os.sep):]
+    if target_components[: len(root_components)] != root_components:
+        return False
+    # The remainder must not itself be a traversal.  (canonicalize_target
+    # already rejected raw traversal, but guard defensively for callers that
+    # pass a pre-built path.)
+    remainder = "/".join(target_components[len(root_components):])
     return not has_traversal_component(remainder)
 
 

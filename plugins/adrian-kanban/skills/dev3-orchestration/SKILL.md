@@ -69,16 +69,21 @@ Before performing phase work, resolve the active segment and workspace:
 5. If exactly one task is eligible for this profile, anchor to it. If
    multiple tasks are eligible, present them for selection. If none is
    eligible, report the missing or blocked work.
-6. Resolve the segment workspace from the task card's
-   `segment_workspace_ref`.
-   <!-- TODO: deterministic workspace resolution logic — to be provided
-   when the Kanban workspace resolver is implemented. -->
-   Verify the worktree exists, is on the expected branch, and its base
-   SHA matches the segment register's recorded base SHA.
-7. Obtain the trusted workspace binding
-   (CONFIRMED_WORKTREE_BINDING v1). Confirm the binding's
-   `segment_id`, `worktree_path`, and `git_branch` match the resolved
-   segment workspace.
+6. The plugin—not the caller—derives the physical segment root from the
+   active `segment_workspace_id` in the task's immutable
+   `lifecycle_contract_v1` and the trusted repository registry. The task
+   card projection exposes `lifecycle_phase`, `segment_id`, and
+   `segment_workspace_id`; an absolute path is not accepted from the task
+   caller. On dispatch, the controller checks the worktree/repository
+   identity, the expected branch, required base ancestry, and one active
+   single writer. Legitimate commits may advance HEAD after
+   materialization.
+7. Read the task's `task_input_manifest_v1`, which exactly covers the
+   declared reference paths (`baseline_refs`, `governing_source_refs`,
+   `prior_record_refs`, and, after the first sequence item,
+   `predecessor_ref`). Each entry is pinned by `sha256` and either a Git
+   `source_locator` or a stored snapshot attachment; `context_ref` gives
+   the reading instruction for that entry.
 8. Retain the tuple `initiative_id + segment_id + phase + task_id +
    worktree_path + binding` as the session anchor. Revalidate it before
    governed mutations. If the initiative has advanced (a newer
@@ -94,12 +99,14 @@ worktree:
 - The active segment is not in the segment register.
 - The task card's `segment_id` does not match the active segment from
   the chain.
-- The task card's `segment_workspace_ref` is missing or does not match
-  the expected path.
-- The worktree does not exist, is on the wrong branch, or its base SHA
-  does not match.
-- The workspace binding is missing or does not match the segment
-  workspace.
+- The task card's `segment_workspace_id` is missing from the
+  `lifecycle_contract_v1`, or the system-derived segment root cannot be
+  resolved through the trusted repository registry.
+- The worktree does not exist, is on the wrong branch, fails required
+  base ancestry, or has more than one active writer.
+- The task's `task_input_manifest_v1` does not exactly cover the
+  declared reference paths, or an entry's `sha256` / `source_locator`
+  pin does not verify.
 - The segment's dependencies are not all closed.
 
 ### Phase-specific continuation (DEV3)
@@ -136,9 +143,11 @@ Dispatch protocol:
   initiative.
 - The card identifies the ratified implementation brief (path +
   commit SHA from DEV2.3) and the verified design baseline (path +
-  commit SHA recorded at D4).
-  <!-- TODO: exact card fields and workspace binding to be confirmed
-  once the Kanban field contract is finalized. -->
+  commit SHA recorded at D4). Its `task_input_manifest_v1` pins those
+  declared reference paths by `sha256` and Git `source_locator`, and its
+  `context_ref` gives the reading instruction for each entry. This task
+  carries the accepted DEV2 orchestration checkpoint through its exact
+  `predecessor_ref`.
 - The card states what the builder-tester must produce: build
   artefacts and a build summary.
 - Wait for the contract's accepted completion or checkpoint before
@@ -208,9 +217,9 @@ Dispatch protocol:
   parent initiative.
 - The card identifies the candidate tests and fixtures from DEV3.2,
   the verified design baseline (path + commit SHA recorded at D4),
-  and the build summary from DEV3.1.
-  <!-- TODO: exact card fields and workspace binding to be confirmed
-  once the Kanban field contract is finalized. -->
+  and the build summary from DEV3.1. Its `task_input_manifest_v1` pins
+  those declared reference paths by `sha256` and Git `source_locator`,
+  and its `context_ref` gives the reading instruction for each entry.
 - The card states what the test-authority-reviewer must produce: an
   updated exhaustive test store, a ratified test suite, and a
   test-coverage conclusion.
@@ -243,9 +252,10 @@ Dispatch protocol:
   parent initiative.
 - The card identifies the exhaustive test store (product/module
   identity), the current build state (commit SHA in the segment
-  workspace), and the verified design baseline.
-  <!-- TODO: exact card fields and workspace binding to be confirmed
-  once the Kanban field contract is finalized. -->
+  workspace), and the verified design baseline. Its `task_input_manifest_v1`
+  pins those declared reference paths by `sha256` and Git
+  `source_locator`, and its `context_ref` gives the reading instruction
+  for each entry.
 - The card states what the test-authority-reviewer must produce: a
   complete test-store execution record.
 - Wait for the contract's accepted completion or checkpoint before
@@ -302,9 +312,9 @@ Dispatch protocol:
   initiative.
 - The card identifies the exhaustive test store identity, the complete
   execution record from DEV3.4, and the verified design baseline (path
-  + commit SHA recorded at D4).
-  <!-- TODO: exact card fields and workspace binding to be confirmed
-  once the Kanban field contract is finalized. -->
+  + commit SHA recorded at D4). Its `task_input_manifest_v1` pins those
+  declared reference paths by `sha256` and Git `source_locator`, and its
+  `context_ref` gives the reading instruction for each entry.
 - The card states what the independent-reviewer must produce: a
   test-result review record.
 - Wait for the contract's accepted completion or checkpoint before
@@ -329,9 +339,9 @@ Dispatch protocol:
 - The card identifies the current build state (commit SHA in the
   segment workspace), the verified design baseline (path + commit SHA
   recorded at D4), and the ratified implementation brief (path +
-  commit SHA from DEV2.3).
-  <!-- TODO: exact card fields and workspace binding to be confirmed
-  once the Kanban field contract is finalized. -->
+  commit SHA from DEV2.3). Its `task_input_manifest_v1` pins those
+  declared reference paths by `sha256` and Git `source_locator`, and its
+  `context_ref` gives the reading instruction for each entry.
 - The card states what the independent-reviewer must produce: an
   independent code-review record.
 - The card must state that the independent-reviewer must NOT read
@@ -362,9 +372,9 @@ Dispatch protocol:
   initiative.
 - The card identifies the independent code-review record from DEV3.7
   and the test-authority-reviewer's broad code-review findings from
-  DEV3.5.
-  <!-- TODO: exact card fields and workspace binding to be confirmed
-  once the Kanban field contract is finalized. -->
+  DEV3.5. Its `task_input_manifest_v1` pins those declared reference
+  paths by `sha256` and Git `source_locator`, and its `context_ref` gives
+  the reading instruction for each entry.
 - The card states what the independent-reviewer must produce: an
   integrated review record with agreement, disagreement, and gap
   register.
@@ -480,9 +490,11 @@ the prior cycle's relevant records as context.
   `2-design/<segment-id>/`.
 - Candidate tests and fixtures: committed to main under
   `2-design/<segment-id>/`.
-- Exhaustive test store: committed to main under the product/module
-  test-store location. <!-- TODO: exact test-store location to be
-  confirmed once the Kanban field contract is finalized. -->
+- Exhaustive test store: the test store has no hard-coded global folder.
+  Its authoritative identity/location is the path declared in the task's
+  `task_input_manifest_v1`, pinned by `source_locator` and `sha256` and
+  explained by `context_ref`. Where a design-prescribed artifact
+  location is already explicit, it is preserved.
 - Test execution record: committed to main under
   `2-design/<segment-id>/`.
 - Broad code-review findings: committed to main under
@@ -499,10 +511,10 @@ the prior cycle's relevant records as context.
   `2-design/<segment-id>/`.
 - Kanban: each DEV3 dispatch creates a child card linked to the
   initiative. DEV3.9 (classification) is an orchestrator action
-  recorded on the initiative card, not a separate dispatch card.
-  <!-- TODO: exact Kanban card fields, transition record schema,
-  and workspace binding details to be confirmed once the Kanban
-  field contract is finalized. -->
+  recorded on the initiative card, not a separate dispatch card. DEV3.9
+  is the accepted orchestration checkpoint that classifies all review
+  observations; later revision tasks and the DEV4 chain cite the exact
+  accepted predecessor records through their `predecessor_ref`.
 
 ## Phase outcome and route
 
@@ -574,10 +586,15 @@ The segment proceeds to DEV4 when the DEV3 exit gate is satisfied.
 - The segment register at `2-design/segment-register.md` — the
   read-only reference for segment identity, boundary, dependencies,
   dispatch package reference, and current state.
-- The task card's `segment_workspace_ref` — the source of truth for
-  the segment worktree path.
-  <!-- TODO: deterministic workspace resolution, multi-repository
-  binding behavior, and single-writer constraint details to be
-  confirmed once the Kanban field contract is finalized. -->
+- The task's immutable `lifecycle_contract_v1` (`segment_id`,
+  `segment_workspace_id`, `baseline_refs`, `governing_source_refs`,
+  `prior_record_refs`, and, after the first sequence item,
+  `predecessor_ref`) and its `task_input_manifest_v1` (each entry pinned
+  by `sha256` and a Git `source_locator` or stored snapshot attachment;
+  `context_ref` gives the reading instruction). The plugin—not the
+  caller—derives the physical segment root from the active
+  `segment_workspace_id` and the trusted repository registry; on
+  dispatch the controller checks worktree/repository identity, expected
+  branch, required base ancestry, and one active single writer.
 - The Kanban initiative card — the single reference point for the
   initiative's lifecycle state and DEV3 closing result.
