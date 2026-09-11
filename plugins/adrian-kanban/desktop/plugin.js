@@ -35,7 +35,12 @@ const styles = {
   cardMeta: { display: 'flex', flexWrap: 'wrap', gap: 4 },
   badge: { fontSize: 11, padding: '2px 6px', borderRadius: 4, background: 'var(--color-muted, #eef2f6)', color: 'var(--color-foreground, #3e4c59)' },
   badgePhase: { fontSize: 11, padding: '2px 6px', borderRadius: 4, background: '#e7f1ff', color: '#1a4f8b' },
-  taskStatus: { fontSize: 11, padding: '2px 6px', borderRadius: 4, background: 'var(--color-muted, #f0f4f8)', color: 'var(--color-muted-foreground, #616e7c)' },
+  taskStatus: { fontSize: 11, padding: '2px 6px', borderRadius: 4, background: '#e7f1ff', color: '#1a4f8b' },
+  initiativeGroup: { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 },
+  nestedTasks: { display: 'flex', flexDirection: 'column', gap: 3, margin: '-1px 6px 0 12px', paddingLeft: 7, borderLeft: '2px solid #d9e2ec' },
+  taskRow: { display: 'flex', alignItems: 'center', gap: 5, minWidth: 0, height: 24, padding: '0 6px', border: '1px solid #d9e2ec', borderRadius: 4, background: '#102f57', color: 'var(--color-foreground, #f8fafc)', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden' },
+  taskStep: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 12, fontWeight: 600 },
+  taskSeparator: { color: 'var(--color-muted-foreground, #a8b3c2)', fontSize: 11 },
   diagnostics: { display: 'flex', flexDirection: 'column', gap: 6 },
   diagnostic: { fontSize: 12, padding: 6, borderRadius: 4, background: 'var(--color-muted, #f3f4f6)', color: 'var(--color-foreground, #1f2933)' },
   diagnosticWarn: { fontSize: 12, padding: 8, borderRadius: 4, background: '#fff4e0', color: '#8a5a00' },
@@ -57,6 +62,7 @@ const styles = {
   taskEntry: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 6 },
   attachments: { display: 'flex', flexDirection: 'column', gap: 2, paddingLeft: 12, marginTop: 2 },
   attachment: { fontSize: 12, color: 'var(--color-muted-foreground, #616e7c)' },
+  commentMeta: { marginBottom: 4, fontSize: 11, fontWeight: 600, color: 'inherit' },
   diagnosticField: { fontSize: 12, color: 'var(--color-foreground, #1f2933)' }
 }
 
@@ -77,6 +83,11 @@ function phaseOf(record) {
   const p = String(raw).toUpperCase()
   if (PHASES.indexOf(p) >= 0) return p
   return normalizePhase(p)
+}
+
+function exactStepOf(record) {
+  if (!record || typeof record !== 'object' || record.lifecycle_phase == null) return null
+  return String(record.lifecycle_phase)
 }
 
 function segmentOf(record) {
@@ -178,6 +189,30 @@ function Card({ record, kind, onOpenDetail }) {
   )
 }
 
+function TaskRow({ record, onOpenTaskDetail }) {
+  const id = record.task_id
+  const exactStep = exactStepOf(record) || 'INVALID STEP'
+  const phase = phaseOf(record) || 'INVALID PHASE'
+  const status = nativeStatusOf(record) || 'unknown'
+  return h('div', {
+    style: styles.taskRow,
+    role: 'button',
+    tabIndex: 0,
+    'aria-label': 'Open task ' + (id != null ? id : exactStep),
+    onClick: () => onOpenTaskDetail(id, record.board),
+    onKeyDown: (event) => {
+      if (!event || (event.key !== 'Enter' && event.key !== ' ')) return
+      if (typeof event.preventDefault === 'function') event.preventDefault()
+      onOpenTaskDetail(id, record.board)
+    }
+  },
+  h('span', { style: styles.taskStep }, exactStep),
+  h('span', { style: styles.taskSeparator, 'aria-hidden': 'true' }, '|'),
+  h('span', { style: styles.badgePhase }, phase),
+  h('span', { style: styles.taskSeparator, 'aria-hidden': 'true' }, '|'),
+  h('span', { style: styles.taskStatus }, status))
+}
+
 function Diagnostics({ board }) {
   const failedChecks = Array.isArray(board.failed_checks) ? board.failed_checks : []
   const notEvaluated = Array.isArray(board.not_evaluated_checks) ? board.not_evaluated_checks : []
@@ -202,7 +237,7 @@ function Diagnostics({ board }) {
   )
 }
 
-function Column({ phase, initiatives, tasks, onOpenDetail }) {
+function Column({ phase, initiatives, tasks, onOpenDetail, onOpenTaskDetail }) {
   const total = initiatives.length + tasks.length
   return h('section', { style: styles.column, 'data-phase': phase },
     h('header', { style: styles.columnHeader },
@@ -210,8 +245,17 @@ function Column({ phase, initiatives, tasks, onOpenDetail }) {
       h('span', { style: styles.count }, String(total))),
     h('div', null,
       total === 0 ? h('div', { style: styles.empty }, 'No cards') : null,
-      initiatives.map((record, i) => h(Card, { key: 'i-' + i, record, kind: 'initiative', onOpenDetail })),
-      tasks.map((record, i) => h(Card, { key: 't-' + i, record, kind: 'task' }))
+      initiatives.map((record, i) => {
+        const nestedTasks = tasks.filter((task) => task.initiative_id === record.initiative_id)
+        return h('div', { key: 'i-' + i, style: styles.initiativeGroup },
+          h(Card, { record, kind: 'initiative', onOpenDetail }),
+          nestedTasks.length ? h('div', { style: styles.nestedTasks },
+            nestedTasks.map((task, ti) => h(TaskRow, {
+              key: 't-' + ti,
+              record: task,
+              onOpenTaskDetail
+            }))) : null)
+      })
     )
   )
 }
@@ -337,6 +381,68 @@ function InitiativeDetail({ data, loading, error, onClose }) {
   }, panel)
 }
 
+function TaskDetail({ data, loading, error, onClose }) {
+  let panel
+  if (loading) {
+    panel = h('div', { style: styles.detailPanel, role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Task detail' },
+      h('div', { style: styles.detailHeader },
+        h('h2', { style: styles.detailTitle }, 'Task detail'),
+        h('button', { style: styles.detailClose, onClick: onClose, type: 'button' }, 'Close')),
+      h('div', { style: Object.assign({}, styles.detailBody, styles.info) }, 'Loading task detail...'))
+  } else if (error || !data || typeof data !== 'object') {
+    panel = h('div', { style: styles.detailPanel, role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Task detail' },
+      h('div', { style: styles.detailHeader },
+        h('h2', { style: styles.detailTitle }, 'Task detail'),
+        h('button', { style: styles.detailClose, onClick: onClose, type: 'button' }, 'Close')),
+      h('div', { style: styles.detailBody },
+        h('div', { style: styles.diagnosticError }, 'Detail error: ' + (error || 'Task detail is unavailable; close and reopen the task.'))))
+  } else {
+    const card = data.card && typeof data.card === 'object' ? data.card : {}
+    const task = data.task && typeof data.task === 'object' ? data.task : {}
+    const comments = Array.isArray(data.comments) ? data.comments : []
+    const lifecycle = data.lifecycle_contract && typeof data.lifecycle_contract === 'object' ? data.lifecycle_contract : {}
+    const combined = Object.assign({}, card, task, {
+      lifecycle_phase: lifecycle.step
+    })
+    panel = h('div', { style: styles.detailPanel, role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Task detail' },
+      h('div', { style: styles.detailHeader },
+        h('h2', { style: styles.detailTitle }, titleOf(card) || 'Task detail'),
+        h('button', { style: styles.detailClose, onClick: onClose, type: 'button', 'aria-label': 'Close task detail' }, 'Close')),
+      h('div', { style: styles.detailBody },
+        h('div', { style: styles.cardMeta },
+          h('span', { style: styles.taskStep }, exactStepOf(combined) || card.task_id || 'Task'),
+          h('span', { style: styles.badgePhase }, phaseOf(combined) || 'No phase'),
+          h('span', { style: styles.taskStatus }, nativeStatusOf(combined) || 'unknown')),
+        h('div', { style: styles.detailSection },
+          h('h3', { style: styles.detailSectionTitle }, 'Description'),
+          task.body ? h('div', { style: styles.cardBody }, task.body)
+            : h('div', { style: styles.info }, 'No description stored')),
+        h('div', { style: styles.detailSection },
+          h('h3', { style: styles.detailSectionTitle }, 'Comment history (' + comments.length + ')'),
+          comments.length === 0
+            ? h('div', { style: styles.info }, 'No comments recorded')
+            : comments.map((comment, i) => {
+                const c = comment && typeof comment === 'object' ? comment : {}
+                return h('div', { key: 'c-' + i, style: styles.detailRecord },
+                  h('div', { style: styles.commentMeta },
+                    (c.author != null ? c.author : 'Unknown author') +
+                    (c.created_at != null ? ' @ ' + c.created_at : '')),
+                  h('div', { style: styles.cardBody }, c.body != null ? c.body : ''))
+              })),
+        h(StructuredSection, { label: 'Lifecycle contract', value: data.lifecycle_contract }),
+        h(StructuredSection, { label: 'Input manifest', value: data.input_manifest }),
+        h(StructuredSection, { label: 'Handoff requirement', value: data.handoff_requirement })
+      ))
+  }
+  return h('div', {
+    style: styles.detailOverlay,
+    role: 'presentation',
+    onClick: (event) => {
+      if (event && event.target === event.currentTarget) onClose()
+    }
+  }, panel)
+}
+
 function AdrianKanbanPage({ ctx }) {
   const [state, setState] = useState({
     loading: true,
@@ -353,6 +459,7 @@ function AdrianKanbanPage({ ctx }) {
   const [selectedBoard, setSelectedBoard] = useState('')
   const selectedBoardRef = useRef('')
   const [openInitiative, setOpenInitiative] = useState(null)
+  const [openTask, setOpenTask] = useState(null)
   const detailAbortRef = useRef(null)
 
   function load(boardOverride) {
@@ -410,6 +517,7 @@ function AdrianKanbanPage({ ctx }) {
     setSelectedBoard(value)
     selectedBoardRef.current = value
     closeInitiativeDetail()
+    closeTaskDetail()
     load(value)
   }
 
@@ -424,6 +532,7 @@ function AdrianKanbanPage({ ctx }) {
       controller = new AbortController()
       detailAbortRef.current = controller
     }
+    setOpenTask(null)
     setOpenInitiative(id)
     setState((prev) => ({ ...prev, detailLoading: true, detailError: null, detailData: null }))
     ctx.rest('/initiatives/' + encodeURIComponent(id) + '?board=' + encodeURIComponent(board), controller ? { signal: controller.signal } : undefined)
@@ -448,6 +557,45 @@ function AdrianKanbanPage({ ctx }) {
       detailAbortRef.current = null
     }
     setOpenInitiative(null)
+    setState((prev) => ({ ...prev, detailLoading: false, detailError: null, detailData: null }))
+  }
+
+  function openTaskDetail(id, board) {
+    if (id == null || board == null || String(board).trim() === '') return
+    if (typeof detailAbortRef.current !== 'undefined' && detailAbortRef.current &&
+        typeof detailAbortRef.current.abort === 'function') {
+      detailAbortRef.current.abort()
+    }
+    let controller = null
+    if (typeof AbortController === 'function') {
+      controller = new AbortController()
+      detailAbortRef.current = controller
+    }
+    setOpenInitiative(null)
+    setOpenTask(id)
+    setState((prev) => ({ ...prev, detailLoading: true, detailError: null, detailData: null }))
+    ctx.rest('/tasks/' + encodeURIComponent(id) + '?board=' + encodeURIComponent(board), controller ? { signal: controller.signal } : undefined)
+      .then((envelope) => {
+        if (envelope && typeof envelope === 'object' && envelope.result === 'ACCEPTED' &&
+            envelope.value != null && typeof envelope.value === 'object') {
+          setState((prev) => ({ ...prev, detailLoading: false, detailError: null, detailData: envelope.value }))
+        } else {
+          setState((prev) => ({ ...prev, detailLoading: false, detailError: 'Task detail response was REJECTED or malformed', detailData: null }))
+        }
+      })
+      .catch((err) => {
+        if (err && err.name === 'AbortError') return
+        setState((prev) => ({ ...prev, detailLoading: false, detailError: err && err.message ? err.message : 'Failed to load task detail', detailData: null }))
+      })
+  }
+
+  function closeTaskDetail() {
+    if (typeof detailAbortRef.current !== 'undefined' && detailAbortRef.current &&
+        typeof detailAbortRef.current.abort === 'function') {
+      detailAbortRef.current.abort()
+      detailAbortRef.current = null
+    }
+    setOpenTask(null)
     setState((prev) => ({ ...prev, detailLoading: false, detailError: null, detailData: null }))
   }
 
@@ -551,7 +699,8 @@ function AdrianKanbanPage({ ctx }) {
         phase: p,
         initiatives: byPhase[p].initiatives,
         tasks: byPhase[p].tasks,
-        onOpenDetail: openInitiativeDetail
+        onOpenDetail: openInitiativeDetail,
+        onOpenTaskDetail: openTaskDetail
       }))
     ),
     openInitiative != null ? h(InitiativeDetail, {
@@ -559,6 +708,12 @@ function AdrianKanbanPage({ ctx }) {
       loading: state.detailLoading,
       error: state.detailError,
       onClose: closeInitiativeDetail
+    }) : null,
+    openTask != null ? h(TaskDetail, {
+      data: state.detailData,
+      loading: state.detailLoading,
+      error: state.detailError,
+      onClose: closeTaskDetail
     }) : null
   )
 }

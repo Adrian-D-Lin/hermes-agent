@@ -721,6 +721,10 @@ def test_replacement_lineage_is_visible_without_implying_acceptance(
     projections = plugin_modules["projections"]
     with sqlite3.connect(database_path) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES ('successor', 'reviewer', 'detail-visible comment', 10)"
+        )
         shown = projections.show_projection(conn, "successor", "orchestrator")
         lineage = shown["purge_replacement"]
         assert lineage["predecessor_task_id"] == "predecessor"
@@ -730,6 +734,14 @@ def test_replacement_lineage_is_visible_without_implying_acceptance(
         assert lineage["transferred_relations"]["dependent_task_ids"] == ["child-a"]
         assert shown["accepted_handoff"] is None
         assert shown["task"]["status"] == "todo"
+        assert shown["comments"] == [
+            {
+                "id": shown["comments"][0]["id"],
+                "author": "reviewer",
+                "body": "detail-visible comment",
+                "created_at": 10,
+            }
+        ]
         initiative = projections.show_projection(
             conn, None, "orchestrator", "initiative-1"
         )

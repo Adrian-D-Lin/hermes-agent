@@ -143,6 +143,56 @@
   color: var(--color-foreground, #f8fafc);
 }
 
+.adrian-kanban-initiative-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.adrian-kanban-nested-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: -1px 6px 0 12px;
+  padding-left: 7px;
+  border-left: 2px solid var(--color-border, #d9e2ec);
+}
+
+.adrian-kanban-task-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--color-border, #d9e2ec);
+  border-radius: 4px;
+  background: #102f57;
+  color: var(--color-foreground, #f8fafc);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.adrian-kanban-task-row:hover,
+.adrian-kanban-task-row:focus {
+  border-color: var(--color-primary, #1a4f8b);
+  outline: 1px solid var(--color-primary, #1a4f8b);
+}
+
+.adrian-kanban-task-step {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.adrian-kanban-task-separator {
+  color: var(--color-muted-foreground, #a8b3c2);
+  font-size: 0.7rem;
+}
+
 .adrian-kanban-card-clickable {
   cursor: pointer;
 }
@@ -198,8 +248,15 @@
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 0.7rem;
-  background: var(--color-muted, #f0f4f8);
-  color: var(--color-muted-foreground, #616e7c);
+  background: var(--color-muted, #e7f1ff);
+  color: var(--color-primary, #1a4f8b);
+}
+
+.adrian-kanban-comment-meta {
+  margin-bottom: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: inherit;
 }
 
 .adrian-kanban-card-error {

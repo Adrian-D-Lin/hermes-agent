@@ -39,6 +39,11 @@
     return normalizePhase(p);
   }
 
+  function exactStepOf(record) {
+    if (!record || typeof record !== 'object' || record.lifecycle_phase == null) return null;
+    return String(record.lifecycle_phase);
+  }
+
   function segmentOf(record) {
     if (!record || typeof record !== 'object') return null;
     var raw = record.current_segment_id != null ? record.current_segment_id : record.segment_id;
@@ -139,6 +144,33 @@
     return String(value);
   }
 
+  function TaskRow(props) {
+    var record = props.record;
+    var id = record.task_id;
+    var exactStep = exactStepOf(record) || 'INVALID STEP';
+    var phase = phaseOf(record) || 'INVALID PHASE';
+    var status = nativeStatusOf(record) || 'unknown';
+    var rowProps = {
+      className: 'adrian-kanban-task-row',
+      role: 'button',
+      tabIndex: 0,
+      'aria-label': 'Open task ' + (id != null ? id : exactStep),
+      onClick: function () { props.onOpenTaskDetail(id, record.board); },
+      onKeyDown: function (event) {
+        if (!event || (event.key !== 'Enter' && event.key !== ' ')) return;
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+        props.onOpenTaskDetail(id, record.board);
+      }
+    };
+    return h('div', rowProps,
+      h('span', { className: 'adrian-kanban-task-step' }, exactStep),
+      h('span', { className: 'adrian-kanban-task-separator', 'aria-hidden': 'true' }, '|'),
+      h('span', { className: 'adrian-kanban-badge adrian-kanban-badge-phase' }, phase),
+      h('span', { className: 'adrian-kanban-task-separator', 'aria-hidden': 'true' }, '|'),
+      h('span', { className: 'adrian-kanban-task-status' }, status)
+    );
+  }
+
   function StructuredSection(props) {
     var rendered = textOf(props.value);
     return h('details', { className: 'adrian-kanban-detail-group' },
@@ -161,10 +193,18 @@
           ? h('div', { className: 'adrian-kanban-column-empty' }, 'No cards')
           : null,
         initiatives.map(function (r, i) {
-          return h(Card, { key: 'i-' + i, record: r, kind: 'initiative', onOpenDetail: props.onOpenDetail });
-        }),
-        tasks.map(function (r, i) {
-          return h(Card, { key: 't-' + i, record: r, kind: 'task' });
+          var nestedTasks = tasks.filter(function (task) { return task.initiative_id === r.initiative_id; });
+          return h('div', { key: 'i-' + i, className: 'adrian-kanban-initiative-group' },
+            h(Card, { record: r, kind: 'initiative', onOpenDetail: props.onOpenDetail }),
+            nestedTasks.length ? h('div', { className: 'adrian-kanban-nested-tasks' },
+              nestedTasks.map(function (task, ti) {
+                return h(TaskRow, {
+                  key: 't-' + ti,
+                  record: task,
+                  onOpenTaskDetail: props.onOpenTaskDetail
+                });
+              })) : null
+          );
         })
       )
     );
@@ -336,6 +376,78 @@
     }, panel);
   }
 
+  function TaskDetail(props) {
+    var data = props.data;
+    var loading = props.loading;
+    var error = props.error;
+    var onClose = props.onClose;
+    var panel;
+
+    if (loading) {
+      panel = h('div', { className: 'adrian-kanban-detail-panel', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Task detail' },
+        h('div', { className: 'adrian-kanban-detail-header' },
+          h('h2', null, 'Task detail'),
+          h('button', { className: 'adrian-kanban-detail-close', onClick: onClose, type: 'button' }, 'Close')),
+        h('div', { className: 'adrian-kanban-detail-body adrian-kanban-diagnostic adrian-kanban-diagnostic-info' },
+          'Loading task detail...'));
+    } else if (error || !data || typeof data !== 'object') {
+      panel = h('div', { className: 'adrian-kanban-detail-panel', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Task detail' },
+        h('div', { className: 'adrian-kanban-detail-header' },
+          h('h2', null, 'Task detail'),
+          h('button', { className: 'adrian-kanban-detail-close', onClick: onClose, type: 'button' }, 'Close')),
+        h('div', { className: 'adrian-kanban-detail-body' },
+          h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-error' },
+            'Detail error: ' + (error || 'Task detail is unavailable; close and reopen the task.'))));
+    } else {
+      var card = data.card && typeof data.card === 'object' ? data.card : {};
+      var task = data.task && typeof data.task === 'object' ? data.task : {};
+      var comments = Array.isArray(data.comments) ? data.comments : [];
+      var lifecycle = data.lifecycle_contract && typeof data.lifecycle_contract === 'object' ? data.lifecycle_contract : {};
+      var combined = Object.assign({}, card, task, {
+        lifecycle_phase: lifecycle.step
+      });
+      panel = h('div', { className: 'adrian-kanban-detail-panel', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Task detail' },
+        h('div', { className: 'adrian-kanban-detail-header' },
+          h('h2', null, titleOf(card) || 'Task detail'),
+          h('button', { className: 'adrian-kanban-detail-close', onClick: onClose, type: 'button', 'aria-label': 'Close task detail' }, 'Close')),
+        h('div', { className: 'adrian-kanban-detail-body' },
+          h('div', { className: 'adrian-kanban-card-meta' },
+            h('span', { className: 'adrian-kanban-task-step' }, exactStepOf(combined) || card.task_id || 'Task'),
+            h('span', { className: 'adrian-kanban-badge adrian-kanban-badge-phase' }, phaseOf(combined) || 'No phase'),
+            h('span', { className: 'adrian-kanban-task-status' }, nativeStatusOf(combined) || 'unknown')),
+          h('div', { className: 'adrian-kanban-detail-section' },
+            h('h3', null, 'Description'),
+            task.body ? h('div', { className: 'adrian-kanban-card-body' }, task.body)
+              : h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-info' }, 'No description stored')),
+          h('div', { className: 'adrian-kanban-detail-section' },
+            h('h3', null, 'Comment history (' + comments.length + ')'),
+            comments.length === 0
+              ? h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-info' }, 'No comments recorded')
+              : comments.map(function (comment, i) {
+                  var c = comment && typeof comment === 'object' ? comment : {};
+                  return h('div', { key: 'c-' + i, className: 'adrian-kanban-detail-record' },
+                    h('div', { className: 'adrian-kanban-comment-meta' },
+                      (c.author != null ? c.author : 'Unknown author') +
+                      (c.created_at != null ? ' @ ' + c.created_at : '')),
+                    h('div', { className: 'adrian-kanban-card-body' }, c.body != null ? c.body : ''));
+                })),
+          h(StructuredSection, { label: 'Lifecycle contract', value: data.lifecycle_contract }),
+          h(StructuredSection, { label: 'Input manifest', value: data.input_manifest }),
+          h(StructuredSection, { label: 'Handoff requirement', value: data.handoff_requirement })
+        ));
+    }
+
+    return h('div', {
+      className: 'adrian-kanban-detail-overlay',
+      role: 'presentation',
+      onClick: function (event) {
+        if (event && event.target && event.target.classList && event.target.classList.contains('adrian-kanban-detail-overlay')) {
+          onClose();
+        }
+      }
+    }, panel);
+  }
+
   function App() {
     var state = React.useState({
       loading: true,
@@ -358,6 +470,9 @@
     var openInitiativeState = React.useState(null);
     var openInitiative = openInitiativeState[0];
     var setOpenInitiative = openInitiativeState[1];
+    var openTaskState = React.useState(null);
+    var openTask = openTaskState[0];
+    var setOpenTask = openTaskState[1];
     var detailAbortRef = React.useRef(null);
 
     function load(boardOverride) {
@@ -434,6 +549,7 @@
         controller = new window.AbortController();
         detailAbortRef.current = controller;
       }
+      setOpenTask(null);
       setOpenInitiative(id);
       set(function (prev) {
         return {
@@ -523,6 +639,55 @@
           detailError: null,
           detailData: null
         };
+      });
+    }
+
+    function openTaskDetail(id, board) {
+      if (id == null || board == null || String(board).trim() === '') return;
+      if (typeof detailAbortRef.current !== 'undefined' && detailAbortRef.current &&
+          typeof detailAbortRef.current.abort === 'function') {
+        detailAbortRef.current.abort();
+      }
+      var controller = null;
+      if (typeof window.AbortController === 'function') {
+        controller = new window.AbortController();
+        detailAbortRef.current = controller;
+      }
+      setOpenInitiative(null);
+      setOpenTask(id);
+      set(function (prev) {
+        return Object.assign({}, prev, { detailLoading: true, detailError: null, detailData: null });
+      });
+      return api('/tasks/' + encodeURIComponent(id) + '?board=' + encodeURIComponent(board), controller ? { signal: controller.signal } : undefined)
+        .then(function (envelope) {
+          if (envelope && typeof envelope === 'object' && envelope.result === 'ACCEPTED' &&
+              envelope.value != null && typeof envelope.value === 'object') {
+            set(function (prev) {
+              return Object.assign({}, prev, { detailLoading: false, detailError: null, detailData: envelope.value });
+            });
+          } else {
+            set(function (prev) {
+              return Object.assign({}, prev, { detailLoading: false, detailError: 'Task detail response was REJECTED or malformed', detailData: null });
+            });
+          }
+        })
+        .catch(function (err) {
+          if (err && err.name === 'AbortError') return;
+          set(function (prev) {
+            return Object.assign({}, prev, { detailLoading: false, detailError: (err && err.message ? err.message : 'Failed to load task detail'), detailData: null });
+          });
+        });
+    }
+
+    function closeTaskDetail() {
+      if (typeof detailAbortRef.current !== 'undefined' && detailAbortRef.current &&
+          typeof detailAbortRef.current.abort === 'function') {
+        detailAbortRef.current.abort();
+        detailAbortRef.current = null;
+      }
+      setOpenTask(null);
+      set(function (prev) {
+        return Object.assign({}, prev, { detailLoading: false, detailError: null, detailData: null });
       });
     }
 
@@ -712,6 +877,7 @@
             setSelectedBoard(value);
             selectedBoardRef.current = value;
             closeInitiativeDetail();
+            closeTaskDetail();
             load(value);
           }
         },
@@ -742,7 +908,8 @@
             phase: p,
             initiatives: byPhase[p].initiatives,
             tasks: byPhase[p].tasks,
-            onOpenDetail: openInitiativeDetail
+            onOpenDetail: openInitiativeDetail,
+            onOpenTaskDetail: openTaskDetail
           });
         })
       ),
@@ -751,6 +918,12 @@
         loading: s.detailLoading,
         error: s.detailError,
         onClose: closeInitiativeDetail
+      }) : null,
+      openTask != null ? h(TaskDetail, {
+        data: s.detailData,
+        loading: s.detailLoading,
+        error: s.detailError,
+        onClose: closeTaskDetail
       }) : null
     );
   }

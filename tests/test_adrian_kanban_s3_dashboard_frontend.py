@@ -61,6 +61,44 @@ def test_dashboard_renders_initiative_phase_and_subordinate_task_status():
     assert "task-status" in javascript
 
 
+def test_dashboard_nests_compact_tasks_and_opens_task_detail():
+    javascript = _asset("src/index.js")
+    desktop = DESKTOP_ENTRY.read_text(encoding="utf-8")
+
+    for source in (javascript, desktop):
+        assert "function TaskRow" in source
+        assert "nestedTasks" in source
+        assert "task.initiative_id ===" in source
+        assert "exactStepOf(record)" in source
+        assert "'|'" in source
+        assert "function TaskDetail" in source
+        assert "Comment history (" in source
+        assert "'/tasks/' + encodeURIComponent(id)" in source
+        assert "onOpenTaskDetail" in source
+
+    assert "adrian-kanban-nested-tasks" in javascript
+    assert "adrian-kanban-task-row" in javascript
+    assert "h(Card, { key: 't-'" not in javascript
+
+
+def test_task_status_badge_matches_phase_badge_colours():
+    css = _asset("src/style.css")
+    phase = re.search(r"\.adrian-kanban-badge-phase\s*\{(?P<body>[^}]*)\}", css)
+    status = re.search(r"\.adrian-kanban-task-status\s*\{(?P<body>[^}]*)\}", css)
+
+    assert phase is not None
+    assert status is not None
+    for declaration in (
+        "background: var(--color-muted, #e7f1ff)",
+        "color: var(--color-primary, #1a4f8b)",
+    ):
+        assert declaration in phase.group("body")
+        assert declaration in status.group("body")
+
+    desktop = DESKTOP_ENTRY.read_text(encoding="utf-8")
+    assert "taskStatus: { fontSize: 11, padding: '2px 6px', borderRadius: 4, background: '#e7f1ff', color: '#1a4f8b' }" in desktop
+
+
 def test_dashboard_surfaces_actionable_boundary_diagnostics():
     javascript = _asset("src/index.js")
 
@@ -192,7 +230,8 @@ setImmediate(function () {
     flatten(tree, output);
     const text = output.join(" ");
     if (calls.join("|") !== "/api/plugins/adrian-kanban/handshake|/api/plugins/adrian-kanban/projects|/api/plugins/adrian-kanban/board") process.exit(13);
-    if (!text.includes("Probe initiative") || !text.includes("Probe task") || !text.includes("ready") || !text.includes("S1")) process.exit(14);
+    if (!text.includes("Probe initiative") || !text.includes("DEV2.1") || !text.includes("ready") || !text.includes("S1")) process.exit(14);
+    if (text.includes("Probe task")) process.exit(18);
     if (text.includes("Historical D1 task") || text.includes("task-done") || text.includes("task_id: task-done")) process.exit(17);
     function findType(value, type) {
       if (value == null || value === false) return null;
