@@ -29,8 +29,8 @@
   padding: 6px 12px;
   border: 1px solid var(--color-border, #cbd2d9);
   border-radius: 6px;
-  background: var(--color-card, #ffffff);
-  color: var(--color-foreground, #1f2933);
+  background: #102f57;
+  color: var(--color-foreground, #f8fafc);
   font-size: 0.9rem;
   cursor: pointer;
 }
@@ -40,14 +40,15 @@
   padding: 6px 12px;
   border: 1px solid var(--color-border, #cbd2d9);
   border-radius: 6px;
-  background: var(--color-card, #ffffff);
-  color: var(--color-foreground, #1f2933);
+  background: #102f57;
+  color: var(--color-foreground, #f8fafc);
   cursor: pointer;
 }
 
+.adrian-kanban-project-selector:hover,
 .adrian-kanban-refresh:hover,
 .adrian-kanban-mutation:hover:not(:disabled) {
-  background: var(--color-muted, #eef2f6);
+  background: #163b68;
 }
 
 .adrian-kanban-mutations {
@@ -250,9 +251,13 @@
   padding: 4px 10px;
   border: 1px solid var(--color-border, #cbd2d9);
   border-radius: 6px;
-  background: var(--color-card, #ffffff);
-  color: var(--color-foreground, #1f2933);
+  background: #102f57;
+  color: var(--color-foreground, #f8fafc);
   cursor: pointer;
+}
+
+.adrian-kanban-detail-close:hover {
+  background: #163b68;
 }
 
 .adrian-kanban-detail-body {

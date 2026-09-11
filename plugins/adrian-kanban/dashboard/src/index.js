@@ -281,7 +281,7 @@
               ? h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-info' }, 'No transitions recorded')
               : history.map(function (t, i) {
                   var d = t && typeof t === 'object' ? t : {};
-                  return h('div', { key: 'h-' + i, className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-info' },
+                return h('div', { key: 'h-' + i, className: 'adrian-kanban-detail-record' },
                     'transition: ' + (d.from_phase != null ? d.from_phase : '?') + ' → ' + (d.to_phase != null ? d.to_phase : '?') +
                     (d.created_at != null ? ' @ ' + d.created_at : ''));
                 })),
