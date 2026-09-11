@@ -18,7 +18,7 @@ const styles = {
   toolbar: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' },
   actions: { display: 'flex', gap: 8, flexWrap: 'wrap' },
   title: { margin: 0, fontSize: 18 },
-  button: { cursor: 'pointer', padding: '4px 10px', border: '1px solid #cbd2d9', borderRadius: 4, background: 'var(--color-card, #ffffff)', color: 'var(--color-foreground, #1f2933)' },
+  button: { cursor: 'pointer', padding: '4px 10px', border: '1px solid #cbd2d9', borderRadius: 4, background: '#102f57', color: 'var(--color-foreground, #f8fafc)' },
   warn: { border: '1px solid #b45309', background: '#fff4e0', color: '#8a5a00', padding: 8, borderRadius: 4 },
   error: { border: '1px solid #b91c1c', background: '#fdecec', color: '#9b1c1c', padding: 8, borderRadius: 4 },
   info: { border: '1px solid #2563eb', background: '#e7f1ff', color: '#1a4f8b', padding: 8, borderRadius: 4 },
@@ -45,7 +45,7 @@ const styles = {
   detailPanel: { width: '100%', maxWidth: 640, background: '#0b2545', color: 'var(--color-foreground, #f8fafc)', border: '1px solid #d9e2ec', borderRadius: 8, display: 'flex', flexDirection: 'column', maxHeight: 'calc(100vh - 48px)', userSelect: 'text' },
   detailHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '12px 16px', borderBottom: '1px solid #d9e2ec' },
   detailTitle: { margin: 0, fontSize: 17 },
-  detailClose: { cursor: 'pointer', padding: '4px 10px', border: '1px solid #cbd2d9', borderRadius: 6, background: 'var(--color-card, #ffffff)', color: 'var(--color-foreground, #1f2933)' },
+  detailClose: { cursor: 'pointer', padding: '4px 10px', border: '1px solid #cbd2d9', borderRadius: 6, background: '#102f57', color: 'var(--color-foreground, #f8fafc)' },
   detailBody: { padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, overflow: 'auto', userSelect: 'text' },
   detailSection: { display: 'flex', flexDirection: 'column', gap: 6 },
   detailSectionTitle: { margin: 0, fontSize: 14, color: 'var(--color-foreground, #f8fafc)' },
@@ -285,7 +285,7 @@ function InitiativeDetail({ data, loading, error, onClose }) {
             ? h('div', { style: styles.info }, 'No transitions recorded')
             : history.map((t, i) => {
                 const d = t && typeof t === 'object' ? t : {}
-                return h('div', { key: 'h-' + i, style: styles.diagnostic },
+                return h('div', { key: 'h-' + i, style: styles.detailRecord },
                   'transition: ' + (d.from_phase != null ? d.from_phase : '?') + ' → ' + (d.to_phase != null ? d.to_phase : '?') +
                   (d.created_at != null ? ' @ ' + d.created_at : ''))
               })),
