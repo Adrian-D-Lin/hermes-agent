@@ -190,10 +190,14 @@ const responses = {
   "/api/plugins/adrian-kanban/board": {
     result: "ACCEPTED",
     value: {
-      initiatives: [{initiative_id: "initiative-probe", title: "Probe initiative", current_phase: "DEV2", current_segment_id: "S1"}],
+      initiatives: [
+        {initiative_id: "initiative-probe", title: "Probe initiative", current_phase: "DEV2", current_segment_id: "S1", closed_at: null},
+        {initiative_id: "initiative-closed", title: "Closed initiative", current_phase: "DEV4", current_segment_id: null, closed_at: 1234}
+      ],
       tasks: [
         {task_id: "task-probe", initiative_id: "initiative-probe", title: "Probe task", lifecycle_phase: "DEV2.1", segment_id: "S1", status: "ready"},
-        {task_id: "task-done", initiative_id: "initiative-probe", title: "Historical D1 task", status: "done"}
+        {task_id: "task-done", initiative_id: "initiative-probe", title: "Historical D1 task", status: "done"},
+        {task_id: "task-closed-blocked", initiative_id: "initiative-closed", title: "Closed blocked historical task", status: "blocked", closed_at: 1234}
       ]
     }
   }
@@ -231,8 +235,10 @@ setImmediate(function () {
     const text = output.join(" ");
     if (calls.join("|") !== "/api/plugins/adrian-kanban/handshake|/api/plugins/adrian-kanban/projects|/api/plugins/adrian-kanban/board") process.exit(13);
     if (!text.includes("Probe initiative") || !text.includes("DEV2.1") || !text.includes("ready") || !text.includes("S1")) process.exit(14);
+    if (!text.includes("Closed initiatives (1)") || !text.includes("Closed initiative") || !text.includes("CLOSED")) process.exit(19);
     if (text.includes("Probe task")) process.exit(18);
     if (text.includes("Historical D1 task") || text.includes("task-done") || text.includes("task_id: task-done")) process.exit(17);
+    if (text.includes("Closed blocked historical task") || text.includes("task-closed-blocked")) process.exit(20);
     function findType(value, type) {
       if (value == null || value === false) return null;
       if (Array.isArray(value)) {

@@ -23,6 +23,9 @@ const styles = {
   error: { border: '1px solid #b91c1c', background: '#fdecec', color: '#9b1c1c', padding: 8, borderRadius: 4 },
   info: { border: '1px solid #2563eb', background: '#e7f1ff', color: '#1a4f8b', padding: 8, borderRadius: 4 },
   columns: { display: 'flex', gap: 12, overflowX: 'auto', alignItems: 'flex-start', width: '100%', maxWidth: '100%', minWidth: 0, paddingBottom: 8 },
+  closedShelf: { width: '100%', boxSizing: 'border-box', border: '1px solid #d9e2ec', borderRadius: 8, background: 'var(--color-background, #0f172a)', color: 'var(--color-foreground, #f8fafc)' },
+  closedSummary: { padding: '10px 12px', cursor: 'pointer', fontSize: 14, fontWeight: 600, userSelect: 'none' },
+  closedCards: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8, padding: '0 10px 10px' },
   column: { width: 240, maxWidth: 240, minWidth: 240, flex: '0 0 240px', border: '1px solid #d9e2ec', borderRadius: 8, padding: 8, boxSizing: 'border-box', background: 'var(--color-background, #0f172a)', color: 'var(--color-foreground, #f8fafc)' },
   columnHeader: { display: 'flex', justifyContent: 'space-between', padding: '8px 0', marginBottom: 8, borderBottom: '1px solid #d9e2ec' },
   columnTitle: { margin: 0, fontSize: 14 },
@@ -110,6 +113,10 @@ function isTaskOpen(record) {
   return CLOSED_TASK_STATUSES.indexOf(s) < 0
 }
 
+function isCardClosed(record) {
+  return !!(record && typeof record === 'object' && record.closed_at != null)
+}
+
 function titleOf(record) {
   if (!record || typeof record !== 'object') return ''
   return record.title != null ? String(record.title) : (record.name != null ? String(record.name) : '')
@@ -159,6 +166,7 @@ function Card({ record, kind, onOpenDetail }) {
   const phase = phaseOf(record)
   const segment = segmentOf(record)
   const status = nativeStatusOf(record)
+  const closed = isCardClosed(record)
   const title = titleOf(record) || (kind === 'initiative' ? 'Untitled initiative' : 'Untitled task')
   const invalid = !phase
   const cardStyle = Object.assign({}, invalid ? styles.cardInvalid : styles.card)
@@ -184,6 +192,7 @@ function Card({ record, kind, onOpenDetail }) {
     h('div', { style: styles.cardMeta },
       h('span', { style: styles.badgePhase }, phase ? phase : 'INVALID PHASE'),
       segment ? h('span', { style: styles.badgePhase }, 'SEG ' + segment) : null,
+      kind === 'initiative' && closed ? h('span', { style: styles.taskStatus }, 'CLOSED') : null,
       kind === 'task' && status ? h('span', { style: styles.taskStatus }, status) : null),
     invalid ? h('div', { style: { fontSize: 11, color: '#9b1c1c', marginTop: 6 } }, 'Missing or unrecognized lifecycle phase') : null
   )
@@ -635,16 +644,22 @@ function AdrianKanbanPage({ ctx }) {
   // phase. Closed historical tasks do not appear on the board and do not
   // emit diagnostics; they remain reachable through the initiative detail.
   const byPhase = {}
+  const closedInitiatives = []
   const unpositioned = []
   PHASES.forEach((p) => {
     byPhase[p] = { initiatives: [], tasks: [] }
   })
   initiatives.forEach((record) => {
+    if (isCardClosed(record)) {
+      closedInitiatives.push(record)
+      return
+    }
     const p = phaseOf(record)
     if (p) byPhase[p].initiatives.push(record)
     else unpositioned.push({ kind: 'initiative', record })
   })
   tasks.forEach((record) => {
+    if (isCardClosed(record)) return
     if (!isTaskOpen(record)) return
     const p = phaseOf(record)
     if (!p) {
@@ -703,6 +718,17 @@ function AdrianKanbanPage({ ctx }) {
         onOpenTaskDetail: openTaskDetail
       }))
     ),
+    h('details', { style: styles.closedShelf },
+      h('summary', { style: styles.closedSummary }, 'Closed initiatives (' + closedInitiatives.length + ')'),
+      h('div', { style: styles.closedCards },
+        closedInitiatives.length === 0
+          ? h('div', { style: styles.empty }, 'No closed initiatives')
+          : closedInitiatives.map((record) => h(Card, {
+              key: 'closed-' + record.initiative_id,
+              record,
+              kind: 'initiative',
+              onOpenDetail: openInitiativeDetail
+            })))),
     openInitiative != null ? h(InitiativeDetail, {
       data: state.detailData,
       loading: state.detailLoading,

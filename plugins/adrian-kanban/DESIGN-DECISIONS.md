@@ -98,3 +98,25 @@ diagnostic. Background board refresh preserves an open initiative detail; an
 intentional project-board change closes it before loading the other project.
 The dashboard and installed Desktop extension must implement the same behavior
 and maintain readable foreground/background contrast in light and dark themes.
+
+## Closed initiatives shelf - Adrian approved, 2026-09-11
+
+Successful closure is an initiative state, not a tenth lifecycle phase. A
+closed initiative retains its final authoritative phase and non-null
+`closed_at`, but no longer occupies any of the nine active phase columns. It is
+presented in a collapsed **Closed initiatives** shelf visually beneath those
+columns. The shelf is part of the selected project-board projection; it remains
+searchable and each card opens the same durable initiative-detail view.
+
+Archive semantics remain reserved for cancelled or superseded work and must not
+be used as a synonym for successful initiative closure. Historical task records
+associated with a closed initiative retain their original native statuses,
+including failed or blocked intermediate attempts. Their association cards are
+closed so they cannot dispatch, appear as current work, or create missing-phase
+diagnostics, while their task IDs, bodies, results, comments, events, runs,
+attachments, and relationship history remain available for traceability.
+
+The dashboard and installed Desktop extension must implement this presentation
+identically. List projections expose `closed_at` for initiative and task cards;
+the active board excludes closed cards before phase validation, and the
+initiative detail remains the history surface for every associated task.

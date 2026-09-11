@@ -768,6 +768,23 @@ def test_replacement_lineage_is_visible_without_implying_acceptance(
         assert projections.list_projection(conn, board="different-board")["tasks"] == []
         with pytest.raises(ValueError):
             projections.show_projection(conn, "successor", "different-board")
+        conn.execute(
+            "UPDATE adrian_kanban_cards SET closed_at = 1234 "
+            "WHERE initiative_id = 'initiative-1'"
+        )
+        closed_detail = projections.show_projection(
+            conn, None, "orchestrator", "initiative-1"
+        )
+        assert closed_detail["card"]["closed_at"] == 1234
+        closed_list = projections.list_projection(conn, board="orchestrator")
+        assert next(
+            card
+            for card in closed_list["initiatives"]
+            if card["initiative_id"] == "initiative-1"
+        )["closed_at"] == 1234
+        assert next(
+            card for card in closed_list["tasks"] if card["task_id"] == "successor"
+        )["closed_at"] == 1234
         json.dumps(shown)
         json.dumps(initiative)
 

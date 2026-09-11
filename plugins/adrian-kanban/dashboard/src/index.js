@@ -67,6 +67,10 @@
     return true;
   }
 
+  function isCardClosed(record) {
+    return !!(record && typeof record === 'object' && record.closed_at != null);
+  }
+
   function titleOf(record) {
     if (!record || typeof record !== 'object') return '';
     return record.title != null ? String(record.title) : (record.name != null ? String(record.name) : '');
@@ -98,6 +102,7 @@
     var phase = phaseOf(record);
     var segment = segmentOf(record);
     var status = nativeStatusOf(record);
+    var closed = isCardClosed(record);
     var id = kind === 'initiative' ? record.initiative_id : record.task_id;
     var title = titleOf(record) || (kind === 'initiative' ? 'Untitled initiative' : 'Untitled task');
     var invalid = !phase;
@@ -122,6 +127,7 @@
       h('div', { className: 'adrian-kanban-card-meta' },
         h('span', { className: 'adrian-kanban-badge adrian-kanban-badge-phase' }, phase ? phase : 'INVALID PHASE'),
         segment ? h('span', { className: 'adrian-kanban-badge adrian-kanban-badge-segment' }, 'SEG ' + segment) : null,
+        kind === 'initiative' && closed ? h('span', { className: 'adrian-kanban-task-status' }, 'CLOSED') : null,
         kind === 'task' && status ? h('span', { className: 'adrian-kanban-task-status' }, status) : null
       ),
       invalid ? h('div', { className: 'adrian-kanban-card-error' }, 'Missing or unrecognized lifecycle phase') : null
@@ -835,14 +841,20 @@
     // when its normalized display phase equals its parent initiative's current
     // phase. Closed tasks remain reachable through the initiative detail.
     var byPhase = {};
+    var closedInitiatives = [];
     var unpositioned = [];
     PHASES.forEach(function (p) { byPhase[p] = { initiatives: [], tasks: [] }; });
     initiatives.forEach(function (r) {
+      if (isCardClosed(r)) {
+        closedInitiatives.push(r);
+        return;
+      }
       var p = phaseOf(r);
       if (p) byPhase[p].initiatives.push(r);
       else unpositioned.push({ kind: 'initiative', record: r });
     });
     tasks.forEach(function (r) {
+      if (isCardClosed(r)) return;
       if (!isTaskOpen(r)) return;
       var p = phaseOf(r);
       if (!p) {
@@ -913,6 +925,20 @@
           });
         })
       ),
+      h('details', { className: 'adrian-kanban-closed-shelf' },
+        h('summary', { className: 'adrian-kanban-closed-summary' },
+          'Closed initiatives (' + closedInitiatives.length + ')'),
+        h('div', { className: 'adrian-kanban-closed-cards' },
+          closedInitiatives.length === 0
+            ? h('div', { className: 'adrian-kanban-column-empty' }, 'No closed initiatives')
+            : closedInitiatives.map(function (record) {
+                return h(Card, {
+                  key: 'closed-' + record.initiative_id,
+                  record: record,
+                  kind: 'initiative',
+                  onOpenDetail: openInitiativeDetail
+                });
+              }))),
       openInitiative != null ? h(InitiativeDetail, {
         data: s.detailData,
         loading: s.detailLoading,
