@@ -102,12 +102,12 @@
       cardProps.role = 'button';
       cardProps.tabIndex = 0;
       cardProps['aria-label'] = 'Open initiative ' + (id != null ? id : title);
-      cardProps.onClick = function () { onOpenDetail(id); };
+      cardProps.onClick = function () { onOpenDetail(id, record.board); };
       cardProps.onKeyDown = function (event) {
         if (!event || !event.key) return;
         if (event.key === 'Enter' || event.key === ' ') {
           if (typeof event.preventDefault === 'function') event.preventDefault();
-          onOpenDetail(id);
+          onOpenDetail(id, record.board);
         }
       };
     }
@@ -397,8 +397,8 @@
       });
     }
 
-    function openInitiativeDetail(id) {
-      if (id == null) return;
+    function openInitiativeDetail(id, board) {
+      if (id == null || board == null || String(board).trim() === '') return;
       if (typeof detailAbortRef.current !== 'undefined' && detailAbortRef.current &&
           typeof detailAbortRef.current.abort === 'function') {
         detailAbortRef.current.abort();
@@ -423,7 +423,7 @@
           detailData: null
         };
       });
-      return api('/initiatives/' + encodeURIComponent(id), controller ? { signal: controller.signal } : undefined)
+      return api('/initiatives/' + encodeURIComponent(id) + '?board=' + encodeURIComponent(board), controller ? { signal: controller.signal } : undefined)
         .then(function (envelope) {
           if (envelope && typeof envelope === 'object' && envelope.result === 'ACCEPTED' &&
               envelope.value != null && typeof envelope.value === 'object') {

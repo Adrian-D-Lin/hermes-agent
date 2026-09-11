@@ -156,18 +156,22 @@ def list_projects():
 
 
 @router.get("/tasks/{task_id}")
-def task(task_id: str):
+def task(task_id: str, board: str | None = None):
     attempt_id = str(uuid.uuid4())
-    envelope = _delegate("kanban_show", {"task_id": task_id}, attempt_id)
+    payload = {"task_id": task_id}
+    if board is not None:
+        payload["board"] = board
+    envelope = _delegate("kanban_show", payload, attempt_id)
     return _respond(envelope, attempt_id, "kanban_show")
 
 
 @router.get("/initiatives/{initiative_id}")
-def initiative(initiative_id: str):
+def initiative(initiative_id: str, board: str | None = None):
     attempt_id = str(uuid.uuid4())
-    envelope = _delegate(
-        "kanban_show", {"initiative_id": initiative_id}, attempt_id
-    )
+    payload = {"initiative_id": initiative_id}
+    if board is not None:
+        payload["board"] = board
+    envelope = _delegate("kanban_show", payload, attempt_id)
     return _respond(envelope, attempt_id, "kanban_show")
 
 
