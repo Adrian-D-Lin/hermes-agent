@@ -189,8 +189,8 @@
 }
 
 .adrian-kanban-badge-segment {
-  background: var(--color-muted, #eef2f6);
-  color: var(--color-foreground, #3e4c59);
+  background: var(--color-muted, #e7f1ff);
+  color: var(--color-primary, #1a4f8b);
 }
 
 .adrian-kanban-task-status {

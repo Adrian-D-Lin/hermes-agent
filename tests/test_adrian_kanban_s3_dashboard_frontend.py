@@ -237,6 +237,26 @@ def test_dashboard_styles_support_phase_columns_and_status_badges():
     assert ".adrian-kanban-controls-disabled" in css
 
 
+def test_segment_badges_match_phase_badge_colours_on_web_and_desktop():
+    css = _asset("src/style.css")
+    phase = re.search(
+        r"\.adrian-kanban-badge-phase\s*\{(?P<body>[^}]*)\}", css
+    )
+    segment = re.search(
+        r"\.adrian-kanban-badge-segment\s*\{(?P<body>[^}]*)\}", css
+    )
+
+    assert phase is not None
+    assert segment is not None
+    assert phase.group("body").strip() == segment.group("body").strip()
+    assert "segment ? h('span', { style: styles.badgePhase }" in DESKTOP_ENTRY.read_text(
+        encoding="utf-8"
+    )
+    assert "? h('span', { style: styles.badgePhase }, 'SEG '" in DESKTOP_ENTRY.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_dashboard_uses_initiative_tracker_title_and_project_board_selector():
     javascript = _asset("src/index.js")
     manifest = json.loads(_asset("manifest.json"))

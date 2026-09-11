@@ -172,7 +172,7 @@ function Card({ record, kind, onOpenDetail }) {
       id != null ? h('span', { style: { fontSize: 11, color: 'inherit' } }, ' #' + id) : null),
     h('div', { style: styles.cardMeta },
       h('span', { style: styles.badgePhase }, phase ? phase : 'INVALID PHASE'),
-      segment ? h('span', { style: styles.badge }, 'SEG ' + segment) : null,
+      segment ? h('span', { style: styles.badgePhase }, 'SEG ' + segment) : null,
       kind === 'task' && status ? h('span', { style: styles.taskStatus }, status) : null),
     invalid ? h('div', { style: { fontSize: 11, color: '#9b1c1c', marginTop: 6 } }, 'Missing or unrecognized lifecycle phase') : null
   )
@@ -277,7 +277,7 @@ function InitiativeDetail({ data, loading, error, onClose }) {
             h('span', { style: styles.badgePhase },
               transition && transition.to_phase != null ? String(transition.to_phase) : 'No transition recorded'),
             transition && transition.to_segment_id != null
-              ? h('span', { style: styles.badge }, 'SEG ' + transition.to_segment_id)
+              ? h('span', { style: styles.badgePhase }, 'SEG ' + transition.to_segment_id)
               : null)),
         h('div', { style: styles.detailSection },
           h('h3', { style: styles.detailSectionTitle }, 'Transition history (' + history.length + ')'),
