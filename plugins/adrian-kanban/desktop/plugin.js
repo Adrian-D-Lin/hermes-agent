@@ -28,7 +28,7 @@ const styles = {
   columnTitle: { margin: 0, fontSize: 14 },
   count: { fontSize: 12, color: 'var(--color-muted-foreground, #616e7c)' },
   empty: { fontSize: 12, color: 'var(--color-muted-foreground, #616e7c)', padding: 8 },
-  card: { border: '1px solid #d9e2ec', borderRadius: 6, padding: 8, marginBottom: 6, background: 'var(--color-card, #fbfcfe)', color: 'var(--color-foreground, #1f2933)' },
+  card: { border: '1px solid #d9e2ec', borderRadius: 6, padding: 8, marginBottom: 6, background: '#0b2545', color: 'var(--color-foreground, #f8fafc)' },
   cardClickable: { cursor: 'pointer' },
   cardInvalid: { border: '1px solid #9b1c1c', background: '#fdecec', color: 'var(--color-foreground, #1f2933)' },
   cardTitle: { fontWeight: 600, fontSize: 13, marginBottom: 6 },
@@ -148,19 +148,19 @@ function Card({ record, kind, onOpenDetail }) {
     cardProps.role = 'button'
     cardProps.tabIndex = 0
     cardProps['aria-label'] = 'Open initiative ' + (id != null ? id : title)
-    cardProps.onClick = () => onOpenDetail(id)
+    cardProps.onClick = () => onOpenDetail(id, record.board)
     cardProps.onKeyDown = (event) => {
       if (!event || !event.key) return
       if (event.key === 'Enter' || event.key === ' ') {
         if (typeof event.preventDefault === 'function') event.preventDefault()
-        onOpenDetail(id)
+        onOpenDetail(id, record.board)
       }
     }
   }
   return h('div', cardProps,
     h('div', { style: styles.cardTitle },
       title,
-      id != null ? h('span', { style: { fontSize: 11, color: 'var(--color-muted-foreground, #616e7c)' } }, ' #' + id) : null),
+      id != null ? h('span', { style: { fontSize: 11, color: 'inherit' } }, ' #' + id) : null),
     h('div', { style: styles.cardMeta },
       h('span', { style: styles.badgePhase }, phase ? phase : 'INVALID PHASE'),
       segment ? h('span', { style: styles.badge }, 'SEG ' + segment) : null,
@@ -387,8 +387,8 @@ function AdrianKanbanPage({ ctx }) {
     load(value)
   }
 
-  function openInitiativeDetail(id) {
-    if (id == null) return
+  function openInitiativeDetail(id, board) {
+    if (id == null || board == null || String(board).trim() === '') return
     if (typeof detailAbortRef.current !== 'undefined' && detailAbortRef.current &&
         typeof detailAbortRef.current.abort === 'function') {
       detailAbortRef.current.abort()
@@ -400,7 +400,7 @@ function AdrianKanbanPage({ ctx }) {
     }
     setOpenInitiative(id)
     setState((prev) => ({ ...prev, detailLoading: true, detailError: null, detailData: null }))
-    ctx.rest('/initiatives/' + encodeURIComponent(id), controller ? { signal: controller.signal } : undefined)
+    ctx.rest('/initiatives/' + encodeURIComponent(id) + '?board=' + encodeURIComponent(board), controller ? { signal: controller.signal } : undefined)
       .then((envelope) => {
         if (envelope && typeof envelope === 'object' && envelope.result === 'ACCEPTED' &&
             envelope.value != null && typeof envelope.value === 'object') {

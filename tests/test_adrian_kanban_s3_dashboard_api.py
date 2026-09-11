@@ -204,11 +204,15 @@ def test_projects_lists_live_project_board_bindings(
 @pytest.mark.parametrize(
     ("path", "operation", "payload"),
     [
-        ("/tasks/task-4", "kanban_show", {"task_id": "task-4"}),
         (
-            "/initiatives/INIT-4",
+            "/tasks/task-4?board=orchestrator",
             "kanban_show",
-            {"initiative_id": "INIT-4"},
+            {"task_id": "task-4", "board": "orchestrator"},
+        ),
+        (
+            "/initiatives/INIT-4?board=orchestrator",
+            "kanban_show",
+            {"initiative_id": "INIT-4", "board": "orchestrator"},
         ),
         (
             "/tasks/task-4/attachments",

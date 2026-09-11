@@ -257,6 +257,7 @@ def test_dashboard_treats_board_as_current_work_and_detail_as_history():
     assert "if (parentPhase !== p) return" in javascript
     assert "ctx.rest" not in javascript
     assert "api('/initiatives/'" in javascript
+    assert "'?board=' + encodeURIComponent(board)" in javascript
     assert "envelope.result === 'ACCEPTED'" in javascript
     assert "envelope.value" in javascript
     assert "Transition history (" in javascript
@@ -284,8 +285,8 @@ def test_dashboard_styles_give_cards_and_details_explicit_contrast():
         ".adrian-kanban-attachment",
     ):
         assert selector in css
-    assert "var(--color-card, #" in css
-    assert "var(--color-foreground, #" in css
+    assert "background: #0b2545" in css
+    assert "color: var(--color-foreground, #" in css
 
 
 def test_dashboard_refresh_preserves_open_detail_and_project_change_closes_it():
@@ -362,6 +363,7 @@ def test_desktop_extension_matches_current_work_and_history_detail_contract():
     assert "if (!isTaskOpen(record)) return" in javascript
     assert "if (parentPhase !== p) return" in javascript
     assert "ctx.rest('/initiatives/'" in javascript
+    assert "'?board=' + encodeURIComponent(board)" in javascript
     assert "envelope.result === 'ACCEPTED'" in javascript
     assert "detailData: envelope.value" in javascript
     assert "phaseOf(t) || legacyPhaseOf(t) || 'Legacy/Unclassified'" in javascript
@@ -369,8 +371,8 @@ def test_desktop_extension_matches_current_work_and_history_detail_contract():
     assert "Array.isArray(d.attachments)" in javascript
     assert "Transition history (" in javascript
     assert "h('details'" in javascript
-    assert "var(--color-card, #" in javascript
-    assert "var(--color-foreground, #" in javascript
+    assert "background: '#0b2545'" in javascript
+    assert "color: 'var(--color-foreground, #" in javascript
 
 
 def test_desktop_refresh_preserves_open_detail_and_project_change_closes_it():
