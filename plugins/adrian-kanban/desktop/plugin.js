@@ -23,7 +23,7 @@ const styles = {
   error: { border: '1px solid #b91c1c', background: '#fdecec', color: '#9b1c1c', padding: 8, borderRadius: 4 },
   info: { border: '1px solid #2563eb', background: '#e7f1ff', color: '#1a4f8b', padding: 8, borderRadius: 4 },
   columns: { display: 'flex', gap: 12, overflowX: 'auto', alignItems: 'flex-start', width: '100%', maxWidth: '100%', minWidth: 0, paddingBottom: 8 },
-  column: { width: 240, maxWidth: 240, minWidth: 240, flex: '0 0 240px', border: '1px solid #d9e2ec', borderRadius: 8, padding: 8, boxSizing: 'border-box', background: 'var(--color-card, #ffffff)', color: 'var(--color-foreground, #1f2933)' },
+  column: { width: 240, maxWidth: 240, minWidth: 240, flex: '0 0 240px', border: '1px solid #d9e2ec', borderRadius: 8, padding: 8, boxSizing: 'border-box', background: 'var(--color-background, #0f172a)', color: 'var(--color-foreground, #f8fafc)' },
   columnHeader: { display: 'flex', justifyContent: 'space-between', padding: '8px 0', marginBottom: 8, borderBottom: '1px solid #d9e2ec' },
   columnTitle: { margin: 0, fontSize: 14 },
   count: { fontSize: 12, color: 'var(--color-muted-foreground, #616e7c)' },
@@ -42,16 +42,18 @@ const styles = {
   diagnosticError: { fontSize: 12, padding: 8, borderRadius: 4, background: '#fdecec', color: '#9b1c1c' },
   unpositioned: { fontSize: 12, color: '#9b1c1c' },
   detailOverlay: { position: 'fixed', inset: 0, background: 'rgba(15, 23, 32, 0.45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: 24, overflow: 'auto', zIndex: 100 },
-  detailPanel: { width: '100%', maxWidth: 640, background: 'var(--color-popover, var(--color-card, #ffffff))', color: 'var(--color-popover-foreground, var(--color-foreground, #1f2933))', border: '1px solid #d9e2ec', borderRadius: 8, display: 'flex', flexDirection: 'column', maxHeight: 'calc(100vh - 48px)' },
+  detailPanel: { width: '100%', maxWidth: 640, background: '#0b2545', color: 'var(--color-foreground, #f8fafc)', border: '1px solid #d9e2ec', borderRadius: 8, display: 'flex', flexDirection: 'column', maxHeight: 'calc(100vh - 48px)', userSelect: 'text' },
   detailHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '12px 16px', borderBottom: '1px solid #d9e2ec' },
   detailTitle: { margin: 0, fontSize: 17 },
   detailClose: { cursor: 'pointer', padding: '4px 10px', border: '1px solid #cbd2d9', borderRadius: 6, background: 'var(--color-card, #ffffff)', color: 'var(--color-foreground, #1f2933)' },
-  detailBody: { padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, overflow: 'auto' },
+  detailBody: { padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12, overflow: 'auto', userSelect: 'text' },
   detailSection: { display: 'flex', flexDirection: 'column', gap: 6 },
-  detailSectionTitle: { margin: 0, fontSize: 14, color: 'var(--color-heading-foreground, var(--color-muted-foreground, #616e7c))' },
+  detailSectionTitle: { margin: 0, fontSize: 14, color: 'var(--color-foreground, #f8fafc)' },
   cardBody: { fontSize: 14, lineHeight: 1.45, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
-  detailGroup: { border: '1px solid #d9e2ec', borderRadius: 6, padding: '6px 10px', background: 'var(--color-card, #fbfcfe)' },
-  detailGroupSummary: { cursor: 'pointer', fontSize: 13, fontWeight: 600, color: 'var(--color-foreground, #1f2933)' },
+  detailGroup: { border: '1px solid #d9e2ec', borderRadius: 6, padding: '6px 10px', background: '#0b2545', color: 'var(--color-foreground, #f8fafc)', userSelect: 'text' },
+  detailGroupSummary: { cursor: 'pointer', fontSize: 13, fontWeight: 600, color: 'inherit' },
+  structuredValue: { margin: '6px 0 0', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', font: 'inherit', fontSize: 12, color: 'inherit', userSelect: 'text' },
+  detailRecord: { marginTop: 6, padding: 6, borderRadius: 4, background: '#102f57', color: 'var(--color-foreground, #f8fafc)', fontSize: 12, overflowWrap: 'anywhere', userSelect: 'text' },
   taskEntry: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 6 },
   attachments: { display: 'flex', flexDirection: 'column', gap: 2, paddingLeft: 12, marginTop: 2 },
   attachment: { fontSize: 12, color: 'var(--color-muted-foreground, #616e7c)' },
@@ -132,6 +134,13 @@ function textOf(value) {
       .join('; ')
   }
   return String(value)
+}
+
+function StructuredSection({ label, value }) {
+  const rendered = textOf(value)
+  return h('details', { style: styles.detailGroup },
+    h('summary', { style: styles.detailGroupSummary }, label),
+    h('pre', { style: styles.structuredValue }, rendered || 'None recorded'))
 }
 
 function Card({ record, kind, onOpenDetail }) {
@@ -236,6 +245,12 @@ function InitiativeDetail({ data, loading, error, onClose }) {
     const history = Array.isArray(data.transition_history) ? data.transition_history
       : (Array.isArray(data.transitions) ? data.transitions : [])
     const phaseTasks = Array.isArray(data.tasks) ? data.tasks : []
+    const phaseResults = Array.isArray(data.phase_results) ? data.phase_results : []
+    const segmentProjection = data.segment_projection && typeof data.segment_projection === 'object'
+      ? data.segment_projection : null
+    const workspaces = Array.isArray(data.workspaces) ? data.workspaces : []
+    const openFindings = Array.isArray(data.open_findings) ? data.open_findings : []
+    const nextPermittedRoutes = Array.isArray(data.next_permitted_routes) ? data.next_permitted_routes : []
 
     // Group associated historical/evidence tasks by display phase.
     const groups = {}
@@ -274,6 +289,11 @@ function InitiativeDetail({ data, loading, error, onClose }) {
                   'transition: ' + (d.from_phase != null ? d.from_phase : '?') + ' → ' + (d.to_phase != null ? d.to_phase : '?') +
                   (d.created_at != null ? ' @ ' + d.created_at : ''))
               })),
+        h(StructuredSection, { label: 'Phase results (' + phaseResults.length + ')', value: phaseResults }),
+        h(StructuredSection, { label: 'Segment manifest and readiness', value: segmentProjection }),
+        h(StructuredSection, { label: 'Workspace assignments (' + workspaces.length + ')', value: workspaces }),
+        h(StructuredSection, { label: 'Open findings (' + openFindings.length + ')', value: openFindings }),
+        h(StructuredSection, { label: 'Next permitted routes (' + nextPermittedRoutes.length + ')', value: nextPermittedRoutes }),
         phaseTasks.length === 0
           ? h('div', { style: styles.info }, 'No associated tasks recorded')
           : groupNames.map((gp) => {
@@ -285,9 +305,15 @@ function InitiativeDetail({ data, loading, error, onClose }) {
                   const tid = d.task_id != null ? d.task_id : (d.id != null ? d.id : '(unknown)')
                   const attachments = Array.isArray(d.attachments) ? d.attachments : []
                   return h('div', { key: 't-' + i, style: styles.taskEntry },
-                    h('div', { style: styles.diagnostic },
+                    h('div', { style: styles.detailRecord },
                       String(tid) + ' — ' + (d.title != null ? d.title : '(untitled)') +
                       (d.status != null ? ' [' + d.status + ']' : '')),
+                    d.lifecycle_contract != null
+                      ? h('div', { style: styles.detailRecord }, 'Lifecycle contract: ' + textOf(d.lifecycle_contract)) : null,
+                    d.accepted_handoff != null
+                      ? h('div', { style: styles.detailRecord }, 'Accepted handoff: ' + textOf(d.accepted_handoff)) : null,
+                    d.latest_candidate != null
+                      ? h('div', { style: styles.detailRecord }, 'Latest candidate: ' + textOf(d.latest_candidate)) : null,
                     attachments.length > 0 ? h('div', { style: styles.attachments },
                       attachments.map((att, ai) => {
                         const ad = att && typeof att === 'object' ? att : {}
@@ -332,7 +358,7 @@ function AdrianKanbanPage({ ctx }) {
   function load(boardOverride) {
     const board = typeof boardOverride === 'string' ? boardOverride : selectedBoardRef.current
     const boardParam = board ? `?board=${encodeURIComponent(board)}` : ''
-    setState((prev) => ({ ...prev, loading: true, error: null, mismatch: false }))
+    setState((prev) => ({ ...prev, loading: prev.boardEnvelope == null, error: null, mismatch: false }))
     Promise.all([
       ctx.rest('/handshake'),
       ctx.rest('/projects'),

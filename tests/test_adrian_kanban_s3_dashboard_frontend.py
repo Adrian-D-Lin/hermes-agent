@@ -288,6 +288,15 @@ def test_dashboard_styles_give_cards_and_details_explicit_contrast():
     assert "background: #0b2545" in css
     assert "color: var(--color-foreground, #" in css
 
+    column_rule = re.search(r"\.adrian-kanban-column\s*\{([^}]+)\}", css, re.DOTALL)
+    assert column_rule is not None
+    assert "background: var(--color-background," in column_rule.group(1)
+
+    detail_rule = re.search(r"\.adrian-kanban-detail-panel\s*\{([^}]+)\}", css, re.DOTALL)
+    assert detail_rule is not None
+    assert "background: #0b2545" in detail_rule.group(1)
+    assert "user-select: text" in detail_rule.group(1)
+
 
 def test_dashboard_refresh_preserves_open_detail_and_project_change_closes_it():
     javascript = _asset("src/index.js")
@@ -298,6 +307,23 @@ def test_dashboard_refresh_preserves_open_detail_and_project_change_closes_it():
     assert javascript.count("detailData: prev.detailData") >= 2
     assert "Initiative detail is unavailable; close and reopen the initiative." in javascript
     assert "closeInitiativeDetail();" in javascript
+    assert "loading: prev.boardEnvelope == null" in javascript
+
+
+def test_dashboard_detail_exposes_the_structured_cold_session_contract():
+    javascript = _asset("src/index.js")
+
+    for field in (
+        "Phase results (",
+        "Segment manifest and readiness",
+        "Workspace assignments (",
+        "Open findings (",
+        "Next permitted routes (",
+        "lifecycle_contract",
+        "accepted_handoff",
+        "latest_candidate",
+    ):
+        assert field in javascript
 
 
 def test_unified_package_supplies_the_matching_desktop_extension():
@@ -373,6 +399,20 @@ def test_desktop_extension_matches_current_work_and_history_detail_contract():
     assert "h('details'" in javascript
     assert "background: '#0b2545'" in javascript
     assert "color: 'var(--color-foreground, #" in javascript
+    assert "background: 'var(--color-background," in javascript
+    assert "userSelect: 'text'" in javascript
+
+    for field in (
+        "Phase results (",
+        "Segment manifest and readiness",
+        "Workspace assignments (",
+        "Open findings (",
+        "Next permitted routes (",
+        "lifecycle_contract",
+        "accepted_handoff",
+        "latest_candidate",
+    ):
+        assert field in javascript
 
 
 def test_desktop_refresh_preserves_open_detail_and_project_change_closes_it():
@@ -382,6 +422,7 @@ def test_desktop_refresh_preserves_open_detail_and_project_change_closes_it():
     assert javascript.count("detailData: prev.detailData") >= 2
     assert "Initiative detail is unavailable; close and reopen the initiative." in javascript
     assert "closeInitiativeDetail()" in javascript
+    assert "loading: prev.boardEnvelope == null" in javascript
 
 
 def test_desktop_extension_is_one_self_contained_runtime_module():
