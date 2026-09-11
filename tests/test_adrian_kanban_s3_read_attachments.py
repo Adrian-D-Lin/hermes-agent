@@ -191,10 +191,11 @@ def test_task_read_is_plugin_rooted_and_redacts_attachment_path(
         "card_type": "task",
         "initiative_id": "initiative-read",
         "task_id": "task-read",
-        "title": "Read task",
-        "board": "orchestrator",
-        "record_version": 0,
-    }
+            "title": "Read task",
+            "board": "orchestrator",
+            "record_version": 0,
+            "closed_at": None,
+        }
     assert value["task"]["status"] == "ready"
     assert value["task"]["assignee"] == "builder-tester"
     assert value["legacy"] is True
