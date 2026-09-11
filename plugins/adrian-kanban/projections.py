@@ -315,6 +315,14 @@ def show_projection(
         latest_candidate = _get_latest_candidate(conn, card_row["id"])
         accepted_handoff = _get_accepted_handoff(conn, card_row["id"])
         attachments = _get_task_attachments(conn, task_id)
+        comments = [
+            _row_to_dict(row)
+            for row in conn.execute(
+                "SELECT id, author, body, created_at FROM task_comments "
+                "WHERE task_id = ? ORDER BY created_at, id",
+                (task_id,),
+            ).fetchall()
+        ]
 
         purge_replacement = None
         replacements = _get_purge_replacements(conn, board, card_row["initiative_id"], task_id)
@@ -331,6 +339,7 @@ def show_projection(
             "latest_candidate": latest_candidate,
             "accepted_handoff": accepted_handoff,
             "attachments": attachments,
+            "comments": comments,
             "purge_replacement": purge_replacement,
         }
 
