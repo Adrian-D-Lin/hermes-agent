@@ -102,8 +102,8 @@
   flex: 0 0 240px;
   display: flex;
   flex-direction: column;
-  background: var(--color-card, #ffffff);
-  color: var(--color-foreground, #1f2933);
+  background: var(--color-background, #0f172a);
+  color: var(--color-foreground, #f8fafc);
   border: 1px solid var(--color-border, #d9e2ec);
   border-radius: 8px;
   min-height: 120px;
@@ -221,13 +221,15 @@
 .adrian-kanban-detail-panel {
   width: 100%;
   max-width: 640px;
-  background: var(--color-popover, var(--color-card, #ffffff));
-  color: var(--color-popover-foreground, var(--color-foreground, #1f2933));
+  background: #0b2545;
+  color: var(--color-foreground, #f8fafc);
   border: 1px solid var(--color-border, #d9e2ec);
   border-radius: 8px;
   display: flex;
   flex-direction: column;
   max-height: calc(100vh - 48px);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .adrian-kanban-detail-header {
@@ -259,6 +261,8 @@
   flex-direction: column;
   gap: 12px;
   overflow: auto;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .adrian-kanban-detail-section {
@@ -270,7 +274,7 @@
 .adrian-kanban-detail-section h3 {
   margin: 0;
   font-size: 0.85rem;
-  color: var(--color-muted-foreground, #616e7c);
+  color: var(--color-foreground, #f8fafc);
 }
 
 .adrian-kanban-card-body {
@@ -283,14 +287,40 @@
   border: 1px solid var(--color-border, #d9e2ec);
   border-radius: 6px;
   padding: 6px 10px;
-  background: var(--color-card, #fbfcfe);
+  background: #0b2545;
+  color: var(--color-foreground, #f8fafc);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .adrian-kanban-detail-group summary {
   cursor: pointer;
   font-size: 0.85rem;
   font-weight: 600;
-  color: var(--color-foreground, #1f2933);
+  color: inherit;
+}
+
+.adrian-kanban-structured-value {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  font-size: 0.8rem;
+  color: inherit;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.adrian-kanban-detail-record {
+  margin-top: 6px;
+  padding: 6px;
+  border-radius: 4px;
+  background: #102f57;
+  color: var(--color-foreground, #f8fafc);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .adrian-kanban-detail-group .adrian-kanban-diagnostic {

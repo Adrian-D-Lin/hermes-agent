@@ -139,6 +139,14 @@
     return String(value);
   }
 
+  function StructuredSection(props) {
+    var rendered = textOf(props.value);
+    return h('details', { className: 'adrian-kanban-detail-group' },
+      h('summary', null, props.label),
+      h('pre', { className: 'adrian-kanban-structured-value' }, rendered || 'None recorded')
+    );
+  }
+
   function Column(props) {
     var phase = props.phase;
     var initiatives = props.initiatives;
@@ -228,11 +236,18 @@
           h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-error' },
             'Initiative detail is unavailable; close and reopen the initiative.')));
     } else {
+      var card = data.card && typeof data.card === 'object' ? data.card : {};
       var bodyText = data.card_body != null ? data.card_body : (data.body != null ? data.body : '');
       var transition = data.current_transition && typeof data.current_transition === 'object' ? data.current_transition : null;
       var history = Array.isArray(data.transition_history) ? data.transition_history
         : (Array.isArray(data.transitions) ? data.transitions : []);
       var phaseTasks = Array.isArray(data.tasks) ? data.tasks : [];
+      var phaseResults = Array.isArray(data.phase_results) ? data.phase_results : [];
+      var segmentProjection = data.segment_projection && typeof data.segment_projection === 'object'
+        ? data.segment_projection : null;
+      var workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
+      var openFindings = Array.isArray(data.open_findings) ? data.open_findings : [];
+      var nextPermittedRoutes = Array.isArray(data.next_permitted_routes) ? data.next_permitted_routes : [];
 
       // Group associated historical/evidence tasks by display phase.
       var groups = {};
@@ -270,6 +285,11 @@
                     'transition: ' + (d.from_phase != null ? d.from_phase : '?') + ' → ' + (d.to_phase != null ? d.to_phase : '?') +
                     (d.created_at != null ? ' @ ' + d.created_at : ''));
                 })),
+          h(StructuredSection, { label: 'Phase results (' + phaseResults.length + ')', value: phaseResults }),
+          h(StructuredSection, { label: 'Segment manifest and readiness', value: segmentProjection }),
+          h(StructuredSection, { label: 'Workspace assignments (' + workspaces.length + ')', value: workspaces }),
+          h(StructuredSection, { label: 'Open findings (' + openFindings.length + ')', value: openFindings }),
+          h(StructuredSection, { label: 'Next permitted routes (' + nextPermittedRoutes.length + ')', value: nextPermittedRoutes }),
           phaseTasks.length === 0
             ? h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-info' }, 'No associated tasks recorded')
             : groupNames.map(function (gp) {
@@ -281,9 +301,15 @@
                     var tid = d.task_id != null ? d.task_id : (d.id != null ? d.id : '(unknown)');
                     var attachments = Array.isArray(d.attachments) ? d.attachments : [];
                     return h('div', { key: 't-' + i, className: 'adrian-kanban-task-entry' },
-                      h('div', { className: 'adrian-kanban-diagnostic adrian-kanban-diagnostic-info' },
+                      h('div', { className: 'adrian-kanban-detail-record' },
                         String(tid) + ' — ' + (d.title != null ? d.title : '(untitled)') +
                         (d.status != null ? ' [' + d.status + ']' : '')),
+                      d.lifecycle_contract != null
+                        ? h('div', { className: 'adrian-kanban-detail-record' }, 'Lifecycle contract: ' + textOf(d.lifecycle_contract)) : null,
+                      d.accepted_handoff != null
+                        ? h('div', { className: 'adrian-kanban-detail-record' }, 'Accepted handoff: ' + textOf(d.accepted_handoff)) : null,
+                      d.latest_candidate != null
+                        ? h('div', { className: 'adrian-kanban-detail-record' }, 'Latest candidate: ' + textOf(d.latest_candidate)) : null,
                       attachments.length > 0 ? h('div', { className: 'adrian-kanban-attachments' },
                         attachments.map(function (att, ai) {
                           var ad = att && typeof att === 'object' ? att : {};
@@ -337,7 +363,7 @@
     function load(boardOverride) {
       set(function (prev) {
         return {
-          loading: true,
+          loading: prev.boardEnvelope == null,
           error: null,
           handshake: prev.handshake,
           board: prev.board,
