@@ -91,6 +91,82 @@ def test_create_binding_is_active(reg):
     active = reg.get_active_binding("sess-A")
     assert active is not None
     assert active.session_id == "sess-A"
+    assert active.member_roots == ("/wt/a",)
+    assert active.logical_workspace_id is None
+    assert active.binding_version is None
+
+
+def test_create_logical_binding_round_trips_ordered_roots(reg):
+    binding = reg.create_binding(
+        session_id="sess-logical",
+        worktree_path="/wt/a",
+        logical_workspace_id="coord-init-1",
+        member_roots=("/wt/a", "/wt/b"),
+        binding_version=3,
+    )
+    assert binding.logical_workspace_id == "coord-init-1"
+    assert binding.member_roots == ("/wt/a", "/wt/b")
+    assert binding.binding_version == 3
+    assert binding.to_dict()["member_roots"] == ["/wt/a", "/wt/b"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"logical_workspace_id": "coord", "member_roots": ("/wt/a",)},
+        {"logical_workspace_id": "coord", "binding_version": 1},
+        {"member_roots": ("/wt/a",), "binding_version": 1},
+        {
+            "logical_workspace_id": "coord",
+            "member_roots": "/wt/a",
+            "binding_version": 1,
+        },
+        {
+            "logical_workspace_id": "coord",
+            "member_roots": ("/wt/a", "/wt/a"),
+            "binding_version": 1,
+        },
+        {
+            "logical_workspace_id": "coord",
+            "member_roots": ("/wt/b", "/wt/a"),
+            "binding_version": 1,
+        },
+    ],
+)
+def test_logical_binding_rejects_partial_or_invalid_payload_without_mutation(
+    reg, wgr, overrides
+):
+    with pytest.raises(wgr.RegistryError):
+        reg.create_binding(
+            session_id="sess-invalid", worktree_path="/wt/a", **overrides
+        )
+    assert reg.get_active_binding("sess-invalid") is None
+
+
+@pytest.mark.parametrize(
+    ("workspace", "roots", "version"),
+    [
+        ("coord", None, 1),
+        (None, '["/wt/a"]', 1),
+        ("coord", '["/wt/a"]', None),
+        ("coord", "not-json", 1),
+        ("coord", '[["/wt/a"]]', 1),
+        ("coord", '["/wt/b"]', 1),
+    ],
+)
+def test_binding_record_rejects_partial_or_malformed_persisted_logical_state(
+    reg, wgr, workspace, roots, version
+):
+    reg._conn.execute(
+        "INSERT INTO write_gate_bindings "
+        "(session_id, worktree_path, status, created_at, "
+        "logical_workspace_id, member_roots_json, binding_version) "
+        "VALUES (?, ?, 'active', 'now', ?, ?, ?)",
+        ("sess-corrupt", "/wt/a", workspace, roots, version),
+    )
+    reg._conn.commit()
+    with pytest.raises(wgr.RegistryError):
+        reg.get_active_binding("sess-corrupt")
 
 
 def test_second_binding_supersedes_first(reg):

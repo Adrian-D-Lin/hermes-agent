@@ -236,6 +236,86 @@ def _make_session_db(tmp_path, rows):
 
 # ── §1: top-level confirm binding --------------------------------------------
 
+def test_trusted_logical_confirmation_presents_all_roots_once(
+    reg, mods, tmp_path, monkeypatch
+):
+    member_a = tmp_path / "coord" / "repo-a"
+    member_b = tmp_path / "coord" / "repo-b"
+    member_a.mkdir(parents=True)
+    member_b.mkdir(parents=True)
+    presentations = []
+
+    def approve_once(presentation, kind):
+        presentations.append((presentation, kind))
+        return {
+            "approved": True,
+            "decision": "once",
+            "approval_reference": "host-ref",
+            "decision_at": "2026-09-01T10:00:00+00:00",
+        }
+
+    monkeypatch.setattr(mods.tool, "_present_and_get_decision", approve_once)
+    first = mods.tool.confirm_trusted_logical_binding(
+        session_id="sess-logical",
+        project="project-1",
+        initiative="init-1",
+        board="board-1",
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(member_a), str(member_b)),
+        binding_version=1,
+    )
+    assert first is not None
+    assert len(presentations) == 1
+    assert presentations[0][0]["member_roots"] == [
+        str(member_a.resolve()),
+        str(member_b.resolve()),
+    ]
+    assert presentations[0][1] == "CONFIRMED_WORKTREE_BINDING"
+
+    replay = mods.tool.confirm_trusted_logical_binding(
+        session_id="sess-logical",
+        project="project-1",
+        initiative="init-1",
+        board="board-1",
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(member_a), str(member_b)),
+        binding_version=1,
+    )
+    assert replay.id == first.id
+    assert len(presentations) == 1
+
+
+def test_declined_logical_replacement_preserves_existing_binding(
+    reg, mods, tmp_path, monkeypatch
+):
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    old = reg.create_binding(session_id="sess-logical", worktree_path=str(old_root))
+    monkeypatch.setattr(
+        mods.tool,
+        "_present_and_get_decision",
+        lambda _presentation, kind: {
+            "approved": False,
+            "decision": "deny",
+            "approval_reference": "host-ref",
+            "decision_at": "2026-09-01T10:00:00+00:00",
+        },
+    )
+    result = mods.tool.confirm_trusted_logical_binding(
+        session_id="sess-logical",
+        project="project-1",
+        initiative="init-1",
+        board="board-1",
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(new_root),),
+        binding_version=1,
+    )
+    assert result is None
+    assert reg.get_active_binding("sess-logical").id == old.id
+
+
 def test_confirm_binding_binds_real_git_root(cwd_recorder, approve, reg, mods, git_repo):
     """A fresh top-level session binds to the real Git worktree root derived
     from the host-owned session cwd record, not a model path."""

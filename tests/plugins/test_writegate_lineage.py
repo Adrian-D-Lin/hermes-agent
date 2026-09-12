@@ -140,6 +140,86 @@ def test_delegate_isolated_workspace_bound_exact(reg, mods, tmp_path):
     assert derived.parent_session_id == "sess-parent"
 
 
+def test_logical_candidate_presents_and_persists_all_canonical_roots(
+    reg, mods, tmp_path
+):
+    member_a = tmp_path / "coord" / "repo-a"
+    member_b = tmp_path / "coord" / "repo-b"
+    member_a.mkdir(parents=True)
+    member_b.mkdir(parents=True)
+    producer = mods.binding.TrustedBindingProducer(reg)
+    candidate = producer.derive_candidate(
+        session_id="sess-logical",
+        worktree_path=str(member_a),
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(member_a), str(member_b)),
+        binding_version=2,
+    )
+    presentation = candidate.to_presentation()
+    assert presentation["member_roots"] == [
+        str(member_a.resolve()),
+        str(member_b.resolve()),
+    ]
+    record = producer.confirm(candidate, confirmed=True)
+    assert record.logical_workspace_id == "coord-init-1"
+    assert record.member_roots == (
+        str(member_a.resolve()),
+        str(member_b.resolve()),
+    )
+    assert record.binding_version == 2
+
+
+def test_branch_child_inherits_complete_logical_binding(reg, mods, tmp_path):
+    member_a = tmp_path / "coord" / "repo-a"
+    member_b = tmp_path / "coord" / "repo-b"
+    member_a.mkdir(parents=True)
+    member_b.mkdir(parents=True)
+    parent = reg.create_binding(
+        session_id="sess-logical-parent",
+        worktree_path=str(member_a.resolve()),
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(member_a.resolve()), str(member_b.resolve())),
+        binding_version=4,
+    )
+    child = mods.binding.derive_binding(
+        reg,
+        session_id="sess-logical-child",
+        parent_session_id=parent.session_id,
+        parent_is_bound=True,
+    )
+    assert child.logical_workspace_id == parent.logical_workspace_id
+    assert child.member_roots == parent.member_roots
+    assert child.binding_version == parent.binding_version
+
+
+def test_distinct_delegate_from_logical_parent_is_narrow_single_root(
+    reg, mods, tmp_path
+):
+    member_a = tmp_path / "coord" / "repo-a"
+    member_b = tmp_path / "coord" / "repo-b"
+    isolated = tmp_path / "segment" / "repo-a"
+    member_a.mkdir(parents=True)
+    member_b.mkdir(parents=True)
+    isolated.mkdir(parents=True)
+    parent = reg.create_binding(
+        session_id="sess-logical-parent",
+        worktree_path=str(member_a.resolve()),
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(member_a.resolve()), str(member_b.resolve())),
+        binding_version=4,
+    )
+    child = mods.binding.derive_binding(
+        reg,
+        session_id="sess-isolated-child",
+        parent_session_id=parent.session_id,
+        parent_is_bound=True,
+        assigned_workspace=str(isolated),
+    )
+    assert child.logical_workspace_id is None
+    assert child.member_roots == (str(isolated.resolve()),)
+    assert child.binding_version is None
+
+
 def test_parent_not_bound_yields_no_binding(reg, mods, tmp_path):
     """A parent that is not actively bound must not authorize a child binding."""
     _bind(mods, reg, tmp_path, "sess-parent", "wt-parent")

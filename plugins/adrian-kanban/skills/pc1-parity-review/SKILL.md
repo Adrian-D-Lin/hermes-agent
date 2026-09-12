@@ -1,7 +1,7 @@
 ---
 name: pc1-parity-review
 description: Operational guidance for PC1 milestone parity review.
-version: 0.1.0
+version: 0.2.0
 author: Adrian Lin, Hermes Agent
 license: MIT
 platforms: [linux]
@@ -23,6 +23,18 @@ to surface. It is not a second DEV3 code or test pass and must not
 reopen a DEV4.2 outcome already ratified through D1-D4 unless it
 identifies a genuinely new, materially different cross-segment
 consequence.
+
+## Trusted initiative anchor
+
+Before phase work, use the server-issued Session Startup anchor for a top-level
+`default` session, or the trusted dispatch binding for a worker. Verify the
+selected project, `initiative_id`, current phase, coordination workspace ID,
+member repositories, exact derived roots, and binding version against the
+Initiative Tracker. Do not infer them from the session CWD, chat text, display
+title, or filesystem discovery. The controller creates and repairs coordination
+worktrees; work only in the roots in the binding. Concurrent bindings are
+permitted, so refresh repository state before edits and recheck the complete
+diff and HEAD before committing.
 
 ## Your role
 

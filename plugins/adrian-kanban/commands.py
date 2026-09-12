@@ -17,6 +17,8 @@ from .purge_cleanup import execute_cleanup
 from .rejection_audit import record_rejection
 from .capability import CapabilityBinding
 from .contracts import ContractSnapshot, expand_contract, template_for
+from .coordination_closure import prepare_coordination_closure
+from .closure_archive import finalize_initiative_archive
 from .diagnostics import (
     Boundary,
     CommandRejected,
@@ -756,11 +758,13 @@ TOOL_SCHEMAS: dict[str, Any] = {
                     "type": "string",
                     "description": (
                         "Kind of update to apply to the initiative. One of "
-                        "body_update, phase_result, segment_manifest_projection, "
+                        "body_update, coordination_membership_expansion, "
+                        "phase_result, segment_manifest_projection, "
                         "orchestration_checkpoint, or purge_replace_task."
                     ),
                     "enum": [
                         "body_update",
+                        "coordination_membership_expansion",
                         "phase_result",
                         "segment_manifest_projection",
                         "orchestration_checkpoint",
@@ -3674,6 +3678,40 @@ class _CommandBoundary:
                 err_msg = str(e)[:1024]
                 result['post_commit'] = {'state': 'failed', 'items': [], 'error': str(e)[:1024], 'remediation': 'Replay the original approved request.'}
 
+        if (
+            result.get("result") == "ACCEPTED"
+            and action == "kanban_close_initiative"
+            and self._workspace_registry is not None
+        ):
+            try:
+                from .session_startup_runtime import load_projects
+
+                with contextlib.closing(sqlite3.connect(self._database_path)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    archive_result = finalize_initiative_archive(
+                        conn,
+                        self._workspace_registry,
+                        load_projects,
+                        initiative_id=fields["payload"]["initiative_id"],
+                        actor_evidence=json.dumps(
+                            {
+                                "actor_profile": fields.get("actor_profile"),
+                                "session_id": fields.get("session_id"),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        at=int(time.time()),
+                    )
+                    result["post_commit"] = archive_result
+            except Exception as exc:
+                result["post_commit"] = {
+                    "state": "failed",
+                    "error": str(exc)[:1024],
+                    "remediation": "Replay the original approved close request.",
+                }
+
         return result
 
     def _execute_mutation_transaction(
@@ -4047,6 +4085,80 @@ class _CommandBoundary:
                             raise ValueError("DEV4.4 retire member mismatch")
 
             capability = self._provider._mint_after_admission(binding)
+
+            if action == "kanban_close_initiative":
+                initiative_id = payload.get("initiative_id")
+                active_coordination = None
+                if isinstance(initiative_id, str) and initiative_id.strip():
+                    active_coordination = conn.execute(
+                        "SELECT workspace_id FROM initiative_coordination_workspaces "
+                        "WHERE initiative_id = ? AND active = 1",
+                        (initiative_id.strip(),),
+                    ).fetchone()
+                if active_coordination is not None:
+                    if self._workspace_registry is None:
+                        raise ValueError(
+                            "workspace_registry is required for initiative closure"
+                        )
+                    preflight_context = _CommandContext(
+                        operation=action,
+                        payload=payload,
+                        connection=conn,
+                        attempt_id=attempt_id,
+                        capability=capability,
+                        binding=binding,
+                        mutation_executor=None,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        user_task=user_task,
+                        known_profiles=self._known_profiles,
+                        prepared_attachment=prepared_attachment,
+                        idempotency_key=idempotency_key,
+                        prepared_manifest=prepared_manifest,
+                        prepared_segment_manifest=prepared_segment_manifest,
+                        prepared_successor_manifest=prepared_successor_manifest,
+                        prepared_phase_result=prepared_phase_result,
+                        initial_authorizer=fields.get("initial_authorizer"),
+                        override_now=fields.get("override_now"),
+                        workspace_registry=self._workspace_registry,
+                    )
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        handler(preflight_context)
+                    finally:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                    coordination_result = prepare_coordination_closure(
+                        conn,
+                        self._workspace_registry,
+                        initiative_id=initiative_id.strip(),
+                        actor_evidence=json.dumps(
+                            {
+                                "actor_profile": actor_profile.strip(),
+                                "session_id": session_id.strip(),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        at=int(time.time()),
+                    )
+                    if (
+                        not isinstance(coordination_result, dict)
+                        or coordination_result.get("lifecycle_state") != "merged"
+                    ):
+                        raise ValueError("coordination workspace not merged")
+                    coordination_members = coordination_result.get("members")
+                    if not isinstance(coordination_members, list) or not coordination_members:
+                        raise ValueError("coordination workspace has no members")
+                    if any(
+                        member.get("member_state") != "merged"
+                        for member in coordination_members
+                        if isinstance(member, dict)
+                    ) or any(
+                        not isinstance(member, dict) for member in coordination_members
+                    ):
+                        raise ValueError("coordination workspace member not merged")
+
             adapter = self._provider._create_mutation_executor(conn)
 
             audited_rejection: _AuditedMutationRejection | None = None

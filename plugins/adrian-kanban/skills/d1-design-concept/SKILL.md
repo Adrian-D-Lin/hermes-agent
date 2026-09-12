@@ -1,7 +1,7 @@
 ---
 name: d1-design-concept
 description: Operational guidance for D1 design concept and revision.
-version: 0.1.0
+version: 0.2.0
 author: Adrian Lin, Hermes Agent
 license: MIT
 platforms: [linux]
@@ -20,6 +20,18 @@ design interview with Adrian: you probe the concept, investigate the existing
 build and Canon, research to refine the idea, and document every decision as
 it's made. The draft is not just "here's a design" — it's "here's how this
 design integrates with, contradicts, or replaces what exists."
+
+## Trusted initiative anchor
+
+Before phase work, use the server-issued Session Startup anchor for a top-level
+`default` session, or the trusted dispatch binding for a worker. Verify the
+selected project, `initiative_id`, current phase, coordination workspace ID,
+member repositories, exact derived roots, and binding version against the
+Initiative Tracker. Do not infer them from the session CWD, chat text, display
+title, or filesystem discovery. The controller creates and repairs coordination
+worktrees; work only in the roots in the binding. Concurrent bindings are
+permitted, so refresh repository state before edits and recheck the complete
+diff and HEAD before committing.
 
 ## Your role
 

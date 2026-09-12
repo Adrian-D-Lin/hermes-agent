@@ -58,7 +58,7 @@ def test_dashboard_manifest_declares_versioned_plugin_owned_surface(
     manifest = json.loads((root / "dashboard" / "manifest.json").read_text("utf-8"))
 
     assert manifest["name"] == "adrian-kanban"
-    assert manifest["version"] == "0.2.0"
+    assert manifest["version"] == "0.4.0"
     assert manifest["api"] == "plugin_api.py"
     assert manifest["entry"] == "dist/index.js"
     assert manifest["css"] == "dist/style.css"

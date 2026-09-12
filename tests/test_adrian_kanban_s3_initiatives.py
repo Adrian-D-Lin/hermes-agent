@@ -1090,6 +1090,176 @@ def test_body_update_preserves_structural_contract_and_phase_result_is_append_on
         )
 
 
+def _seed_coordination_workspace(commands_module, database_path: Path):
+    coordination = importlib.import_module(
+        f"{commands_module.__package__}.coordination_workspace"
+    )
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        store = coordination.CoordinationWorkspaceStore(conn)
+        store.plan_or_read(
+            initiative_id="initiative-1",
+            project_id="project-1",
+            repository_identity="repo-1",
+            controller_binding_ref="tracker:orchestrator:initiative-1",
+            planned_at=10,
+        )
+
+
+def _coordination_registry(commands_module, tmp_path: Path):
+    workspace = importlib.import_module(f"{commands_module.__package__}.workspace")
+    controlled_root = tmp_path / "AI-worktrees"
+    controlled_root.mkdir()
+    registrations = []
+    for repository_id in ("repo-1", "repo-2"):
+        repository_root = tmp_path / f"source-{repository_id}"
+        repository_root.mkdir()
+        registrations.append(
+            workspace._RepositoryRegistration(
+                repository_identity=repository_id,
+                repository_root=str(repository_root.resolve()),
+                controlled_worktree_root=str(controlled_root.resolve()),
+            )
+        )
+    return workspace._TrustedRepositoryRegistry(tuple(registrations))
+
+
+def test_membership_expansion_consumes_approval_and_atomically_versions_both_records(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(database_path)
+    _seed_coordination_workspace(commands_module, database_path)
+    registry = _coordination_registry(commands_module, tmp_path)
+    payload = {
+        "initiative_id": "initiative-1",
+        "update_kind": "coordination_membership_expansion",
+        "update": {"repository_ids": ["repo-2"]},
+        "approval_id": "approval-membership",
+        "board": "orchestrator",
+    }
+    _approve(
+        database_path,
+        approval_id="approval-membership",
+        attempt_id="attempt-membership",
+        operation="kanban_update_initiative",
+        target="initiative-1",
+        expected_version=0,
+        payload=payload,
+    )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_update_initiative": commands_module._handle_update_initiative
+        },
+        workspace_registry=registry,
+    )
+
+    result = _submit(
+        boundary,
+        "kanban_update_initiative",
+        attempt_id="attempt-membership",
+        key="key-membership",
+        target="initiative-1",
+        version=0,
+        payload=payload,
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["value"] == {
+        "initiative_id": "initiative-1",
+        "update_kind": "coordination_membership_expansion",
+        "record_version": 1,
+        "logical_workspace_id": "coord-initiative-1",
+        "writegate_binding_version": 2,
+        "repository_ids": ["repo-1", "repo-2"],
+    }
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1' AND task_id IS NULL"
+        ).fetchone()[0] == 1
+        workspace_row = conn.execute(
+            "SELECT binding_version, lifecycle_state "
+            "FROM initiative_coordination_workspaces "
+            "WHERE workspace_id='coord-initiative-1'"
+        ).fetchone()
+        assert workspace_row == (2, "planned")
+        assert [
+            row[0]
+            for row in conn.execute(
+                "SELECT repository_identity "
+                "FROM initiative_coordination_workspace_members "
+                "ORDER BY repository_identity"
+            )
+        ] == ["repo-1", "repo-2"]
+        assert conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals "
+            "WHERE approval_id='approval-membership'"
+        ).fetchone()[0] == "consumed"
+
+
+def test_membership_expansion_registry_failure_rolls_back_approval_and_versions(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_initiative(database_path)
+    _seed_coordination_workspace(commands_module, database_path)
+    registry = _coordination_registry(commands_module, tmp_path)
+    payload = {
+        "initiative_id": "initiative-1",
+        "update_kind": "coordination_membership_expansion",
+        "update": {"repository_ids": ["repo-unknown"]},
+        "approval_id": "approval-membership",
+        "board": "orchestrator",
+    }
+    _approve(
+        database_path,
+        approval_id="approval-membership",
+        attempt_id="attempt-membership",
+        operation="kanban_update_initiative",
+        target="initiative-1",
+        expected_version=0,
+        payload=payload,
+    )
+    boundary = commands_module._CommandBoundary(
+        database_path=str(database_path),
+        provider=provider,
+        handlers={
+            "kanban_update_initiative": commands_module._handle_update_initiative
+        },
+        workspace_registry=registry,
+    )
+
+    result = _submit(
+        boundary,
+        "kanban_update_initiative",
+        attempt_id="attempt-membership",
+        key="key-membership",
+        target="initiative-1",
+        version=0,
+        payload=payload,
+    )
+
+    assert result["result"] == "REJECTED"
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1' AND task_id IS NULL"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT binding_version FROM initiative_coordination_workspaces"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM initiative_coordination_workspace_members"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals "
+            "WHERE approval_id='approval-membership'"
+        ).fetchone()[0] == "approved"
+
+
 def _phase_scope_payload():
     return {
         "initiative_id": "initiative-1",

@@ -3,7 +3,7 @@ description: >-
   Complete Adrian-specific mutation authority for the shared Kanban board.
   When selected, it replaces all 18 public Kanban operations and supplies the
   verified-input pre-tool hook. Native selection leaves it inert.
-version: 0.2.0
+version: 0.4.0
 author: NousResearch
 kind: standalone
 manifest_version: 2
@@ -13,8 +13,8 @@ hermes:
   protocol_version: "2"
   schema_version: "1"
   registry_version: "v0.28-s2-1"
-  skill_bundle_version: "0.1.0"
-  desktop_extension_version: "0.2.0"
+  skill_bundle_version: "0.2.0"
+  desktop_extension_version: "0.2.2"
 provides_tools:
   - kanban_show
   - kanban_list
@@ -36,3 +36,4 @@ provides_tools:
   - kanban_close_initiative
 provides_hooks:
   - pre_tool_call
+  - pre_user_turn

@@ -1067,7 +1067,8 @@ class TestForceReloadSymmetry:
         import time
 
         monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.15
+            "hermes_cli.plugins._resolve_hook_callback_timeout",
+            lambda _hook_name=None: 0.15,
         )
 
         hold = threading.Event()
@@ -1100,7 +1101,8 @@ class TestForceReloadSymmetry:
 
     def test_hook_callback_within_timeout_returns_value(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+            "hermes_cli.plugins._resolve_hook_callback_timeout",
+            lambda _hook_name=None: 1.0,
         )
         mgr = PluginManager()
         mgr._hooks["pre_llm_call"] = [lambda **_kw: {"context": "hi"}]
@@ -1110,7 +1112,8 @@ class TestForceReloadSymmetry:
 
     def test_hook_exception_still_isolated_under_timeout_path(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+            "hermes_cli.plugins._resolve_hook_callback_timeout",
+            lambda _hook_name=None: 1.0,
         )
 
         def boom(**_kwargs):
@@ -1140,7 +1143,8 @@ class TestForceReloadSymmetry:
     def test_subagent_stop_stays_on_caller_thread(self, monkeypatch):
         """Caller-thread hooks must not move the body onto a timeout worker."""
         monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+            "hermes_cli.plugins._resolve_hook_callback_timeout",
+            lambda _hook_name=None: 1.0,
         )
         seen = {}
 
@@ -1159,7 +1163,8 @@ class TestForceReloadSymmetry:
         import time
 
         monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+            "hermes_cli.plugins._resolve_hook_callback_timeout",
+            lambda _hook_name=None: 0.1,
         )
 
         hold = threading.Event()
@@ -1192,7 +1197,8 @@ class TestForceReloadSymmetry:
         )
 
         monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+            "hermes_cli.plugins._resolve_hook_callback_timeout",
+            lambda _hook_name=None: 0.1,
         )
 
         hold = threading.Event()
@@ -1264,7 +1270,8 @@ class TestForceReloadSymmetry:
         from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
 
         monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+            "hermes_cli.plugins._resolve_hook_callback_timeout",
+            lambda _hook_name=None: 0.1,
         )
 
         hold = threading.Event()
