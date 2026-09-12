@@ -48,6 +48,7 @@ from agent.turn_context import (
     compose_user_api_content,
     reanchor_current_turn_user_idx,
 )
+from agent.turn_admission import resolve_pre_user_turn
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
@@ -1949,6 +1950,25 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    _admission = resolve_pre_user_turn(
+        agent,
+        user_message,
+        conversation_history,
+        task_id,
+        persist_user_message,
+        getattr(agent, "model", None),
+        getattr(agent, "platform", None),
+    )
+    if _admission is not None:
+        _action = _admission.get("action")
+        if _action == "respond":
+            return _admission["result"]
+        if _action == "fail":
+            return _admission["result"]
+        if _action == "rewrite":
+            user_message = _admission["model_message"]
+            persist_user_message = _admission["persist_message"]
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later

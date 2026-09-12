@@ -51,6 +51,9 @@ class BindingCandidate:
     profile: Optional[str]
     source: str  # "derived-from-card" | "derived-from-worktree"
     model_supplied_path: Optional[str] = None
+    logical_workspace_id: Optional[str] = None
+    member_roots: Optional[tuple] = None
+    binding_version: Optional[int] = None
 
     def to_presentation(self) -> Dict[str, Any]:
         """The human-facing block: visibly a *Worktree Binding* confirmation."""
@@ -64,6 +67,13 @@ class BindingCandidate:
             "git_branch": self.git_branch,
             "profile": self.profile,
             "confirmation_basis": self.source,
+            "logical_workspace_id": self.logical_workspace_id,
+            "member_roots": (
+                list(self.member_roots)
+                if self.member_roots
+                else [self.worktree_path]
+            ),
+            "binding_version": self.binding_version,
             "note": (
                 "Worktree Binding confirmation. Confirming persists this "
                 "session's confirmed worktree in the central security "
@@ -94,6 +104,9 @@ class TrustedBindingProducer:
         profile: Optional[str] = None,
         source: str = "derived-from-card",
         model_supplied_path: Optional[str] = None,
+        logical_workspace_id: Optional[str] = None,
+        member_roots: Optional[tuple] = None,
+        binding_version: Optional[int] = None,
     ) -> BindingCandidate:
         """Validate a candidate against trusted state before presenting it.
 
@@ -116,6 +129,67 @@ class TrustedBindingProducer:
                 "resolve to an existing directory (rejected; not derived from "
                 "trusted state)."
             )
+        if (
+            logical_workspace_id is not None
+            or member_roots is not None
+            or binding_version is not None
+        ):
+            if (
+                logical_workspace_id is None
+                or member_roots is None
+                or binding_version is None
+            ):
+                raise BindingPresentationError(
+                    "WriteGate: all logical fields must be supplied together"
+                )
+            if (
+                not isinstance(logical_workspace_id, str)
+                or not logical_workspace_id.strip()
+            ):
+                raise BindingPresentationError(
+                    "WriteGate: logical_workspace_id must be a nonblank string"
+                )
+            if not isinstance(member_roots, (tuple, list)) or not member_roots:
+                raise BindingPresentationError(
+                    "WriteGate: member_roots must be a nonempty tuple or list"
+                )
+            if not all(
+                isinstance(root, str) and root.strip() for root in member_roots
+            ):
+                raise BindingPresentationError(
+                    "WriteGate: member_roots must be nonblank strings"
+                )
+            if len(set(member_roots)) != len(member_roots):
+                raise BindingPresentationError(
+                    "WriteGate: member_roots must be distinct"
+                )
+            if (
+                not isinstance(binding_version, int)
+                or isinstance(binding_version, bool)
+                or binding_version <= 0
+            ):
+                raise BindingPresentationError(
+                    "WriteGate: binding_version must be a positive integer"
+                )
+            canonical_roots = []
+            for root in member_roots:
+                canonical_root = canonicalize_target(root, must_exist=True)
+                if canonical_root is None:
+                    raise BindingPresentationError(
+                        f"WriteGate: member root {root!r} does not resolve to "
+                        "an existing directory"
+                    )
+                canonical_roots.append(canonical_root)
+            if len(set(canonical_roots)) != len(canonical_roots):
+                raise BindingPresentationError(
+                    "WriteGate: canonical member roots must be distinct"
+                )
+            if canonical != canonical_roots[0]:
+                raise BindingPresentationError(
+                    "WriteGate: canonical primary worktree must equal first "
+                    "canonical member root"
+                )
+            member_roots = tuple(canonical_roots)
         return BindingCandidate(
             session_id=session_id,
             project=project,
@@ -126,6 +200,9 @@ class TrustedBindingProducer:
             profile=profile,
             source=source,
             model_supplied_path=model_supplied_path,
+            logical_workspace_id=logical_workspace_id,
+            member_roots=member_roots,
+            binding_version=binding_version,
         )
 
     # -- the trusted operation ---------------------------------------------
@@ -156,6 +233,15 @@ class TrustedBindingProducer:
             profile=profile or candidate.profile,
             producer=_registry.PRODUCER_CONFIRM_BINDING,
             event=_registry.EVENT_CONFIRM,
+            **(
+                {
+                    "logical_workspace_id": candidate.logical_workspace_id,
+                    "member_roots": candidate.member_roots,
+                    "binding_version": candidate.binding_version,
+                }
+                if candidate.logical_workspace_id is not None
+                else {}
+            ),
         )
 
     def reanchor(
@@ -449,4 +535,16 @@ def derive_binding(
         parent_session_id=parent_id,
         parent_binding_id=parent.id,
         lineage=lineage,
+        **(
+            {
+                "logical_workspace_id": parent.logical_workspace_id,
+                "member_roots": parent.member_roots,
+                "binding_version": parent.binding_version,
+            }
+            if (
+                assigned_workspace is None
+                and parent.logical_workspace_id is not None
+            )
+            else {}
+        ),
     )

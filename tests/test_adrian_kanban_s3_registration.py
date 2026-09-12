@@ -115,8 +115,10 @@ def test_register_wires_one_complete_plugin_authority_runtime(
         importlib.import_module(f"{package.__name__}.commands").RECOGNIZED_OPERATIONS
     )
     assert all(item["override"] is True for item in context.tools)
-    assert len(context.hooks) == 1
-    assert context.hooks[0][0] == "pre_tool_call"
+    assert [name for name, _callback in context.hooks] == [
+        "pre_tool_call",
+        "pre_user_turn",
+    ]
     status = package._kb.provider_status(database_path)
     assert status.present is True
     assert status.healthy is True
@@ -174,7 +176,7 @@ def test_manifest_and_runtime_share_one_release_identity(package):
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
 
     assert package.PLUGIN_NAME == "adrian-kanban"
-    assert package.PLUGIN_VERSION == versioning.PLUGIN_VERSION == "0.2.0"
+    assert package.PLUGIN_VERSION == versioning.PLUGIN_VERSION == "0.4.0"
     assert manifest["name"] == package.PLUGIN_NAME
     assert manifest["version"] == package.PLUGIN_VERSION
     assert manifest["kind"] == "standalone"
@@ -190,7 +192,7 @@ def test_manifest_and_runtime_share_one_release_identity(package):
     assert set(manifest["provides_tools"]) == set(
         importlib.import_module(f"{package.__name__}.commands").RECOGNIZED_OPERATIONS
     )
-    assert manifest["provides_hooks"] == ["pre_tool_call"]
+    assert manifest["provides_hooks"] == ["pre_tool_call", "pre_user_turn"]
 
 
 def test_runtime_health_reports_exact_versions_and_path(

@@ -129,6 +129,95 @@ def test_decide_governed_mutation_requires_binding(reg, mods):
     assert d2.allowed or getattr(d2, "escalated", False)
 
 
+def test_logical_binding_allows_each_member_but_not_parent_or_sibling(
+    reg, mods, tmp_path
+):
+    shared = tmp_path / "AI-worktrees" / "init-1" / "coordination"
+    member_a = shared / "repo-a"
+    member_b = shared / "repo-b"
+    sibling = shared / "repo-c"
+    for path in (member_a, member_b, sibling):
+        path.mkdir(parents=True)
+    reg.create_binding(
+        session_id="logical",
+        worktree_path=str(member_a.resolve()),
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(member_a.resolve()), str(member_b.resolve())),
+        binding_version=1,
+    )
+
+    for target in (member_a / "src" / "a.py", member_b / "src" / "b.py"):
+        decision = mods.enforcement.decide(
+            tool_name="write_file",
+            args={"path": str(target)},
+            session_id="logical",
+            reg=reg,
+            base_dir=str(member_a),
+        )
+        assert decision.allowed is True
+
+    for target in (shared / "coordination-note.md", sibling / "src" / "c.py"):
+        decision = mods.enforcement.decide(
+            tool_name="write_file",
+            args={"path": str(target)},
+            session_id="logical",
+            reg=reg,
+            base_dir=str(member_a),
+        )
+        assert decision.allowed is False
+        assert "outside the bound worktree" in decision.reason
+
+
+def test_logical_binding_protects_canon_in_every_member(reg, mods, tmp_path):
+    member_a = tmp_path / "repo-a"
+    member_b = tmp_path / "repo-b"
+    member_a.mkdir()
+    member_b.mkdir()
+    reg.create_binding(
+        session_id="logical-protected",
+        worktree_path=str(member_a.resolve()),
+        logical_workspace_id="coord-init-2",
+        member_roots=(str(member_a.resolve()), str(member_b.resolve())),
+        binding_version=1,
+    )
+    for member in (member_a, member_b):
+        decision = mods.enforcement.decide(
+            tool_name="write_file",
+            args={"path": str(member / "Canon" / "policy.md")},
+            session_id="logical-protected",
+            reg=reg,
+            base_dir=str(member_a),
+        )
+        assert decision.allowed is False
+        assert "protected location" in decision.reason
+
+
+def test_logical_binding_fails_closed_if_any_member_root_disappears(
+    reg, mods, tmp_path
+):
+    member_a = tmp_path / "repo-a"
+    member_b = tmp_path / "repo-b"
+    member_a.mkdir()
+    member_b.mkdir()
+    reg.create_binding(
+        session_id="logical-missing",
+        worktree_path=str(member_a.resolve()),
+        logical_workspace_id="coord-init-3",
+        member_roots=(str(member_a.resolve()), str(member_b.resolve())),
+        binding_version=1,
+    )
+    member_b.rmdir()
+    decision = mods.enforcement.decide(
+        tool_name="write_file",
+        args={"path": str(member_a / "src" / "still-here.py")},
+        session_id="logical-missing",
+        reg=reg,
+        base_dir=str(member_a),
+    )
+    assert decision.allowed is False
+    assert "invalid or unavailable" in decision.reason
+
+
 # -- decide: traversal / unresolvable target refused --------------------------
 
 def test_decide_traversal_refirmed_as_governed(reg, mods):

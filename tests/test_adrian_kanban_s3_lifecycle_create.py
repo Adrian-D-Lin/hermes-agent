@@ -240,7 +240,7 @@ def test_lifecycle_create_atomically_persists_contract_manifest_and_snapshots(
         assert contract["step"] == "D2"
         assert contract["execution_profile"] == "independent-reviewer"
         assert contract["skill_id"] == "d2-iterative-review"
-        assert contract["skill_version"] == "0.1.0"
+        assert contract["skill_version"] == "0.2.0"
         assert len(contract["skill_hash"]) == 64
         snapshot = json.loads(contract["canonical_contract_payload"])
         assert snapshot["baseline_refs"] == ["Canon/design-lifecycle.md"]

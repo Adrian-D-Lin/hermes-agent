@@ -3,6 +3,25 @@
 This record supplements the ratified baseline; it does not rewrite v0.28 or
 authorize deviations from its other requirements.
 
+## v0.29 controlling decision: irreversible initiative closure
+
+Adrian's 2026-09-12 decision supersedes the historical combined-reopening
+proposal retained below. A formally closed initiative cannot be revived or
+moved back to an active phase. PC1 corrections remain within an initiative only
+while it is active. Work discovered after formal closure requires a new
+initiative with an explicit predecessor reference to the closed record and its
+permanent archive.
+
+Closure requires the exact one-time initiative WriteGate approval. The server
+preflights and merges every coordination member, executes the approved close
+transaction, creates and verifies the permanent
+`5-archive/<initiative-id>/` bundle, and only then retires physical coordination
+worktrees. The durable closure journal supports replay after partial failure but
+never reopens the initiative.
+
+The following combined-reopening section is retained solely as superseded
+decision history and is not an operative contract.
+
 ## Combined initiative reopening and movement — Adrian approved, 2026-09-09
 
 A request to move a closed initiative may prepare one exact Write-Gate request

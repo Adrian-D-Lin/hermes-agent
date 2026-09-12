@@ -49,7 +49,7 @@ LEASE_DURATION_SECONDS = 5 * 60
 LEASE_DURATION_TEXT = "5 minutes"
 
 # Registry schema version.  Bumped only on a structural migration.
-REGISTRY_SCHEMA_VERSION = 2
+REGISTRY_SCHEMA_VERSION = 3
 
 # Status values for a binding row.
 BINDING_ACTIVE = "active"
@@ -99,6 +99,7 @@ class BindingRecord:
         "git_branch", "profile", "producer", "event",
         "parent_binding_id", "parent_session_id", "status", "created_at",
         "confirmed_at", "superseded_by_id", "lineage",
+        "logical_workspace_id", "member_roots", "binding_version",
     )
 
     def __init__(self, row: Dict[str, Any]):
@@ -121,13 +122,66 @@ class BindingRecord:
         # Free-form lineage metadata (JSON text) for branch/compression/
         # delegate derivation: the recorded parent_session_id + workspace.
         self.lineage = row.get("lineage")
+        raw_workspace = row.get("logical_workspace_id")
+        raw_roots = row.get("member_roots_json")
+        raw_version = row.get("binding_version")
+        if raw_workspace is None and raw_roots is None and raw_version is None:
+            self.logical_workspace_id = None
+            self.member_roots = (
+                (self.worktree_path,)
+                if isinstance(self.worktree_path, str) and self.worktree_path.strip()
+                else ()
+            )
+            self.binding_version = None
+        else:
+            if raw_workspace is None or raw_roots is None or raw_version is None:
+                raise RegistryError("WriteGate: partial logical binding fields")
+            if not isinstance(raw_workspace, str) or not raw_workspace.strip():
+                raise RegistryError(
+                    "WriteGate: logical_workspace_id must be a nonblank string"
+                )
+            import json
+
+            try:
+                parsed = json.loads(raw_roots)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise RegistryError(
+                    "WriteGate: malformed member_roots_json"
+                ) from exc
+            if not isinstance(parsed, list) or not parsed:
+                raise RegistryError(
+                    "WriteGate: member_roots must be a nonempty list"
+                )
+            if not all(isinstance(root, str) and root.strip() for root in parsed):
+                raise RegistryError(
+                    "WriteGate: member_roots must be nonblank strings"
+                )
+            if len(set(parsed)) != len(parsed):
+                raise RegistryError("WriteGate: member_roots must be distinct")
+            if (
+                not isinstance(raw_version, int)
+                or isinstance(raw_version, bool)
+                or raw_version <= 0
+            ):
+                raise RegistryError(
+                    "WriteGate: binding_version must be a positive integer"
+                )
+            if self.worktree_path != parsed[0]:
+                raise RegistryError(
+                    "WriteGate: worktree_path must equal first member root"
+                )
+            self.logical_workspace_id = raw_workspace
+            self.member_roots = tuple(parsed)
+            self.binding_version = raw_version
 
     @property
     def is_active(self) -> bool:
         return self.status == BINDING_ACTIVE
 
     def to_dict(self) -> Dict[str, Any]:
-        return {k: getattr(self, k) for k in self.__slots__}
+        result = {key: getattr(self, key) for key in self.__slots__}
+        result["member_roots"] = list(self.member_roots)
+        return result
 
 
 class LeaseRecord:
@@ -201,6 +255,9 @@ CREATE TABLE IF NOT EXISTS write_gate_bindings (
     created_at        TEXT NOT NULL,
     confirmed_at      TEXT,
     superseded_by_id  INTEGER,
+    logical_workspace_id TEXT,
+    member_roots_json TEXT,
+    binding_version   INTEGER,
     FOREIGN KEY (parent_binding_id) REFERENCES write_gate_bindings(id),
     FOREIGN KEY (superseded_by_id) REFERENCES write_gate_bindings(id)
 );
@@ -375,6 +432,7 @@ class Registry:
                 # The filtered active-binding index now exists on the rebuilt
                 # table. Idempotent: a no-op once the autoindex is gone.
                 self._migrate_uniqueness()
+                self._migrate_binding_columns()
                 self._conn.execute(
                     "INSERT OR REPLACE INTO write_gate_meta (key, value) "
                     "VALUES ('schema_version', ?)",
@@ -388,6 +446,25 @@ class Registry:
             self._chmod_db_strict()
         except sqlite3.Error as exc:
             raise RegistryError(f"WriteGate: migration failed: {exc}") from exc
+
+    def _migrate_binding_columns(self) -> None:
+        """Add the v3 logical-binding columns after every possible rebuild."""
+        if self._conn is None:
+            return
+        columns = self._table_columns("write_gate_bindings")
+        if "logical_workspace_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE write_gate_bindings "
+                "ADD COLUMN logical_workspace_id TEXT"
+            )
+        if "member_roots_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE write_gate_bindings ADD COLUMN member_roots_json TEXT"
+            )
+        if "binding_version" not in columns:
+            self._conn.execute(
+                "ALTER TABLE write_gate_bindings ADD COLUMN binding_version INTEGER"
+            )
 
     def _table_columns(self, table: str) -> set[str]:
         if self._conn is None:
@@ -696,6 +773,9 @@ class Registry:
         parent_session_id: Optional[str] = None,
         parent_binding_id: Optional[int] = None,
         lineage: Optional[Dict[str, Any]] = None,
+        logical_workspace_id: Optional[str] = None,
+        member_roots: Optional[tuple | list] = None,
+        binding_version: Optional[int] = None,
     ) -> BindingRecord:
         """Insert a new binding row and mark any prior active binding for the
         same session ``superseded`` (one active binding per session).
@@ -703,6 +783,47 @@ class Registry:
         Returns the new :class:`BindingRecord`.
         """
         now = utcnow_iso()
+        import json
+
+        if (
+            logical_workspace_id is not None
+            or member_roots is not None
+            or binding_version is not None
+        ):
+            if (
+                not isinstance(logical_workspace_id, str)
+                or not logical_workspace_id.strip()
+            ):
+                raise RegistryError(
+                    "WriteGate: logical_workspace_id must be nonblank"
+                )
+            if not isinstance(member_roots, (tuple, list)) or not member_roots:
+                raise RegistryError(
+                    "WriteGate: member_roots must be a nonempty tuple or list"
+                )
+            if not all(
+                isinstance(root, str) and root.strip() for root in member_roots
+            ):
+                raise RegistryError(
+                    "WriteGate: member_roots must be nonblank strings"
+                )
+            if len(set(member_roots)) != len(member_roots):
+                raise RegistryError("WriteGate: member_roots must be distinct")
+            if (
+                not isinstance(binding_version, int)
+                or isinstance(binding_version, bool)
+                or binding_version <= 0
+            ):
+                raise RegistryError(
+                    "WriteGate: binding_version must be a positive integer"
+                )
+            if worktree_path != member_roots[0]:
+                raise RegistryError(
+                    "WriteGate: worktree_path must equal first member root"
+                )
+            roots_json = json.dumps(list(member_roots), separators=(",", ":"))
+        else:
+            roots_json = None
         conn = self._tx()
         try:
             with self._lock, conn:
@@ -731,13 +852,15 @@ class Registry:
                          session_id, project, initiative, board, worktree_path,
                          git_branch, profile, producer, event,
                          parent_binding_id, parent_session_id, status,
-                         lineage, created_at, confirmed_at, superseded_by_id
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         lineage, created_at, confirmed_at, superseded_by_id,
+                         logical_workspace_id, member_roots_json, binding_version
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         session_id, project, initiative, board, worktree_path,
                         git_branch, profile, producer, event,
                         parent_binding_id, parent_session_id, BINDING_ACTIVE,
                         _dump_lineage(lineage), now, now, None,
+                        logical_workspace_id, roots_json, binding_version,
                     ),
                 )
                 new_id = cur.lastrowid

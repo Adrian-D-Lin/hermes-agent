@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 PLUGIN_NAME = "adrian-kanban"
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.4.0"
 PROTOCOL_VERSION = "2"
 SCHEMA_VERSION = "1"
 REGISTRY_VERSION = "v0.28-s2-1"
-SKILL_BUNDLE_VERSION = "0.1.0"
-DESKTOP_EXTENSION_VERSION = "0.2.0"
+SKILL_BUNDLE_VERSION = "0.2.0"
+DESKTOP_EXTENSION_VERSION = "0.2.2"
 
 
 def release_identity() -> dict:

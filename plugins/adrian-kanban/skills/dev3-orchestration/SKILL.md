@@ -1,7 +1,7 @@
 ---
 name: dev3-orchestration
 description: Operational guidance for DEV3 build, test, and review.
-version: 0.1.0
+version: 0.2.0
 author: Adrian Lin, Hermes Agent
 license: MIT
 platforms: [linux]
@@ -75,8 +75,10 @@ Before performing phase work, resolve the active segment and workspace:
    card projection exposes `lifecycle_phase`, `segment_id`, and
    `segment_workspace_id`; an absolute path is not accepted from the task
    caller. On dispatch, the controller checks the worktree/repository
-   identity, the expected branch, required base ancestry, and one active
-   single writer. Legitimate commits may advance HEAD after
+   identity, the expected branch, and required base ancestry. Multiple
+   sessions may share the same logical workspace; every session must refresh
+   the repository state before editing and recheck the complete diff and HEAD
+   before committing. Legitimate commits may advance HEAD after
    materialization.
 7. Read the task's `task_input_manifest_v1`, which exactly covers the
    declared reference paths (`baseline_refs`, `governing_source_refs`,
@@ -103,7 +105,8 @@ worktree:
   `lifecycle_contract_v1`, or the system-derived segment root cannot be
   resolved through the trusted repository registry.
 - The worktree does not exist, is on the wrong branch, fails required
-  base ancestry, or has more than one active writer.
+  base ancestry, or has dirty/divergent state that cannot be attributed and
+  safely reconciled.
 - The task's `task_input_manifest_v1` does not exactly cover the
   declared reference paths, or an entry's `sha256` / `source_locator`
   pin does not verify.
@@ -595,6 +598,8 @@ The segment proceeds to DEV4 when the DEV3 exit gate is satisfied.
   caller—derives the physical segment root from the active
   `segment_workspace_id` and the trusted repository registry; on
   dispatch the controller checks worktree/repository identity, expected
-  branch, required base ancestry, and one active single writer.
+  branch, and required base ancestry. Concurrent bindings are visible and
+  permitted; stale diffs, Git conflicts, and unexplained advancement fail
+  closed rather than being overwritten.
 - The Kanban initiative card — the single reference point for the
   initiative's lifecycle state and DEV3 closing result.

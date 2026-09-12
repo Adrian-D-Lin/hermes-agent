@@ -12,7 +12,7 @@ def _runbook() -> str:
     return RUNBOOK.read_text(encoding="utf-8")
 
 
-def test_runbook_covers_the_complete_stopped_cutover_sequence():
+def test_runbook_covers_the_complete_stopped_upgrade_sequence():
     text = _runbook()
 
     required_phrases = (
@@ -21,19 +21,18 @@ def test_runbook_covers_the_complete_stopped_cutover_sequence():
         "WAL",
         "SHM",
         "integrity_check",
-        "dry-run",
         "kanban.database_path",
         "kanban.mutation_authority",
         "adrian-kanban",
-        "dispatch_in_gateway",
-        "auto_decompose",
-        "review_dispatch",
         "negative bypass",
-        "ordinary task canary",
-        "initiative canary",
+        "coordination backfill",
+        "maintenance_backfill",
+        "--apply",
+        "legacy startup hook",
+        "exact-once held-prompt release",
+        "close → verified archive → coordination retirement",
         "staged reactivation",
         "soak",
-        "authority reversal",
         "blind restore",
     )
     for phrase in required_phrases:
@@ -68,18 +67,19 @@ def test_runbook_preserves_session_startup_and_write_gate_profile_contracts():
     text = _runbook().casefold()
 
     assert "session startup" in text
-    assert "builder-tester" in text and "must not load session startup" in text
+    assert "builder-tester" in text and "excluded" in text
     assert "independent-reviewer" in text and "test-authority-reviewer" in text
+    assert "moa selected inside `default`" in text
     assert "write-gate" in text
-    assert "legacy pre-tool hook" in text
+    assert "legacy external `pre_llm_call`" in text
 
 
-def test_runbook_requires_separate_legacy_mapping_and_safe_rollback():
+def test_runbook_requires_primary_only_backfill_and_safe_rollback():
     text = _runbook().casefold()
 
-    assert "separate migration exercise" in text
+    assert "separate completed migration concern" in text
     assert "do not infer" in text
+    assert "additional repositories are not backfilled automatically" in text
     assert "accepted plugin mutation" in text
     assert "reverse migration" in text
     assert "keep the system stopped" in text
-

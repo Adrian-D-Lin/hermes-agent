@@ -117,6 +117,11 @@ class JournalEvent:
             raise JournalRejected("at least one intended evidence is required")
 
 
+_ALLOWED_TABLES = frozenset(
+    ("external_operation_journal", "initiative_coordination_operation_journal")
+)
+
+
 class ExternalOperationJournal:
     _SELECT = (
         "SELECT event_id, operation_id, idempotency_id, member_target, ordinal, "
@@ -124,13 +129,16 @@ class ExternalOperationJournal:
         "intended_git_evidence, intended_filesystem_evidence, "
         "observed_git_evidence, observed_filesystem_evidence, "
         "error_disposition, recovery_disposition, actor_evidence, created_at "
-        "FROM external_operation_journal"
+        "FROM {table}"
     )
 
-    def __init__(self, conn):
+    def __init__(self, conn, table_name="external_operation_journal"):
         if type(conn) is not sqlite3.Connection:
             raise JournalRejected("conn must be a sqlite3.Connection")
+        if not isinstance(table_name, str) or table_name not in _ALLOWED_TABLES:
+            raise JournalRejected("table_name must be an allowed journal table")
         self._conn = conn
+        self._table = table_name
 
     def _require_transaction(self):
         if not self._conn.in_transaction:
@@ -162,7 +170,7 @@ class ExternalOperationJournal:
         _validate_nonblank_str(operation_id, "operation_id")
         _validate_nonblank_str(member_target, "member_target")
         rows = self._conn.execute(
-            self._SELECT
+            self._SELECT.format(table=self._table)
             + " WHERE operation_id = ? AND member_target = ? ORDER BY ordinal ASC",
             (operation_id, member_target),
         ).fetchall()
@@ -270,7 +278,7 @@ class ExternalOperationJournal:
     ):
         self._require_transaction()
         cursor = self._conn.execute(
-            "INSERT INTO external_operation_journal ("
+            "INSERT INTO " + self._table + " ("
             "operation_id, idempotency_id, member_target, ordinal, "
             "operation_kind, workspace_id, repository_identity, state, "
             "intended_git_evidence, intended_filesystem_evidence, "
@@ -297,7 +305,8 @@ class ExternalOperationJournal:
             ),
         )
         row = self._conn.execute(
-            self._SELECT + " WHERE event_id = ?", (cursor.lastrowid,)
+            self._SELECT.format(table=self._table) + " WHERE event_id = ?",
+            (cursor.lastrowid,),
         ).fetchone()
         if row is None:
             raise JournalRejected("inserted journal event could not be read")

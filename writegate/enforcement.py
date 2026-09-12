@@ -214,6 +214,27 @@ def _terminal_fs_mutations(tool_name: str, args: Any) -> List[str]:
     return targets
 
 
+def _canonical_member_roots(
+    member_roots: Sequence[str],
+    *,
+    must_exist: bool,
+) -> Optional[tuple]:
+    """Return a strict, ordered canonical root tuple or fail closed."""
+    if not isinstance(member_roots, (tuple, list)) or not member_roots:
+        return None
+    seen = set()
+    canonical_roots = []
+    for root in member_roots:
+        if not isinstance(root, str) or not root.strip():
+            return None
+        canonical = canonicalize_target(root, must_exist=must_exist)
+        if canonical is None or canonical in seen:
+            return None
+        seen.add(canonical)
+        canonical_roots.append(canonical)
+    return tuple(canonical_roots)
+
+
 def decide(
     *,
     tool_name: str,
@@ -292,7 +313,23 @@ def decide(
         )
 
     worktree = binding.worktree_path
-    worktree_canonical = canonicalize_target(worktree, must_exist=False)
+    member_roots_canonical = _canonical_member_roots(
+        binding.member_roots,
+        must_exist=(binding.logical_workspace_id is not None),
+    )
+    if member_roots_canonical is None:
+        return Decision(
+            allowed=False,
+            reason=(
+                "Write-Gate: binding member roots are invalid or unavailable. "
+                "Governed writes are blocked until the binding is re-confirmed."
+            ),
+            blocked_targets=targets,
+            remediation=(
+                "Call write_gate(action='confirm_binding') to re-anchor the "
+                "session with valid member roots."
+            ),
+        )
 
     # 4. Evaluate every target.  All must pass; one failure blocks the call.
     #    Relative targets resolve against the trusted per-session/task base
@@ -303,10 +340,23 @@ def decide(
         canonical = canonicalize_target(t, base_dir=base_dir)
         if canonical is None:
             return _traversal_or_unresolvable(t)
-        # Containment within the bound worktree.
-        within = is_within(canonical, worktree_canonical) if worktree_canonical else False
-        # Protected-location check (relative to the project root).
-        protected = _is_protected(canonical, project_root)
+        # Match only an explicitly declared member root. Their common parent
+        # never becomes ordinary write authority.
+        within_root = next(
+            (
+                root
+                for root in member_roots_canonical
+                if is_within(canonical, root)
+            ),
+            None,
+        )
+        within = within_root is not None
+        effective_project_root = project_root
+        if within_root is not None:
+            effective_project_root = (
+                _recovery.derive_project_root(within_root) or within_root
+            )
+        protected = _is_protected(canonical, effective_project_root)
         # Out-of-worktree or protected: a matching active lease is required.
         # A matching active lease is the human's folder-scoped authority for
         # the target (a five-minute, folder-scoped approval), and the
@@ -323,8 +373,9 @@ def decide(
                 return Decision(
                     allowed=False,
                     reason=(
-                        f"Write-Gate: {canonical!r} is outside the bound worktree "
-                        f"{worktree!r}" + (
+                        f"Write-Gate: {canonical!r} is outside the bound "
+                        f"worktree {worktree!r} (declared member roots: "
+                        f"{member_roots_canonical!r})" + (
                             f" (protected location) " if protected else " "
                         ) + "and has no matching active lease."
                     ),
@@ -359,7 +410,11 @@ def decide(
         # Ordinary in-worktree write: allowed without a lease (§4).  Symlink
         # escapes (a target that resolves outside the project root through a
         # symlink) are still rejected in depth — a lease cannot authorize them.
-        esc = resolve_symlink_escape(canonical, project_root) if project_root else False
+        esc = (
+            resolve_symlink_escape(canonical, effective_project_root)
+            if effective_project_root
+            else False
+        )
         if esc:
             return _traversal_or_unresolvable(t)
     decision = Decision(allowed=True, leased=leased_call)

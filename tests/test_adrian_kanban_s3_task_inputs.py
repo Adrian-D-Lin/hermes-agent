@@ -62,7 +62,7 @@ def test_pinned_skill_bundle_resolves_exact_phase_contract_and_content_hash(
     content = skill_path.read_bytes()
 
     assert binding.skill_id == skill_id
-    assert binding.skill_version == "0.1.0"
+    assert binding.skill_version == "0.2.0"
     assert binding.skill_hash == hashlib.sha256(content).hexdigest()
     assert skill_bundle.skill_contract(phase) == (contract_id, "1")
     text = content.decode("utf-8")

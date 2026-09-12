@@ -19,6 +19,10 @@ from writegate.kanban_approvals import (
     validate_approved,
 )
 
+from .coordination_workspace import (
+    CoordinationWorkspaceError,
+    CoordinationWorkspaceStore,
+)
 from .initiative_checkpoints import admit_orchestration_checkpoint
 from .diagnostics import CommandRejected, FailedCheck, NotEvaluatedCheck
 from .segment_manifest import PreparedSegmentManifest
@@ -26,6 +30,7 @@ from .phase_result_scope import validate_phase_result_scope
 from .phase_admission import admit_phase_result
 from .segment_projection import admit_segment_projection, persist_segment_projection
 from .transition_evidence import validate_transition_evidence
+from .workspace import _WorkspaceRejected
 
 INITIATIVE_PHASES = frozenset(
     {
@@ -460,6 +465,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
     board = board.strip()
     if update_kind not in {
         "body_update",
+        "coordination_membership_expansion",
         "phase_result",
         "segment_manifest_projection",
         "orchestration_checkpoint",
@@ -592,6 +598,90 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
             "predecessor_task_id": admission.predecessor_task_id,
             "successor_task_id": successor_task_id,
             "cleanup_required": cleanup_required,
+        }
+
+    if update_kind == "coordination_membership_expansion":
+        if set(update.keys()) != {"repository_ids"}:
+            raise ValueError(
+                "coordination_membership_expansion update must contain only "
+                "repository_ids"
+            )
+        repository_ids = update["repository_ids"]
+        if not isinstance(repository_ids, list) or not repository_ids:
+            raise ValueError("repository_ids must be a non-empty list")
+        for repository_id in repository_ids:
+            if not (type(repository_id) is str and repository_id.strip()):
+                raise ValueError(
+                    "repository_ids must contain nonblank strings"
+                )
+        if len(repository_ids) != len(set(repository_ids)):
+            raise ValueError("repository_ids must be unique")
+
+        registry = context.workspace_registry
+        if registry is None:
+            raise ValueError("workspace_registry is required")
+        for repository_id in repository_ids:
+            try:
+                registry.lookup(repository_id)
+            except _WorkspaceRejected as exc:
+                raise ValueError(
+                    f"repository ID {repository_id!r} rejected by registry: {exc}"
+                ) from None
+
+        logical_workspace_id = f"coord-{initiative_id}"
+        store = CoordinationWorkspaceStore(context.connection)
+        try:
+            workspace = store.read_active(initiative_id)
+        except CoordinationWorkspaceError as exc:
+            raise ValueError(
+                f"failed to read active coordination workspace: {exc}"
+            ) from None
+        project_id = workspace.get("project_id")
+        if not (type(project_id) is str and project_id.strip()):
+            raise ValueError("workspace project_id must be a nonblank string")
+        expected_binding_ref = f"tracker:{board}:{initiative_id}"
+        if workspace.get("controller_binding_ref") != expected_binding_ref:
+            raise ValueError("workspace controller_binding_ref mismatch")
+        binding_version = workspace.get("binding_version")
+        if not (
+            type(binding_version) is int
+            and not isinstance(binding_version, bool)
+            and binding_version > 0
+        ):
+            raise ValueError(
+                "workspace binding_version must be a positive non-Boolean integer"
+            )
+
+        _consume_approval(
+            context.connection,
+            context,
+            approval_id,
+            "kanban_update_initiative",
+            expected_version,
+            payload,
+            initiative_id,
+            None,
+        )
+        now = int(time.time())
+        updated_workspace = store.add_planned_members_in_active_transaction(
+            logical_workspace_id,
+            repository_ids,
+            expected_binding_version=binding_version,
+            at=now,
+        )
+        record_version = _advance_initiative_version(
+            context.connection, context, initiative_id, expected_version
+        )
+        return {
+            "initiative_id": initiative_id,
+            "update_kind": update_kind,
+            "record_version": record_version,
+            "logical_workspace_id": logical_workspace_id,
+            "writegate_binding_version": updated_workspace["binding_version"],
+            "repository_ids": sorted(
+                member["repository_identity"]
+                for member in updated_workspace["members"]
+            ),
         }
 
     if update_kind == "segment_manifest_projection":

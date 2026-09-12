@@ -117,6 +117,71 @@ def write_gate_tool(action: str = "", session_id: str = "", task_id: str = "", *
         return json.dumps({"success": False, "error": f"write_gate: {exc}"})
 
 
+def confirm_trusted_logical_binding(
+    *,
+    session_id: str,
+    project: str,
+    initiative: str,
+    board: str,
+    logical_workspace_id: str,
+    member_roots: tuple,
+    binding_version: int,
+    profile: Optional[str] = None,
+) -> Optional["_registry.BindingRecord"]:
+    """Confirm one Tracker-derived logical binding through one approval."""
+    for name, value in (
+        ("session_id", session_id),
+        ("project", project),
+        ("initiative", initiative),
+        ("board", board),
+        ("logical_workspace_id", logical_workspace_id),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"WriteGate: {name} must be a nonblank string")
+    if not isinstance(member_roots, tuple) or not member_roots:
+        raise ValueError("WriteGate: member_roots must be a nonempty tuple")
+    if (
+        not isinstance(binding_version, int)
+        or isinstance(binding_version, bool)
+        or binding_version <= 0
+    ):
+        raise ValueError("WriteGate: binding_version must be a positive integer")
+
+    registry = _get_reg()
+    producer = _binding.TrustedBindingProducer(registry)
+    candidate = producer.derive_candidate(
+        session_id=session_id,
+        worktree_path=member_roots[0],
+        project=project,
+        initiative=initiative,
+        board=board,
+        profile=profile,
+        source="derived-from-tracker",
+        model_supplied_path=None,
+        logical_workspace_id=logical_workspace_id,
+        member_roots=member_roots,
+        binding_version=binding_version,
+    )
+
+    existing = registry.get_active_binding(session_id)
+    if existing is not None and (
+        existing.project == project
+        and existing.initiative == initiative
+        and existing.board == board
+        and existing.logical_workspace_id == logical_workspace_id
+        and existing.member_roots == candidate.member_roots
+        and existing.binding_version == binding_version
+    ):
+        return existing
+
+    approval = _present_and_get_decision(
+        candidate.to_presentation(), kind="CONFIRMED_WORKTREE_BINDING"
+    )
+    if not approval["approved"]:
+        return None
+    return producer.confirm(candidate, confirmed=True, profile=profile)
+
+
 def _build_binding_candidate(
     reg: "_registry.Registry",
     session_id: str,

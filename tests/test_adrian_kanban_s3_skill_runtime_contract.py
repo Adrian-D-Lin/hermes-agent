@@ -31,7 +31,8 @@ def test_segment_phase_skill_names_the_runtime_workspace_and_input_contract(skil
     assert "task_input_manifest_v1" in text
     assert "predecessor_ref" in text
     assert "system-derived" in text
-    assert "single writer" in text.lower() or "single-writer" in text.lower()
+    assert "concurrent bindings" in text.lower()
+    assert "stale diffs" in text.lower()
 
 
 def test_dev2_skill_describes_immutable_accepted_handoff_to_dev3():

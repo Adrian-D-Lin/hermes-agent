@@ -89,7 +89,7 @@ def _binding(module, **changes):
         "canonical_digest": "sha256:task-payload",
         "session_id": "session-1",
         "workspace_id": "workspace-1",
-        "plugin_version": "0.2.0",
+        "plugin_version": "0.4.0",
         "protocol_version": "2",
         "execution_context": "run-1",
     }
@@ -1549,6 +1549,128 @@ def test_workspace_verification_is_read_only(provider_modules, tmp_path):
         _git(target, "rev-parse", "HEAD"),
         _git(target, "symbolic-ref", "--short", "HEAD"),
     ) == before
+    conn.close()
+
+
+def _materialized_workspace_member(member, observed_head):
+    return replace(
+        member,
+        observed_head=observed_head,
+        member_state="materialized",
+    )
+
+
+def test_workspace_freshness_includes_untracked_files_in_dirty_state(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+
+    clean = executor.inspect_freshness(member)
+    assert clean.ready is True
+    assert clean.recorded_head == base_sha
+    assert clean.local_head == base_sha
+    assert clean.remote_head == base_sha
+    assert clean.recorded_is_ancestor_of_local is True
+    assert clean.local_is_ancestor_of_remote is True
+    assert clean.remote_is_ancestor_of_local is True
+
+    (Path(member.target_path) / "untracked.txt").write_text(
+        "untracked\n", encoding="utf-8"
+    )
+    dirty = executor.inspect_freshness(member)
+    assert dirty.ready is False
+    assert dirty.clean_including_untracked is False
+    assert dirty.failures == ("worktree_dirty",)
+    conn.close()
+
+
+def test_workspace_freshness_fast_forwards_only_remote_advancement(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+
+    (repository / "remote-change.txt").write_text("remote\n", encoding="utf-8")
+    _git(repository, "add", "remote-change.txt")
+    _git(repository, "commit", "-m", "advance origin main")
+    _git(repository, "push", "origin", "main")
+    remote_head = _git(repository, "rev-parse", "HEAD")
+
+    freshness = executor.inspect_freshness(member)
+    assert freshness.ready is True
+    assert freshness.local_head == base_sha
+    assert freshness.remote_head == remote_head
+    assert freshness.local_is_ancestor_of_remote is True
+    assert freshness.remote_is_ancestor_of_local is False
+
+    advanced = executor.fast_forward_to_remote(
+        member,
+        expected_local_head=base_sha,
+        expected_remote_head=remote_head,
+    )
+    assert advanced.ready is True
+    assert advanced.observed_head == remote_head
+    assert _git(member.target_path, "status", "--porcelain") == ""
+    conn.close()
+
+
+def test_workspace_freshness_exposes_unexplained_local_advancement(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+    target = Path(member.target_path)
+
+    (target / "local-change.txt").write_text("local\n", encoding="utf-8")
+    _git(target, "add", "local-change.txt")
+    _git(target, "commit", "-m", "unrecorded local advancement")
+    local_head = _git(target, "rev-parse", "HEAD")
+
+    freshness = executor.inspect_freshness(member)
+    assert freshness.ready is True
+    assert freshness.recorded_head == base_sha
+    assert freshness.local_head == local_head
+    assert freshness.remote_head == base_sha
+    assert freshness.recorded_is_ancestor_of_local is True
+    assert freshness.local_is_ancestor_of_remote is False
+    assert freshness.remote_is_ancestor_of_local is True
+    conn.close()
+
+
+def test_workspace_fast_forward_rechecks_exact_heads_and_untracked_cleanliness(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+
+    (repository / "remote-change.txt").write_text("remote\n", encoding="utf-8")
+    _git(repository, "add", "remote-change.txt")
+    _git(repository, "commit", "-m", "advance origin main")
+    _git(repository, "push", "origin", "main")
+    freshness = executor.inspect_freshness(member)
+    assert freshness.remote_head is not None
+    (Path(member.target_path) / "race.txt").write_text("race\n", encoding="utf-8")
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="untracked"):
+        executor.fast_forward_to_remote(
+            member,
+            expected_local_head=base_sha,
+            expected_remote_head=freshness.remote_head,
+        )
+    assert _git(member.target_path, "rev-parse", "HEAD") == base_sha
     conn.close()
 
 

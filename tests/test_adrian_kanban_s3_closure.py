@@ -242,11 +242,19 @@ def _payload():
     }
 
 
-def _submit(commands_module, database_path, provider, key="key-close", payload=None):
+def _submit(
+    commands_module,
+    database_path,
+    provider,
+    key="key-close",
+    payload=None,
+    workspace_registry=None,
+):
     boundary = commands_module._CommandBoundary(
         database_path=str(database_path),
         provider=provider,
         handlers={"kanban_close_initiative": commands_module._handle_close_initiative},
+        workspace_registry=workspace_registry,
     )
     return boundary.submit(
         "kanban_close_initiative",
@@ -260,6 +268,48 @@ def _submit(commands_module, database_path, provider, key="key-close", payload=N
         actor_profile="default",
         payload=_payload() if payload is None else payload,
     )
+
+
+def _seed_coordination_workspace(commands_module, database_path, tmp_path):
+    package = commands_module.__package__
+    coordination = importlib.import_module(f"{package}.coordination_workspace")
+    workspace = importlib.import_module(f"{package}.workspace")
+    repository_root = tmp_path / "repository"
+    controlled_root = tmp_path / "AI-worktrees"
+    repository_root.mkdir()
+    controlled_root.mkdir()
+    with sqlite3.connect(database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        store = coordination.CoordinationWorkspaceStore(conn)
+        store.plan_or_read(
+            initiative_id="initiative-1",
+            project_id="orchestrator",
+            repository_identity="repo-1",
+            controller_binding_ref="tracker:orchestrator:initiative-1",
+            planned_at=20,
+        )
+        conn.execute(
+            "UPDATE initiative_coordination_workspaces SET "
+            "lifecycle_state='materialized', updated_at=21 "
+            "WHERE workspace_id='coord-initiative-1'"
+        )
+        conn.execute(
+            "UPDATE initiative_coordination_workspace_members SET "
+            "required_base_sha=?, observed_head=?, member_state='materialized', "
+            "observed_at=21 WHERE workspace_id='coord-initiative-1'",
+            ("a" * 40, "b" * 40),
+        )
+        conn.commit()
+    registry = workspace._TrustedRepositoryRegistry(
+        (
+            workspace._RepositoryRegistration(
+                repository_identity="repo-1",
+                repository_root=str(repository_root.resolve()),
+                controlled_worktree_root=str(controlled_root.resolve()),
+            ),
+        )
+    )
+    return coordination, registry
 
 
 def _public_closure_payload():
@@ -781,3 +831,118 @@ def test_pc1_closure_accepts_only_milestone_null_segment_scope(
         f"key-pc1-{segment_id or 'null'}",
     )
     assert result["result"] == expected
+
+
+def test_close_preflights_then_merges_active_coordination_before_atomic_close(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_closable(database_path)
+    coordination, registry = _seed_coordination_workspace(
+        commands_module, database_path, tmp_path
+    )
+    _approve(database_path, _payload())
+    calls = []
+
+    def prepare(conn, supplied_registry, **fields):
+        assert supplied_registry is registry
+        assert conn.in_transaction is False
+        assert fields["initiative_id"] == "initiative-1"
+        assert fields["at"] > 0
+        assert json.loads(fields["actor_evidence"]) == {
+            "actor_profile": "default",
+            "session_id": "session-initiative",
+        }
+        assert conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals "
+            "WHERE approval_id='approval-close'"
+        ).fetchone()[0] == "approved"
+        assert conn.execute(
+            "SELECT closed_at FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1' AND task_id IS NULL"
+        ).fetchone()[0] is None
+        calls.append("merge")
+        conn.execute(
+            "UPDATE initiative_coordination_workspace_members SET "
+            "member_state='merged' WHERE workspace_id='coord-initiative-1'"
+        )
+        conn.execute(
+            "UPDATE initiative_coordination_workspaces SET "
+            "lifecycle_state='merged' WHERE workspace_id='coord-initiative-1'"
+        )
+        conn.commit()
+        return coordination.CoordinationWorkspaceStore(conn).read_active(
+            "initiative-1"
+        )
+
+    monkeypatch.setattr(commands_module, "prepare_coordination_closure", prepare)
+
+    def finalize(conn, supplied_registry, project_loader, **fields):
+        assert supplied_registry is registry
+        assert conn.in_transaction is False
+        assert fields["initiative_id"] == "initiative-1"
+        assert conn.execute(
+            "SELECT closed_at FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1' AND task_id IS NULL"
+        ).fetchone()[0] is not None
+        assert conn.execute(
+            "SELECT state FROM write_gate_kanban_approvals "
+            "WHERE approval_id='approval-close'"
+        ).fetchone()[0] == "consumed"
+        calls.append("archive")
+        return {"state": "consumed", "operation_id": "initiative-close-initiative-1"}
+
+    monkeypatch.setattr(commands_module, "finalize_initiative_archive", finalize)
+    result = _submit(
+        commands_module,
+        database_path,
+        provider,
+        "key-coordination-close",
+        workspace_registry=registry,
+    )
+
+    assert result["result"] == "ACCEPTED"
+    assert result["post_commit"]["state"] == "consumed"
+    assert calls == ["merge", "archive"]
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT lifecycle_state FROM initiative_coordination_workspaces"
+        ).fetchone()[0] == "merged"
+        assert conn.execute(
+            "SELECT closed_at FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1' AND task_id IS NULL"
+        ).fetchone()[0] is not None
+
+
+def test_invalid_close_never_starts_coordination_merge(
+    commands_module, tmp_path, monkeypatch
+):
+    database_path, provider = _database(tmp_path, monkeypatch, commands_module)
+    _seed_closable(database_path)
+    _, registry = _seed_coordination_workspace(
+        commands_module, database_path, tmp_path
+    )
+    invalid_payload = dict(_payload(), closure_result_ref="missing-result")
+    _approve(database_path, invalid_payload)
+    calls = []
+    monkeypatch.setattr(
+        commands_module,
+        "prepare_coordination_closure",
+        lambda *args, **kwargs: calls.append("merge"),
+    )
+
+    result = _submit(
+        commands_module,
+        database_path,
+        provider,
+        "key-invalid-coordination-close",
+        payload=invalid_payload,
+        workspace_registry=registry,
+    )
+
+    assert result["result"] == "REJECTED"
+    assert calls == []
+    with sqlite3.connect(database_path) as conn:
+        assert conn.execute(
+            "SELECT lifecycle_state FROM initiative_coordination_workspaces"
+        ).fetchone()[0] == "materialized"

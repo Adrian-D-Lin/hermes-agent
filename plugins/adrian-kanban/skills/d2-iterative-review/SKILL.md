@@ -1,7 +1,7 @@
 ---
 name: d2-iterative-review
 description: Operational guidance for D2 iterative design review.
-version: 0.1.0
+version: 0.2.0
 author: Adrian Lin, Hermes Agent
 license: MIT
 platforms: [linux]
@@ -19,6 +19,18 @@ You are in D2. The D1 draft exists and is committed. Your job is to orchestrate
 independent review passes against the governing corpus, classify what the reviewer
 finds, and route the initiative based on the evidence — not to perform the review
 yourself and not to steer the reviewer toward a dry conclusion.
+
+## Trusted initiative anchor
+
+Before phase work, use the server-issued Session Startup anchor for a top-level
+`default` session, or the trusted dispatch binding for a worker. Verify the
+selected project, `initiative_id`, current phase, coordination workspace ID,
+member repositories, exact derived roots, and binding version against the
+Initiative Tracker. Do not infer them from the session CWD, chat text, display
+title, or filesystem discovery. The controller creates and repairs coordination
+worktrees; work only in the roots in the binding. Concurrent bindings are
+permitted, so refresh repository state before edits and recheck the complete
+diff and HEAD before committing.
 
 ## Your role
 
