@@ -927,12 +927,14 @@ def _materializer_fixture(coordination_modules, tmp_path, monkeypatch):
         repository_identity="repo-1",
         repository_root=str(repository_root.resolve()),
         controlled_worktree_root=str(controlled_root.resolve()),
+        github_repository="Adrian-D-Lin/GRC",
+        integration_branch="main",
     )
     registry = workspace._TrustedRepositoryRegistry((registration,))
     monkeypatch.setattr(
         workspace._SegmentWorkspaceController,
-        "_resolve_origin_main",
-        staticmethod(lambda _root: "a" * 40),
+        "_resolve_integration_head",
+        staticmethod(lambda _registration: "a" * 40),
     )
     return conn, store, registry, repository_root, controlled_root
 
@@ -1483,13 +1485,15 @@ def test_materializer_completes_membership_expansion_without_recreating_existing
                 repository_identity=repository_identity,
                 repository_root=str(repository_root.resolve()),
                 controlled_worktree_root=str(controlled_root.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             )
         )
     registry = workspace._TrustedRepositoryRegistry(tuple(registrations))
     monkeypatch.setattr(
         workspace._SegmentWorkspaceController,
-        "_resolve_origin_main",
-        staticmethod(lambda _root: "a" * 40),
+        "_resolve_integration_head",
+        staticmethod(lambda _registration: "a" * 40),
     )
 
     store.add_planned_members(
@@ -1785,12 +1789,19 @@ def test_coordination_closure_preflights_all_members_before_first_effect(
     registry = workspace._TrustedRepositoryRegistry(
         (
             registration_type(
-                "repo-1", str(repository_root.resolve()), str(controlled_root.resolve())
+                "repo-1", str(repository_root.resolve()), str(controlled_root.resolve()),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
             registration_type(
-                "repo-2", str(repository_root.resolve()), str(controlled_root.resolve())
+                "repo-2", str(repository_root.resolve()), str(controlled_root.resolve()),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
+    )
+    monkeypatch.setattr(
+        workspace._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(lambda _registration: "a" * 40),
     )
 
     class Executor(workspace._GitWorkspaceExecutor):
@@ -2192,6 +2203,8 @@ def test_real_git_phase_delivery_proves_remote_head_and_rejects_untracked(
                 "repo-1",
                 str(repository_root.resolve()),
                 str(controlled_root.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -2325,6 +2338,8 @@ def test_git_archive_executor_exports_changed_files_pushes_and_then_retires(
                 "repo-1",
                 str(repository_root.resolve()),
                 str(controlled_root.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -2399,10 +2414,14 @@ def test_coordination_backfill_preflights_then_creates_only_primary_members(
     registry = workspace._TrustedRepositoryRegistry(
         (
             workspace._RepositoryRegistration(
-                "repo-primary", str(primary.resolve()), str(controlled.resolve())
+                "repo-primary", str(primary.resolve()), str(controlled.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
             workspace._RepositoryRegistration(
-                "repo-secondary", str(secondary.resolve()), str(controlled.resolve())
+                "repo-secondary", str(secondary.resolve()), str(controlled.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -2462,7 +2481,9 @@ def test_coordination_backfill_mapping_failure_writes_nothing(
     registry = workspace._TrustedRepositoryRegistry(
         (
             workspace._RepositoryRegistration(
-                "repo-primary", str(primary.resolve()), str(controlled.resolve())
+                "repo-primary", str(primary.resolve()), str(controlled.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -2501,7 +2522,9 @@ def test_coordination_backfill_path_runner_plans_without_writes_then_applies(
     registry = workspace._TrustedRepositoryRegistry(
         (
             workspace._RepositoryRegistration(
-                "repo-primary", str(primary.resolve()), str(controlled.resolve())
+                "repo-primary", str(primary.resolve()), str(controlled.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )

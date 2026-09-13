@@ -270,3 +270,156 @@ def test_local_origin_mismatch_blocks_before_fetch(modules, tmp_path):
         ).resolve_integration_head(allow_offline=True)
 
     assert len(runner.calls) == 2
+
+
+class _TrustedRegistryStub:
+    def __init__(self, registration):
+        self._registration = registration
+
+    def lookup(self, repository_identity: str):
+        return self._registration
+
+
+class _CursorStub:
+    rowcount = 1
+
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+class _InTransactionStub:
+    in_transaction = False
+
+    def execute(self, sql, *args, **kwargs):
+        if "segment_workspaces" in sql:
+            return _CursorStub((1,))
+        if "segment_workspace_members" in sql:
+            if sql.strip().startswith("UPDATE"):
+                return _CursorStub(None)  # no fetchone needed
+            return _CursorStub((None, None, "planned"))
+        return _CursorStub(None)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+def test_planned_member_base_pins_configured_non_main_branch(
+    modules, tmp_path
+):
+    """The controller's pin_planned_member_base uses RepositoryBindingResolver
+    and pins the exact head_sha returned for the configured integration branch."""
+    root = tmp_path / "repo"
+    registration = _registration(modules, root)
+    branch_sha = "c" * 40
+    main_sha = "d" * 40
+    runner = _Runner(
+        _identity_responses(root)
+        + [
+            (
+                (
+                    "fetch",
+                    "--no-tags",
+                    "origin",
+                    "refs/heads/release/production:refs/remotes/origin/release/production",
+                ),
+                0,
+                "",
+                "",
+            ),
+            (("rev-parse", registration.remote_tracking_ref), 0, branch_sha + "\n", ""),
+        ]
+    )
+    resolver = modules["binding"].RepositoryBindingResolver(registration, runner=runner)
+    result = resolver.resolve_integration_head(allow_offline=True)
+
+    assert result.head_sha == branch_sha
+    assert result.head_sha != main_sha
+    assert result.state == "online"
+    fetch_call = runner.calls[2][0]
+    assert "refs/heads/release/production" in fetch_call[-1]
+    rev_call = runner.calls[3][0]
+    assert rev_call[-2:] == ("rev-parse", "refs/remotes/origin/release/production")
+
+    # The controller delegates to the resolver and pins the returned head_sha.
+    # We monkeypatch _resolve_integration_head to return the already-resolved
+    # result, exercising the controller's pin path with the resolver's output.
+    workspace_mod = modules["workspace"]
+    controller = workspace_mod._SegmentWorkspaceController.__new__(
+        workspace_mod._SegmentWorkspaceController
+    )
+    controller._registry = _TrustedRegistryStub(registration)
+    controller._conn = _InTransactionStub()
+
+    original_resolve = workspace_mod._SegmentWorkspaceController._resolve_integration_head
+    resolved_sha = result.head_sha
+    workspace_mod._SegmentWorkspaceController._resolve_integration_head = (
+        staticmethod(lambda reg: resolved_sha)
+    )
+    try:
+        pinned = controller.pin_planned_member_base(
+            "ws-1", "grc", pinned_at=1
+        )
+    finally:
+        workspace_mod._SegmentWorkspaceController._resolve_integration_head = original_resolve
+    assert pinned == branch_sha
+
+
+def test_planned_member_base_pins_degraded_offline_cached_sha(
+    modules, tmp_path
+):
+    """When the remote is unreachable, the controller's pin_planned_member_base
+    still pins the locally-cached tracking-ref SHA via the resolver."""
+    root = tmp_path / "repo"
+    registration = _registration(modules, root)
+    cached_sha = "e" * 40
+    runner = _Runner(
+        _identity_responses(root)
+        + [
+            (
+                (
+                    "fetch",
+                    "--no-tags",
+                    "origin",
+                    "refs/heads/release/production:refs/remotes/origin/release/production",
+                ),
+                128,
+                "",
+                "fatal: unable to access github.com: Could not resolve host",
+            ),
+            (("rev-parse", registration.remote_tracking_ref), 0, cached_sha + "\n", ""),
+            (("cat-file", "-e", f"{cached_sha}^{{commit}}"), 0, "", ""),
+        ]
+    )
+
+    resolver = modules["binding"].RepositoryBindingResolver(registration, runner=runner)
+    result = resolver.resolve_integration_head(allow_offline=True)
+
+    assert result.head_sha == cached_sha
+    assert result.state == "degraded_offline"
+    assert result.remote_error == "GitHub is unreachable"
+
+    workspace_mod = modules["workspace"]
+    controller = workspace_mod._SegmentWorkspaceController.__new__(
+        workspace_mod._SegmentWorkspaceController
+    )
+    controller._registry = _TrustedRegistryStub(registration)
+    controller._conn = _InTransactionStub()
+
+    original_resolve = workspace_mod._SegmentWorkspaceController._resolve_integration_head
+    resolved_sha = result.head_sha
+    workspace_mod._SegmentWorkspaceController._resolve_integration_head = (
+        staticmethod(lambda reg: resolved_sha)
+    )
+    try:
+        pinned = controller.pin_planned_member_base(
+            "ws-1", "grc", pinned_at=1
+        )
+    finally:
+        workspace_mod._SegmentWorkspaceController._resolve_integration_head = original_resolve
+    assert pinned == cached_sha

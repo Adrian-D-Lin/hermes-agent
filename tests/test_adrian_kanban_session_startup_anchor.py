@@ -68,6 +68,8 @@ def _registry(workspace: ModuleType, root: Path, *, duplicate: bool = False):
             repository_identity="repo-1",
             repository_root=str(root),
             controlled_worktree_root=str(root.parent / "worktrees"),
+            github_repository="Adrian-D-Lin/GRC",
+            integration_branch="main",
         )
     ]
     if duplicate:
@@ -76,6 +78,8 @@ def _registry(workspace: ModuleType, root: Path, *, duplicate: bool = False):
                 repository_identity="repo-2",
                 repository_root=str(root),
                 controlled_worktree_root=str(root.parent / "worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             )
         )
     return workspace._TrustedRepositoryRegistry(tuple(registrations))
