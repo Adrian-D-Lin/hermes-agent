@@ -1963,8 +1963,26 @@ def run_conversation(
     if _admission is not None:
         _action = _admission.get("action")
         if _action == "respond":
+            # Admission responses are real user-visible replies even though
+            # they deliberately bypass the model turn and transcript
+            # persistence (for example, Session Startup project/initiative
+            # selection).  Stream the response through the same callback as a
+            # model answer before returning the authoritative final response.
+            #
+            # Desktop uses receipt of an assistant payload to distinguish a
+            # locally completed turn from one that needs durable-history
+            # hydration.  Returning only ``final_response`` made a fast
+            # intercepted turn look payload-free, so Desktop immediately
+            # hydrated the intentionally empty persisted transcript and
+            # blanked the selection dialogue.
+            _response = _admission["result"].get("final_response")
+            if stream_callback is not None and isinstance(_response, str) and _response:
+                stream_callback(_response)
             return _admission["result"]
         if _action == "fail":
+            _response = _admission["result"].get("final_response")
+            if stream_callback is not None and isinstance(_response, str) and _response:
+                stream_callback(_response)
             return _admission["result"]
         if _action == "rewrite":
             user_message = _admission["model_message"]
