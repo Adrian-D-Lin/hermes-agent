@@ -180,8 +180,47 @@ def test_conversation_loop_responds_before_turn_context(monkeypatch):
         raise AssertionError("turn setup must not run for an intercepted response")
 
     monkeypatch.setattr(conversation_loop, "build_turn_context", forbidden)
-    result = conversation_loop.run_conversation(agent, "opening prompt")
+    streamed = []
+    result = conversation_loop.run_conversation(
+        agent,
+        "opening prompt",
+        stream_callback=streamed.append,
+    )
 
     assert result["final_response"] == "1. Project Alpha"
     assert result["api_calls"] == 0
     assert agent._pending_cli_user_message is None
+    assert streamed == ["1. Project Alpha"]
+
+
+def test_conversation_loop_streams_fail_closed_response_before_turn_context(monkeypatch):
+    concurrent_logging = ModuleType("concurrent_log_handler")
+    concurrent_logging.ConcurrentRotatingFileHandler = RotatingFileHandler
+    monkeypatch.setitem(sys.modules, "concurrent_log_handler", concurrent_logging)
+    from agent import conversation_loop
+
+    agent = _agent(_pending_cli_user_message={"content": "opening prompt"})
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _name: True)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda *_args, **_kwargs: [
+            {"action": "fail_closed", "response": "Startup policy failed closed."}
+        ],
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("turn setup must not run for a failed admission")
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", forbidden)
+    streamed = []
+    result = conversation_loop.run_conversation(
+        agent,
+        "opening prompt",
+        stream_callback=streamed.append,
+    )
+
+    assert result["final_response"] == "Startup policy failed closed."
+    assert result["failed"] is True
+    assert result["api_calls"] == 0
+    assert agent._pending_cli_user_message is None
+    assert streamed == ["Startup policy failed closed."]
