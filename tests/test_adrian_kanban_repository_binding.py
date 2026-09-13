@@ -309,6 +309,40 @@ class _InTransactionStub:
         pass
 
 
+def test_controller_resolves_registered_integration_head_with_offline_allowed(
+    modules, tmp_path, monkeypatch
+):
+    workspace_mod = modules["workspace"]
+    registration = _registration(modules, tmp_path / "repo")
+    expected_sha = "b" * 40
+    observed = {}
+
+    class _ResolverStub:
+        def __init__(self, candidate):
+            observed["registration"] = candidate
+
+        def resolve_integration_head(self, *, allow_offline):
+            observed["allow_offline"] = allow_offline
+            return type("Result", (), {"head_sha": expected_sha})()
+
+    monkeypatch.setattr(
+        workspace_mod,
+        "RepositoryBindingResolver",
+        _ResolverStub,
+    )
+
+    assert (
+        workspace_mod._SegmentWorkspaceController._resolve_integration_head(
+            registration
+        )
+        == expected_sha
+    )
+    assert observed == {
+        "registration": registration,
+        "allow_offline": True,
+    }
+
+
 def test_planned_member_base_pins_configured_non_main_branch(
     modules, tmp_path
 ):
