@@ -13,6 +13,7 @@ from typing import Any
 
 from .attachments import PreparedAttachment, prepare_url_attachment
 from .phase_admission import prepare_phase_result
+from .phase_delivery import PhaseDeliveryError, verify_transition_delivery
 from .purge_cleanup import execute_cleanup
 from .rejection_audit import record_rejection
 from .capability import CapabilityBinding
@@ -3465,6 +3466,7 @@ class _CommandContext:
         prepared_segment_manifest: PreparedSegmentManifest | None = None,
         prepared_successor_manifest: PreparedManifest | None = None,
         prepared_phase_result: Any = None,
+        prepared_transition_delivery: Any = None,
         initial_authorizer: Any = None,
         override_now: Any = None,
         workspace_registry: _TrustedRepositoryRegistry | None = None,
@@ -3486,6 +3488,7 @@ class _CommandContext:
         self.prepared_segment_manifest = prepared_segment_manifest
         self.prepared_successor_manifest = prepared_successor_manifest
         self.prepared_phase_result = prepared_phase_result
+        self.prepared_transition_delivery = prepared_transition_delivery
         self.initial_authorizer = initial_authorizer
         self.override_now = override_now
         self.workspace_registry = workspace_registry
@@ -3885,6 +3888,7 @@ class _CommandBoundary:
 
             prepared_attachment = None
             prepared_phase_result = None
+            prepared_transition_delivery = None
             if action == "kanban_update_initiative":
                 prepared_phase_result = prepare_phase_result(
                     payload,
@@ -3998,6 +4002,41 @@ class _CommandBoundary:
                     workspace_registry=self._workspace_registry,
                 )
                 preflight_result = _preflight_transition_initiative(preflight_context)
+                if self._workspace_registry is not None:
+                    try:
+                        prepared_transition_delivery = verify_transition_delivery(
+                            conn,
+                            self._workspace_registry,
+                            initiative_id=preflight_result["initiative_id"],
+                            from_phase=preflight_result["from_phase"],
+                            from_segment_id=preflight_result["from_segment_id"],
+                            phase_close_ref=preflight_result["phase_close_ref"],
+                        )
+                    except (PhaseDeliveryError, _WorkspaceRejected, ValueError) as exc:
+                        raise CommandRejected(
+                            failed_checks=(
+                                FailedCheck(
+                                    code="TRANSITION_DELIVERY_NOT_PUBLISHED",
+                                    target="phase workspace",
+                                    expected=(
+                                        "a clean assigned worktree whose complete phase-closing "
+                                        "commit is published to its assigned remote branch"
+                                    ),
+                                    observed=str(exc),
+                                    accepted_format=(
+                                        "clean worktree + verified branch/HEAD + accepted phase "
+                                        "result + remote containment"
+                                    ),
+                                    remediation=(
+                                        "review the complete diff, commit and push every intended "
+                                        "phase change, refresh the Tracker evidence, then retry the "
+                                        "same transition"
+                                    ),
+                                    responsible_actor="orchestrator",
+                                    retry="same_operation",
+                                ),
+                            ),
+                        ) from None
                 if preflight_result["to_phase"] == "DEV2":
                     if self._workspace_registry is None:
                         raise ValueError(
@@ -4118,6 +4157,7 @@ class _CommandBoundary:
                         prepared_segment_manifest=prepared_segment_manifest,
                         prepared_successor_manifest=prepared_successor_manifest,
                         prepared_phase_result=prepared_phase_result,
+                        prepared_transition_delivery=prepared_transition_delivery,
                         initial_authorizer=fields.get("initial_authorizer"),
                         override_now=fields.get("override_now"),
                         workspace_registry=self._workspace_registry,
@@ -4206,6 +4246,7 @@ class _CommandBoundary:
                     prepared_segment_manifest=prepared_segment_manifest,
                     prepared_successor_manifest=prepared_successor_manifest,
                     prepared_phase_result=prepared_phase_result,
+                    prepared_transition_delivery=prepared_transition_delivery,
                     initial_authorizer=fields.get("initial_authorizer"),
                     override_now=fields.get("override_now"),
                     workspace_registry=self._workspace_registry,

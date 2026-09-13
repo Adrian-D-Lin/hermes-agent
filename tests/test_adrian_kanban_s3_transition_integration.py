@@ -241,6 +241,9 @@ def test_dev2_transition_preflights_then_materializes_before_mutation_transactio
         events.append("preflight")
         return {
             "initiative_id": "initiative-1",
+            "from_phase": "DEV1",
+            "from_segment_id": None,
+            "phase_close_ref": "close-dev2",
             "to_phase": "DEV2",
             "to_segment_id": "S1",
         }
@@ -264,6 +267,16 @@ def test_dev2_transition_preflights_then_materializes_before_mutation_transactio
     )
     monkeypatch.setattr(
         commands_module, "_materialize_segment_workspace", materialize
+    )
+    monkeypatch.setattr(
+        commands_module,
+        "verify_transition_delivery",
+        lambda *_args, **_kwargs: {
+            "workspace_id": "coordination-1",
+            "phase": "DEV1",
+            "segment_id": None,
+            "phase_close_ref": "close-dev2",
+        },
     )
     boundary = commands_module._CommandBoundary(
         database_path=str(c.path),
@@ -364,6 +377,16 @@ def test_real_dev1_to_dev2_transition_materializes_then_commits_exact_segment(
                 controlled_worktree_root=str(controlled_root),
             ),
         )
+    )
+    monkeypatch.setattr(
+        commands_module,
+        "verify_transition_delivery",
+        lambda *_args, **_kwargs: {
+            "workspace_id": "coordination-1",
+            "phase": "DEV1",
+            "segment_id": None,
+            "phase_close_ref": "dev1-close",
+        },
     )
     definitions = [
         {"segment_id": "S1", "ordinal": 1, "dependency_ids": []},

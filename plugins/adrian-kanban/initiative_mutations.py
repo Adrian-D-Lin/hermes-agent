@@ -1617,6 +1617,18 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
     predecessor_id = preflight["predecessor_id"]
     from_phase = preflight["from_phase"]
     from_segment_id = preflight["from_segment_id"]
+    delivery_proof = getattr(context, "prepared_transition_delivery", None)
+    if getattr(context, "workspace_registry", None) is not None:
+        if not isinstance(delivery_proof, dict):
+            raise ValueError("prepared transition delivery proof is required")
+        if delivery_proof.get("workspace_id") is None:
+            raise ValueError("prepared transition delivery workspace_id is required")
+        if delivery_proof.get("phase") != from_phase:
+            raise ValueError("prepared transition delivery phase mismatch")
+        if delivery_proof.get("segment_id") != from_segment_id:
+            raise ValueError("prepared transition delivery segment mismatch")
+        if delivery_proof.get("phase_close_ref") != phase_close_ref:
+            raise ValueError("prepared transition delivery phase_close_ref mismatch")
     _consume_approval(
         context.connection,
         context,
@@ -1636,14 +1648,17 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
         sort_keys=True,
         separators=(",", ":"),
     )
+    transition_payload = {
+        "from_phase": from_phase,
+        "from_segment_id": from_segment_id,
+        "to_phase": to_phase,
+        "to_segment_id": to_segment_id,
+        "phase_close_ref": phase_close_ref,
+    }
+    if delivery_proof is not None:
+        transition_payload["delivery_proof"] = delivery_proof
     canonical_payload = json.dumps(
-        {
-            "from_phase": from_phase,
-            "from_segment_id": from_segment_id,
-            "to_phase": to_phase,
-            "to_segment_id": to_segment_id,
-            "phase_close_ref": phase_close_ref,
-        },
+        transition_payload,
         sort_keys=True,
         separators=(",", ":"),
     )

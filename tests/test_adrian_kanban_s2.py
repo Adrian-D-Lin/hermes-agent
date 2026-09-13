@@ -89,7 +89,7 @@ def _binding(module, **changes):
         "canonical_digest": "sha256:task-payload",
         "session_id": "session-1",
         "workspace_id": "workspace-1",
-        "plugin_version": "0.4.0",
+        "plugin_version": "0.4.1",
         "protocol_version": "2",
         "execution_context": "run-1",
     }

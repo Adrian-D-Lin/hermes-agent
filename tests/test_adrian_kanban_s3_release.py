@@ -109,7 +109,7 @@ def test_release_manifest_is_canonical_deterministic_and_round_trips(
 
     assert same.payload == manifest.payload
     assert same.digest == manifest.digest
-    assert manifest.release_id.startswith("adrian-kanban-0.4.0-")
+    assert manifest.release_id.startswith("adrian-kanban-0.4.1-")
     manifest_path = (tmp_path / "release-manifest.json").resolve()
     manifest_module.write_release_manifest(manifest, manifest_path)
     assert manifest_path.read_text(encoding="utf-8") == manifest.payload

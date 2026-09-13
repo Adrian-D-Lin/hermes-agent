@@ -176,7 +176,7 @@ def test_manifest_and_runtime_share_one_release_identity(package):
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
 
     assert package.PLUGIN_NAME == "adrian-kanban"
-    assert package.PLUGIN_VERSION == versioning.PLUGIN_VERSION == "0.4.0"
+    assert package.PLUGIN_VERSION == versioning.PLUGIN_VERSION == "0.4.1"
     assert manifest["name"] == package.PLUGIN_NAME
     assert manifest["version"] == package.PLUGIN_VERSION
     assert manifest["kind"] == "standalone"

@@ -45,6 +45,9 @@ def coordination_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "freshness": importlib.import_module(
             f"{package.__name__}.coordination_freshness"
         ),
+        "phase_delivery": importlib.import_module(
+            f"{package.__name__}.phase_delivery"
+        ),
         "closure": importlib.import_module(
             f"{package.__name__}.coordination_closure"
         ),
@@ -1100,6 +1103,135 @@ def test_freshness_controller_confirms_unexplained_local_advancement_once(
         conn.close()
 
 
+def test_freshness_controller_surfaces_dirty_state_without_blocking_active_work(
+    coordination_modules, tmp_path, monkeypatch
+):
+    freshness_module = coordination_modules["freshness"]
+    workspace = coordination_modules["workspace"]
+    conn, _, registry, _, _ = _materializer_fixture(
+        coordination_modules, tmp_path, monkeypatch
+    )
+    _mark_workspace_materialized(conn)
+    confirmations = []
+
+    class DirtyExecutor(workspace._GitWorkspaceExecutor):
+        def inspect_freshness(self, member):
+            return _freshness_result(
+                workspace,
+                member,
+                local="c" * 40,
+                remote="a" * 40,
+                remote_ancestor_local=True,
+                ready=False,
+                failures=("worktree_dirty",),
+            )
+
+    try:
+        result = freshness_module.CoordinationFreshnessController(
+            conn,
+            registry,
+            DirtyExecutor(),
+            advancement_confirmer=lambda items: confirmations.append(items) or True,
+        ).reconcile(
+            initiative_id="init-1", actor_evidence="session:sess-1", at=30
+        )
+        assert result["members"][0]["observed_head"] == "b" * 40
+        assert confirmations == []
+        assert result["freshness_actions"] == [
+            {
+                "repository_identity": "repo-1",
+                "action": "dirty_observed",
+                "recorded_head": "b" * 40,
+                "local_head": "c" * 40,
+                "remote_head": "a" * 40,
+            }
+        ]
+    finally:
+        conn.close()
+
+
+def test_phase_delivery_requires_clean_published_coordination_head(
+    coordination_modules, tmp_path, monkeypatch
+):
+    delivery = coordination_modules["phase_delivery"]
+    workspace = coordination_modules["workspace"]
+    conn, _, registry, repository_root, _ = _materializer_fixture(
+        coordination_modules, tmp_path, monkeypatch
+    )
+    _mark_workspace_materialized(conn)
+
+    class Executor(workspace._GitWorkspaceExecutor):
+        def __init__(self, status="", remote_head="b" * 40):
+            super().__init__()
+            self.status = status
+            self.remote_head = remote_head
+
+        def verify(self, member):
+            return workspace._MemberVerification(
+                member.repository_identity,
+                member.target_path,
+                "b" * 40,
+                True,
+                True,
+                str(repository_root.resolve()),
+                True,
+                (),
+            )
+
+        def _git(self, cwd, *args, allowed_returncodes=(0,)):
+            if args == ("status", "--porcelain", "--untracked-files=all"):
+                return self.status
+            if args == ("fetch", "--no-tags", "origin"):
+                return ""
+            if args == (
+                "rev-parse",
+                "refs/remotes/origin/initiative/init-1/coordination/repo-1",
+            ):
+                return self.remote_head
+            raise AssertionError(args)
+
+        def _is_ancestor(self, cwd, ancestor, descendant):
+            return True
+
+    try:
+        proof = delivery.verify_transition_delivery(
+            conn,
+            registry,
+            initiative_id="init-1",
+            from_phase="D1",
+            from_segment_id=None,
+            phase_close_ref="phase-close-1",
+            executor=Executor(),
+        )
+        assert proof["clean_including_untracked"] is True
+        assert proof["members"][0]["head"] == "b" * 40
+        assert proof["members"][0]["remote_head"] == "b" * 40
+
+        with pytest.raises(delivery.PhaseDeliveryError, match="worktree is dirty"):
+            delivery.verify_transition_delivery(
+                conn,
+                registry,
+                initiative_id="init-1",
+                from_phase="D1",
+                from_segment_id=None,
+                phase_close_ref="phase-close-1",
+                executor=Executor(status="?? uncommitted.txt"),
+            )
+
+        with pytest.raises(delivery.PhaseDeliveryError, match="not the published"):
+            delivery.verify_transition_delivery(
+                conn,
+                registry,
+                initiative_id="init-1",
+                from_phase="D1",
+                from_segment_id=None,
+                phase_close_ref="phase-close-1",
+                executor=Executor(remote_head="c" * 40),
+            )
+    finally:
+        conn.close()
+
+
 def test_freshness_controller_decline_and_divergence_leave_tracker_unchanged(
     coordination_modules, tmp_path, monkeypatch
 ):
@@ -2016,6 +2148,98 @@ def _git(cwd: Path, *args: str, text: bool = True):
     )
     assert result.returncode == 0, result.stderr
     return result.stdout
+
+
+def test_real_git_phase_delivery_proves_remote_head_and_rejects_untracked(
+    coordination_modules, tmp_path
+):
+    delivery = coordination_modules["phase_delivery"]
+    coordination = coordination_modules["coordination"]
+    schema = coordination_modules["schema"]
+    workspace = coordination_modules["workspace"]
+
+    remote = tmp_path / "delivery-remote.git"
+    repository_root = tmp_path / "delivery-repository"
+    controlled_root = tmp_path / "delivery-worktrees"
+    remote.mkdir()
+    repository_root.mkdir()
+    controlled_root.mkdir()
+    _git(remote, "init", "--bare")
+    _git(repository_root, "init", "-b", "main")
+    _git(repository_root, "config", "user.name", "Delivery Test")
+    _git(repository_root, "config", "user.email", "delivery@example.invalid")
+    (repository_root / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repository_root, "add", "README.md")
+    _git(repository_root, "commit", "-m", "base")
+    _git(repository_root, "remote", "add", "origin", str(remote))
+    _git(repository_root, "push", "-u", "origin", "main")
+    base_head = _git(repository_root, "rev-parse", "HEAD").strip()
+
+    branch = "initiative/init-1/coordination/repo-1"
+    target = controlled_root / "init-1" / "coordination" / "repo-1"
+    target.parent.mkdir(parents=True)
+    _git(repository_root, "worktree", "add", "-b", branch, str(target), base_head)
+    (target / "delivered.txt").write_text("delivered\n", encoding="utf-8")
+    _git(target, "add", "delivered.txt")
+    _git(target, "commit", "-m", "deliver phase")
+    _git(target, "push", "-u", "origin", branch)
+    delivered_head = _git(target, "rev-parse", "HEAD").strip()
+
+    conn = _connect(tmp_path / "delivery.sqlite3", schema)
+    registry = workspace._TrustedRepositoryRegistry(
+        (
+            workspace._RepositoryRegistration(
+                "repo-1",
+                str(repository_root.resolve()),
+                str(controlled_root.resolve()),
+            ),
+        )
+    )
+    store = coordination.CoordinationWorkspaceStore(conn)
+    planned = store.plan_or_read(
+        initiative_id="init-1",
+        project_id="project-1",
+        repository_identity="repo-1",
+        controller_binding_ref="tracker:board-1:init-1",
+        planned_at=10,
+    )
+    conn.execute(
+        "UPDATE initiative_coordination_workspaces SET lifecycle_state='materialized' "
+        "WHERE workspace_id=?",
+        (planned["workspace_id"],),
+    )
+    conn.execute(
+        "UPDATE initiative_coordination_workspace_members SET "
+        "required_base_sha=?, observed_head=?, member_state='materialized' "
+        "WHERE workspace_id=? AND repository_identity='repo-1'",
+        (base_head, delivered_head, planned["workspace_id"]),
+    )
+    conn.commit()
+
+    try:
+        proof = delivery.verify_transition_delivery(
+            conn,
+            registry,
+            initiative_id="init-1",
+            from_phase="D1",
+            from_segment_id=None,
+            phase_close_ref="phase-close-1",
+        )
+        assert proof["members"][0]["head"] == delivered_head
+        assert proof["members"][0]["remote_head"] == delivered_head
+
+        (target / "untracked.txt").write_text("not delivered\n", encoding="utf-8")
+        with pytest.raises(delivery.PhaseDeliveryError, match="worktree is dirty"):
+            delivery.verify_transition_delivery(
+                conn,
+                registry,
+                initiative_id="init-1",
+                from_phase="D1",
+                from_segment_id=None,
+                phase_close_ref="phase-close-1",
+            )
+    finally:
+        conn.close()
 
 
 def test_git_archive_executor_exports_changed_files_pushes_and_then_retires(

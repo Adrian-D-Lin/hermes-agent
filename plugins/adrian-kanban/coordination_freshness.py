@@ -119,7 +119,20 @@ class CoordinationFreshnessController:
                     "freshness inspection failed for "
                     f"{ws_member.repository_identity}: {exc}"
                 ) from exc
-            if not freshness.ready:
+            # A dirty worktree is expected while an admitted phase is being
+            # worked.  It is evidence to surface, not a reason to revoke an
+            # already valid session binding.  Every other freshness failure
+            # remains blocking here; cleanliness is enforced at the phase
+            # transition/merge/closure boundary.
+            blocking_failures = tuple(
+                failure
+                for failure in freshness.failures
+                if failure != "worktree_dirty"
+            )
+            if blocking_failures or (
+                not freshness.ready
+                and freshness.failures != ("worktree_dirty",)
+            ):
                 raise CoordinationFreshnessError(
                     f"member {ws_member.repository_identity} is not ready: "
                     f"{freshness.failures}"
@@ -150,14 +163,15 @@ class CoordinationFreshnessController:
                     category = "already_recorded"
                 else:
                     category = "local_advancement"
-                    unexplained.append(
-                        {
-                            "repository_identity": ws_member.repository_identity,
-                            "recorded_head": recorded,
-                            "local_head": local,
-                            "remote_head": remote,
-                        }
-                    )
+                    if freshness.clean_including_untracked:
+                        unexplained.append(
+                            {
+                                "repository_identity": ws_member.repository_identity,
+                                "recorded_head": recorded,
+                                "local_head": local,
+                                "remote_head": remote,
+                            }
+                        )
             else:
                 raise CoordinationFreshnessError(
                     f"member {ws_member.repository_identity}: genuine divergence "
@@ -167,6 +181,7 @@ class CoordinationFreshnessController:
                 {
                     "ws_member": ws_member,
                     "category": category,
+                    "dirty": not freshness.clean_including_untracked,
                     "recorded": recorded,
                     "local": local,
                     "remote": remote,
@@ -194,11 +209,28 @@ class CoordinationFreshnessController:
         for classification in classifications:
             ws_member = classification["ws_member"]
             category = classification["category"]
+            dirty = classification["dirty"]
             recorded = classification["recorded"]
             local = classification["local"]
             remote = classification["remote"]
             repository_identity = ws_member.repository_identity
             current_base = ws_member.required_base_sha
+
+            if dirty:
+                # Never mutate Git or advance Tracker head/base evidence while
+                # uncommitted work exists.  A later clean revalidation can
+                # reconcile it safely; the transition gate will reject until
+                # then.
+                actions.append(
+                    {
+                        "repository_identity": repository_identity,
+                        "action": "dirty_observed",
+                        "recorded_head": recorded,
+                        "local_head": local,
+                        "remote_head": remote,
+                    }
+                )
+                continue
 
             if category == "remote_only_ff":
                 self._perform_fast_forward(

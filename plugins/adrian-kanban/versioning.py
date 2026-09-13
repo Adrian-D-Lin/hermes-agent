@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 PLUGIN_NAME = "adrian-kanban"
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.4.1"
 PROTOCOL_VERSION = "2"
 SCHEMA_VERSION = "1"
 REGISTRY_VERSION = "v0.28-s2-1"
