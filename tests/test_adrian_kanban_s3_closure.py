@@ -306,6 +306,8 @@ def _seed_coordination_workspace(commands_module, database_path, tmp_path):
                 repository_identity="repo-1",
                 repository_root=str(repository_root.resolve()),
                 controlled_worktree_root=str(controlled_root.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )

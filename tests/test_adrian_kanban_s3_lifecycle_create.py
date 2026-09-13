@@ -593,7 +593,9 @@ def test_segment_lifecycle_create_derives_shared_segment_directory(
     registry = workspace._TrustedRepositoryRegistry(
         (
             workspace._RepositoryRegistration(
-                "repo-1", str(repository), str(shared_root)
+                "repo-1", str(repository), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )

@@ -47,8 +47,18 @@ def _workspace_case(commands_module, tmp_path, monkeypatch):
                 repository_identity="repo-1",
                 repository_root=str(repository),
                 controlled_worktree_root=str(controlled_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
+    )
+    monkeypatch.setattr(
+        workspace._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(lambda _registration: subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "origin/main"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()),
     )
     with sqlite3.connect(path) as conn:
         conn.execute(

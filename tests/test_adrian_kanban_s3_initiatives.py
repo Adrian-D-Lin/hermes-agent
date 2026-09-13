@@ -1119,6 +1119,8 @@ def _coordination_registry(commands_module, tmp_path: Path):
                 repository_identity=repository_id,
                 repository_root=str(repository_root.resolve()),
                 controlled_worktree_root=str(controlled_root.resolve()),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             )
         )
     return workspace._TrustedRepositoryRegistry(tuple(registrations))
