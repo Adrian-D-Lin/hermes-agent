@@ -29,7 +29,7 @@
   padding: 6px 12px;
   border: 1px solid var(--color-border, #cbd2d9);
   border-radius: 6px;
-  background: #102f57;
+  background: #1a1b1f;
   color: var(--color-foreground, #f8fafc);
   font-size: 0.9rem;
   cursor: pointer;
@@ -40,7 +40,7 @@
   padding: 6px 12px;
   border: 1px solid var(--color-border, #cbd2d9);
   border-radius: 6px;
-  background: #102f57;
+  background: #1a1b1f;
   color: var(--color-foreground, #f8fafc);
   cursor: pointer;
 }
@@ -48,7 +48,7 @@
 .adrian-kanban-project-selector:hover,
 .adrian-kanban-refresh:hover,
 .adrian-kanban-mutation:hover:not(:disabled) {
-  background: #163b68;
+  background: #2e3138;
 }
 
 .adrian-kanban-mutations {
@@ -163,7 +163,7 @@
   border: 1px solid var(--color-border, #d9e2ec);
   border-radius: 6px;
   padding: 8px;
-  background: #0b2545;
+  background: #040F20;
   color: var(--color-foreground, #f8fafc);
 }
 
@@ -191,7 +191,7 @@
   padding: 0 6px;
   border: 1px solid var(--color-border, #d9e2ec);
   border-radius: 4px;
-  background: #102f57;
+  background: #1a1b1f;
   color: var(--color-foreground, #f8fafc);
   cursor: pointer;
   white-space: nowrap;
@@ -303,7 +303,7 @@
 .adrian-kanban-detail-panel {
   width: 100%;
   max-width: 640px;
-  background: #0b2545;
+  background: #040F20;
   color: var(--color-foreground, #f8fafc);
   border: 1px solid var(--color-border, #d9e2ec);
   border-radius: 8px;
@@ -332,13 +332,13 @@
   padding: 4px 10px;
   border: 1px solid var(--color-border, #cbd2d9);
   border-radius: 6px;
-  background: #102f57;
+  background: #1a1b1f;
   color: var(--color-foreground, #f8fafc);
   cursor: pointer;
 }
 
 .adrian-kanban-detail-close:hover {
-  background: #163b68;
+  background: #2e3138;
 }
 
 .adrian-kanban-detail-body {
@@ -373,7 +373,7 @@
   border: 1px solid var(--color-border, #d9e2ec);
   border-radius: 6px;
   padding: 6px 10px;
-  background: #0b2545;
+  background: #040F20;
   color: var(--color-foreground, #f8fafc);
   user-select: text;
   -webkit-user-select: text;
@@ -401,7 +401,7 @@
   margin-top: 6px;
   padding: 6px;
   border-radius: 4px;
-  background: #102f57;
+  background: #1a1b1f;
   color: var(--color-foreground, #f8fafc);
   font-size: 0.8rem;
   overflow-wrap: anywhere;
