@@ -56,11 +56,25 @@ def _trusted_repository_registry_getter():
                 f"kanban.repository_registry.{repository_id}.repository_root "
                 "must be an absolute path"
             )
+        github_repository = entry.get("github_repository")
+        if not isinstance(github_repository, str) or not github_repository.strip():
+            raise ValueError(
+                f"kanban.repository_registry.{repository_id}.github_repository "
+                "must be nonblank"
+            )
+        integration_branch = entry.get("integration_branch")
+        if not isinstance(integration_branch, str) or not integration_branch.strip():
+            raise ValueError(
+                f"kanban.repository_registry.{repository_id}.integration_branch "
+                "must be nonblank"
+            )
         registrations.append(
             _RepositoryRegistration(
                 repository_identity=repository_id,
                 repository_root=resolved_root,
                 controlled_worktree_root=shared_root,
+                github_repository=github_repository,
+                integration_branch=integration_branch,
             )
         )
     return _TrustedRepositoryRegistry(tuple(registrations))

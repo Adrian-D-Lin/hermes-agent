@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from .journal import ExternalOperationJournal, JournalIntent, JournalRejected
+from .repository_binding import normalize_github_repository
 
 __all__ = ()
 
@@ -55,16 +56,66 @@ def _validate_bool(value, name):
     return value
 
 
+def _validate_integration_branch(value, name):
+    if not isinstance(value, str):
+        raise _WorkspaceRejected(f"{name} must be str")
+    if not value.strip():
+        raise _WorkspaceRejected(f"{name} must be nonblank")
+    if value != value.strip():
+        raise _WorkspaceRejected(f"{name} must not have leading/trailing whitespace")
+    if any(ord(c) < 32 or c.isspace() for c in value):
+        raise _WorkspaceRejected(
+            f"{name} must not contain whitespace or control characters"
+        )
+    if value.startswith("/") or value.endswith("/") or "//" in value:
+        raise _WorkspaceRejected(f"{name} contains an invalid slash")
+    if ".." in value:
+        raise _WorkspaceRejected(f"{name} must not contain ..")
+    if any(c in value for c in "~^:?*[\\"):
+        raise _WorkspaceRejected(f"{name} contains invalid characters")
+    if value == "@" or "@{" in value:
+        raise _WorkspaceRejected(f"{name} contains invalid @ syntax")
+    if value.endswith(".") or any(
+        part.endswith(".lock") for part in value.split("/")
+    ):
+        raise _WorkspaceRejected(f"{name} has an invalid suffix")
+    return value
+
+
 @dataclass(frozen=True)
 class _RepositoryRegistration:
     repository_identity: str
     repository_root: str
     controlled_worktree_root: str
+    github_repository: str
+    integration_branch: str
 
     def __post_init__(self):
         _validate_nonblank_str(self.repository_identity, "repository_identity")
         _validate_absolute_str(self.repository_root, "repository_root")
         _validate_absolute_str(self.controlled_worktree_root, "controlled_worktree_root")
+        object.__setattr__(
+            self,
+            "github_repository",
+            normalize_github_repository(self.github_repository),
+        )
+        _validate_integration_branch(self.integration_branch, "integration_branch")
+
+    @property
+    def canonical_ssh_url(self):
+        return f"git@github.com:{self.github_repository}.git"
+
+    @property
+    def remote_branch_ref(self):
+        return f"refs/heads/{self.integration_branch}"
+
+    @property
+    def remote_tracking_ref(self):
+        return f"refs/remotes/origin/{self.integration_branch}"
+
+    @property
+    def remote_label(self):
+        return f"origin/{self.integration_branch}"
 
 
 @dataclass(frozen=True)
