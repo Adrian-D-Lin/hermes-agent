@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from .journal import ExternalOperationJournal, JournalIntent, JournalRejected
-from .repository_binding import normalize_github_repository
+from .repository_binding import RepositoryBindingError, RepositoryBindingResolver, normalize_github_repository
 
 __all__ = ()
 
@@ -338,28 +338,17 @@ class _SegmentWorkspaceController:
         self._registry = registry
 
     @staticmethod
-    def _resolve_origin_main(repository_root: str) -> str:
+    def _resolve_integration_head(registration: "_RepositoryRegistration") -> str:
         try:
-            result = subprocess.run(
-                ["git", "rev-parse", "refs/remotes/origin/main"],
-                cwd=repository_root,
-                shell=False,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise _WorkspaceRejected(f"git command failed: {exc}") from exc
-        if result.returncode != 0:
+            result = RepositoryBindingResolver(
+                registration
+            ).resolve_integration_head(allow_offline=True)
+        except RepositoryBindingError as exc:
             raise _WorkspaceRejected(
-                f"git rev-parse failed: {result.stderr.strip()}"
-            )
-        sha = result.stdout.strip()
-        _validate_sha(sha, "origin/main")
-        return sha
+                f"failed to resolve integration head for "
+                f"{registration.repository_identity}: {exc}"
+            ) from exc
+        return result.head_sha
 
     def load(self, *, workspace_id: str, expected_initiative_id: str, expected_segment_id: str, expected_controller_binding: str) -> _WorkspacePlan:
         _validate_nonblank_str(workspace_id, "workspace_id")
@@ -466,7 +455,7 @@ class _SegmentWorkspaceController:
             raise _WorkspaceRejected("pinned_at must be positive exact int")
 
         registration = self._registry.lookup(repository_identity)
-        trusted_sha = self._resolve_origin_main(registration.repository_root)
+        trusted_sha = self._resolve_integration_head(registration)
 
         if self._conn.in_transaction:
             raise _WorkspaceRejected("active transaction not allowed")

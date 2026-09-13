@@ -166,12 +166,12 @@ class CoordinationMaterializer:
             # For planned members, pin the base first.
             if member_state == "planned":
                 try:
-                    trusted_sha = _SegmentWorkspaceController._resolve_origin_main(
-                        registration.repository_root
+                    trusted_sha = _SegmentWorkspaceController._resolve_integration_head(
+                        registration
                     )
                 except _WorkspaceRejected as exc:
                     raise CoordinationMaterializationError(
-                        f"failed to resolve origin/main for {repository_identity}: {exc}"
+                        f"failed to resolve integration head for {repository_identity}: {exc}"
                     ) from exc
                 try:
                     self._store.pin_member_base(

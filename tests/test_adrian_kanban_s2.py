@@ -1254,6 +1254,8 @@ def _workspace_plan(provider_modules, tmp_path):
                 repository_identity="repo-1",
                 repository_root=str(repository),
                 controlled_worktree_root=str(repository / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -1299,10 +1301,12 @@ def test_workspace_registry_requires_one_shared_root_across_repository_members(
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(first_repo), str(shared_root)
+                "repo-1", str(first_repo), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
             workspace_mod._RepositoryRegistration(
-                "repo-2", str(second_repo), str(shared_root)
+                "repo-2", str(second_repo), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
@@ -1312,10 +1316,12 @@ def test_workspace_registry_requires_one_shared_root_across_repository_members(
         workspace_mod._TrustedRepositoryRegistry(
             (
                 workspace_mod._RepositoryRegistration(
-                    "repo-1", str(first_repo), str(shared_root)
+                    "repo-1", str(first_repo), str(shared_root),
+                    github_repository="Adrian-D-Lin/GRC", integration_branch="main",
                 ),
                 workspace_mod._RepositoryRegistration(
-                    "repo-2", str(second_repo), str(tmp_path / "other-root")
+                    "repo-2", str(second_repo), str(tmp_path / "other-root"),
+                    github_repository="Adrian-D-Lin/GRC", integration_branch="main",
                 ),
             )
         )
@@ -1351,10 +1357,12 @@ def test_workspace_plan_exposes_one_segment_root_above_all_repository_members(
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(first_repo), str(shared_root)
+                "repo-1", str(first_repo), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
             workspace_mod._RepositoryRegistration(
-                "repo-2", str(second_repo), str(shared_root)
+                "repo-2", str(second_repo), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
@@ -1416,6 +1424,8 @@ def test_workspace_plan_rejects_escape_missing_registry_and_binding_mismatch(
                 "repo-1",
                 str(repository),
                 str(repository / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -1695,7 +1705,8 @@ def test_workspace_plan_rejects_symlink_escape(provider_modules, tmp_path):
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(repository), str(controlled_root)
+                "repo-1", str(repository), str(controlled_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
@@ -1722,6 +1733,8 @@ def test_workspace_plan_rejects_inactive_or_memberless_workspace(
                 "repo-1",
                 str(repository),
                 str(repository / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -2063,11 +2076,16 @@ def test_workspace_activation_retry_is_idempotent_and_still_verifies_members(
 
 
 def test_segment_materialization_coordinator_pins_current_main_and_activates(
-    provider_modules, tmp_path
+    provider_modules, tmp_path, monkeypatch
 ):
     """The system-owned coordinator performs the complete pre-DEV2 operation."""
     workspace_mod = provider_modules["workspace"]
     conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    monkeypatch.setattr(
+        workspace_mod._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(lambda _reg: base_sha),
+    )
     conn.execute(
         "UPDATE segment_workspace_members SET required_base_sha = NULL "
         "WHERE workspace_id = ?",
@@ -2076,7 +2094,8 @@ def test_segment_materialization_coordinator_pins_current_main_and_activates(
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(repository), plan.members[0].controlled_worktree_root
+                "repo-1", str(repository), plan.members[0].controlled_worktree_root,
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
@@ -2152,15 +2171,23 @@ def test_segment_materialization_coordinator_resumes_only_failed_member(
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(first_repo), shared_root
+                "repo-1", str(first_repo), shared_root,
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
             workspace_mod._RepositoryRegistration(
-                "repo-2", str(second_repo), shared_root
+                "repo-2", str(second_repo), shared_root,
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
     original_materialize = workspace_mod._GitWorkspaceExecutor.materialize
     fail_second = {"enabled": True}
+
+    monkeypatch.setattr(
+        workspace_mod._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(lambda _reg: first_base),
+    )
 
     def injected_failure(self, member):
         if member.repository_identity == "repo-2" and fail_second["enabled"]:
@@ -2675,11 +2702,15 @@ def _two_repository_workspace_plan(provider_modules, tmp_path):
                 "repo-1",
                 str(repository_one),
                 str(shared_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
             workspace_mod._RepositoryRegistration(
                 "repo-2",
                 str(repository_two),
                 str(shared_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -4320,6 +4351,8 @@ def _insert_ready_segment_dispatch_task(provider_modules, conn, tmp_path):
                 repository_identity="repo-1",
                 repository_root=str(repository_root),
                 controlled_worktree_root=str(shared_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )

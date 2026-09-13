@@ -375,8 +375,15 @@ def test_real_dev1_to_dev2_transition_materializes_then_commits_exact_segment(
                 repository_identity="repo-1",
                 repository_root=str(repository),
                 controlled_worktree_root=str(controlled_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
+    )
+    monkeypatch.setattr(
+        workspace._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(lambda _registration: base_sha),
     )
     monkeypatch.setattr(
         commands_module,
