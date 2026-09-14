@@ -14,6 +14,13 @@ from typing import Any
 from .attachments import PreparedAttachment, prepare_url_attachment
 from .phase_admission import prepare_phase_result
 from .phase_delivery import PhaseDeliveryError, verify_transition_delivery
+from .initiative_update_approval import InitiativeUpdateApprovalCoordinator
+from .repository_reconciliation import (
+    PreparedRepositoryReconciliation,
+    RepositoryReconciliationError,
+    prepare_repository_reconciliation,
+    revalidate_stored_repository_reconciliation,
+)
 from .purge_cleanup import execute_cleanup
 from .rejection_audit import record_rejection
 from .capability import CapabilityBinding
@@ -74,6 +81,7 @@ from .task_inputs import (
 from .workspace import (
     _SegmentWorkspaceController,
     _TrustedRepositoryRegistry,
+    _WorkspaceRejected,
     _materialize_segment_workspace,
     _merge_segment_workspace,
     _retire_segment_workspace,
@@ -778,7 +786,11 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "approval_id": {
                     "type": "string",
-                    "description": "Approval reference authorizing the update.",
+                    "description": (
+                        "Optional host-prepared approval reference. Public callers "
+                        "normally omit it so the server presents and records the "
+                        "exact update approval."
+                    ),
                 },
                 "idempotency_key": {
                     "type": "string",
@@ -797,7 +809,6 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 "initiative_id",
                 "update_kind",
                 "update",
-                "approval_id",
                 "idempotency_key",
             ],
             "additionalProperties": False,
@@ -980,9 +991,11 @@ class _ModelToolRequestNormalizer:
         boundary: Any,
         *,
         board_resolver: Any = None,
+        initiative_update_approval: Any = None,
     ) -> None:
         self._boundary = boundary
         self._board_resolver = board_resolver
+        self._initiative_update_approval = initiative_update_approval
 
     def submit(
         self,
@@ -1214,6 +1227,39 @@ class _ModelToolRequestNormalizer:
                     override_now=int(time.time()),
                 )
 
+            if operation == "kanban_update_initiative" and "approval_id" not in payload:
+                turn_id = runtime.get("turn_id")
+                if not (type(turn_id) is str and turn_id.strip()):
+                    raise ValueError("turn_id must be a nonblank str")
+                if not (type(idempotency_key) is str and idempotency_key.strip()):
+                    raise ValueError("idempotency_key must be a nonblank str")
+                payload = self._boundary.prepare_public_initiative_update(
+                    payload,
+                    actor_profile=actor_profile.strip(),
+                )
+                approval_coordinator = self._initiative_update_approval
+                if approval_coordinator is None:
+                    approval_coordinator = InitiativeUpdateApprovalCoordinator(
+                        self._boundary.database_path
+                    )
+                authorized = approval_coordinator.authorize(
+                    payload,
+                    session_id=session_id.strip(),
+                    turn_id=turn_id.strip(),
+                )
+                if not authorized.get("approved"):
+                    return {
+                        "result": "REJECTED",
+                        "state_changed": False,
+                        "attempt_id": authorized.get("request_id") or attempt_id,
+                        "operation": operation,
+                        "value": {
+                            "approval_state": authorized.get("state", "cancelled"),
+                        },
+                    }
+                payload["approval_id"] = authorized["approval_id"]
+                attempt_id = authorized["request_id"]
+
             return self._boundary.submit(
                 operation,
                 attempt_id=attempt_id,
@@ -1228,6 +1274,34 @@ class _ModelToolRequestNormalizer:
                 api_request_id=runtime.get("api_request_id"),
                 user_task=runtime.get("user_task"),
                 payload=payload,
+            )
+        except RepositoryReconciliationError as exc:
+            return self._boundary._finish_response(
+                _rejection_from_checks(
+                    _resolve_attempt_id({"attempt_id": attempt_id}),
+                    operation,
+                    (
+                        FailedCheck(
+                            code="RECONCILIATION_PREPARATION_REJECTED",
+                            target="update.result",
+                            expected=(
+                                "a server-verifiable clean repository state and "
+                                "published exit-gate artifact"
+                            ),
+                            observed=str(exc),
+                            accepted_format=(
+                                "exit_gate_ref with repository_identity, path, "
+                                "full commit SHA, and blob SHA-256"
+                            ),
+                            remediation=(
+                                "reconcile and publish the affected worktree and "
+                                "artifact, then retry the same update"
+                            ),
+                            responsible_actor="orchestrator",
+                            retry="same_operation",
+                        ),
+                    ),
+                )
             )
         except Exception:
             return self._boundary._finish_response(
@@ -3446,6 +3520,48 @@ def _canonical_digest(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _prepare_repository_reconciliation_payload(
+    conn: sqlite3.Connection,
+    registry: _TrustedRepositoryRegistry | None,
+    payload: dict[str, Any],
+    *,
+    actor_profile: str | None,
+    require_supplied_proof: bool,
+) -> tuple[dict[str, Any], PreparedRepositoryReconciliation | None]:
+    update = payload.get("update")
+    if not (
+        payload.get("update_kind") == "phase_result"
+        and isinstance(update, dict)
+        and update.get("result_kind") == "repository_reconciliation"
+    ):
+        return payload, None
+    if actor_profile != "default":
+        raise RepositoryReconciliationError(
+            "repository reconciliation requires the default Orchestrator profile"
+        )
+    if registry is None:
+        raise RepositoryReconciliationError(
+            "trusted repository registry is required for reconciliation"
+        )
+    result = update.get("result")
+    if require_supplied_proof and (
+        not isinstance(result, dict) or "repository_proof" not in result
+    ):
+        raise RepositoryReconciliationError(
+            "repository reconciliation must first use the server-controlled "
+            "approval preparation route"
+        )
+    try:
+        prepared = prepare_repository_reconciliation(conn, registry, result)
+    except _WorkspaceRejected as exc:
+        raise RepositoryReconciliationError(str(exc)) from exc
+    prepared_payload = dict(payload)
+    prepared_update = dict(update)
+    prepared_update["result"] = prepared.result()
+    prepared_payload["update"] = prepared_update
+    return prepared_payload, prepared
+
+
 class _CommandContext:
     def __init__(
         self,
@@ -3466,6 +3582,7 @@ class _CommandContext:
         prepared_segment_manifest: PreparedSegmentManifest | None = None,
         prepared_successor_manifest: PreparedManifest | None = None,
         prepared_phase_result: Any = None,
+        prepared_repository_reconciliation: Any = None,
         prepared_transition_delivery: Any = None,
         initial_authorizer: Any = None,
         override_now: Any = None,
@@ -3488,6 +3605,7 @@ class _CommandContext:
         self.prepared_segment_manifest = prepared_segment_manifest
         self.prepared_successor_manifest = prepared_successor_manifest
         self.prepared_phase_result = prepared_phase_result
+        self.prepared_repository_reconciliation = prepared_repository_reconciliation
         self.prepared_transition_delivery = prepared_transition_delivery
         self.initial_authorizer = initial_authorizer
         self.override_now = override_now
@@ -3548,6 +3666,69 @@ class _CommandBoundary:
     @property
     def database_path(self) -> str:
         return self._database_path
+
+    def prepare_public_initiative_update(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor_profile: str,
+    ) -> dict[str, Any]:
+        """Return the exact server-prepared payload that the user will approve."""
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        conn = sqlite3.connect(self._database_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            prepared_payload, _ = _prepare_repository_reconciliation_payload(
+                conn,
+                self._workspace_registry,
+                payload,
+                actor_profile=actor_profile,
+                require_supplied_proof=False,
+            )
+            return prepared_payload
+        finally:
+            conn.close()
+
+    def _revalidate_repository_reconciliation(
+        self,
+        conn: sqlite3.Connection,
+        reconciliation_ref: Any,
+    ) -> None:
+        if self._workspace_registry is None:
+            return
+        try:
+            revalidate_stored_repository_reconciliation(
+                conn,
+                self._workspace_registry,
+                reconciliation_ref,
+            )
+        except (RepositoryReconciliationError, _WorkspaceRejected, ValueError) as exc:
+            raise CommandRejected(
+                failed_checks=(
+                    FailedCheck(
+                        code="RECONCILIATION_LIVE_PROOF_REJECTED",
+                        target="reconciliation_ref",
+                        expected=(
+                            "a server-prepared reconciliation whose pinned artifact, "
+                            "clean worktrees, commits, and remote containment still "
+                            "match live repository state"
+                        ),
+                        observed=str(exc),
+                        accepted_format=(
+                            "server-derived repository_proof plus an exit_gate_ref "
+                            "containing repository_identity, path, commit, and sha256"
+                        ),
+                        remediation=(
+                            "reconcile the affected workspace, publish the exact "
+                            "exit-gate artifact, create a new reconciliation through "
+                            "kanban_update_initiative, then retry the transition"
+                        ),
+                        responsible_actor="orchestrator",
+                        retry="same_operation",
+                    ),
+                ),
+            ) from None
 
     def override_approval_state(self, prepared: Any) -> str:
         if type(prepared) is not dict:
@@ -3808,6 +3989,25 @@ class _CommandBoundary:
                     raise _ConflictError()
                 return json.loads(row["response_json"])
 
+            prepared_repository_reconciliation = None
+            if (
+                action == "kanban_update_initiative"
+                and self._workspace_registry is not None
+            ):
+                payload, prepared_repository_reconciliation = (
+                    _prepare_repository_reconciliation_payload(
+                        conn,
+                        self._workspace_registry,
+                        payload,
+                        actor_profile=(
+                            actor_profile.strip()
+                            if actor_profile is not None
+                            else None
+                        ),
+                        require_supplied_proof=True,
+                    )
+                )
+
             prepared_manifest = None
             if "task_input_manifest_v1" in payload:
                 if self._task_input_preparer is None:
@@ -3946,6 +4146,14 @@ class _CommandBoundary:
             )
             if (
                 action == "kanban_transition_initiative"
+                and "gate_override" in payload
+            ):
+                self._revalidate_repository_reconciliation(
+                    conn,
+                    payload.get("reconciliation_ref"),
+                )
+            if (
+                action == "kanban_transition_initiative"
                 and "_approved_gate_override_request_id" in payload
             ):
                 from .initiative_override import preflight_approved_initiative_transition_override
@@ -3957,6 +4165,10 @@ class _CommandBoundary:
                     executor_profile=(
                         actor_profile.strip() if actor_profile is not None else None
                     ),
+                )
+                self._revalidate_repository_reconciliation(
+                    conn,
+                    override_preflight["reconciliation_ref"],
                 )
                 if override_preflight["to_phase"] == "DEV2":
                     if self._workspace_registry is None:
@@ -4002,6 +4214,10 @@ class _CommandBoundary:
                     workspace_registry=self._workspace_registry,
                 )
                 preflight_result = _preflight_transition_initiative(preflight_context)
+                self._revalidate_repository_reconciliation(
+                    conn,
+                    preflight_result["reconciliation_ref"],
+                )
                 if self._workspace_registry is not None:
                     try:
                         prepared_transition_delivery = verify_transition_delivery(
@@ -4246,6 +4462,9 @@ class _CommandBoundary:
                     prepared_segment_manifest=prepared_segment_manifest,
                     prepared_successor_manifest=prepared_successor_manifest,
                     prepared_phase_result=prepared_phase_result,
+                    prepared_repository_reconciliation=(
+                        prepared_repository_reconciliation
+                    ),
                     prepared_transition_delivery=prepared_transition_delivery,
                     initial_authorizer=fields.get("initial_authorizer"),
                     override_now=fields.get("override_now"),
@@ -4309,6 +4528,26 @@ class _CommandBoundary:
             return self._rejection_internal(attempt_id, action, _IDEMPOTENCY_CONFLICT)
         except _StaleDerivedStateError:
             return self._rejection_internal(attempt_id, action, _STALE_DERIVED_STATE)
+        except RepositoryReconciliationError as exc:
+            return _rejection_from_checks(
+                attempt_id,
+                action,
+                (
+                    FailedCheck(
+                        code="RECONCILIATION_FRESHNESS_REJECTED",
+                        target="update.result.repository_proof",
+                        expected="the approved proof to match current repository state",
+                        observed=str(exc),
+                        accepted_format="fresh server-derived repository proof",
+                        remediation=(
+                            "reconcile the affected workspace and submit a fresh "
+                            "kanban_update_initiative approval request"
+                        ),
+                        responsible_actor="orchestrator",
+                        retry="same_operation",
+                    ),
+                ),
+            )
         except Exception:
             return self._rejection_internal(
                 attempt_id, action, _COMMAND_EXECUTION_FAILED

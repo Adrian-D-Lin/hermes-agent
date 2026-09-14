@@ -28,6 +28,7 @@ from .diagnostics import CommandRejected, FailedCheck, NotEvaluatedCheck
 from .segment_manifest import PreparedSegmentManifest
 from .phase_result_scope import validate_phase_result_scope
 from .phase_admission import admit_phase_result
+from .repository_reconciliation import PreparedRepositoryReconciliation
 from .segment_projection import admit_segment_projection, persist_segment_projection
 from .transition_evidence import validate_transition_evidence
 from .workspace import _WorkspaceRejected
@@ -954,7 +955,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
         validate_phase_result_scope(context, initiative_id, update)
         admit_phase_result(context, card_id, initiative_id, update)
         if result_kind == "repository_reconciliation":
-            _validate_reconciliation_result_candidate(
+            result = _validate_reconciliation_result_candidate(
                 context,
                 card_id,
                 initiative_id,
@@ -1212,14 +1213,46 @@ def _validate_reconciliation(
                     remediation,
                 )
 
-        for key in ("canon_route", "exit_gate_ref"):
-            value = canonical_payload.get(key)
-            if not isinstance(value, str) or not value.strip():
+        canon_route = canonical_payload.get("canon_route")
+        if not isinstance(canon_route, str) or not canon_route.strip():
+            small(
+                "RECONCILIATION_FIELD_INVALID:canon_route",
+                "canonical_payload.canon_route",
+                "present nonblank string",
+                "missing or blank",
+                remediation,
+            )
+        repository_proof = canonical_payload.get("repository_proof")
+        exit_gate_ref = canonical_payload.get("exit_gate_ref")
+        if repository_proof is None:
+            if not isinstance(exit_gate_ref, str) or not exit_gate_ref.strip():
                 small(
-                    f"RECONCILIATION_FIELD_INVALID:{key}",
-                    f"canonical_payload.{key}",
-                    "present nonblank string",
+                    "RECONCILIATION_FIELD_INVALID:exit_gate_ref",
+                    "canonical_payload.exit_gate_ref",
+                    "present nonblank legacy reference",
                     "missing or blank",
+                    remediation,
+                )
+        else:
+            if not isinstance(repository_proof, dict):
+                small(
+                    "RECONCILIATION_PROOF_INVALID",
+                    "canonical_payload.repository_proof",
+                    "server-derived repository proof object",
+                    "missing or malformed",
+                    remediation_invalid,
+                )
+            if not isinstance(exit_gate_ref, dict) or set(exit_gate_ref) != {
+                "repository_identity",
+                "path",
+                "commit",
+                "sha256",
+            }:
+                small(
+                    "RECONCILIATION_FIELD_INVALID:exit_gate_ref",
+                    "canonical_payload.exit_gate_ref",
+                    "pinned artifact with repository_identity, path, commit, sha256",
+                    "missing or malformed",
                     remediation,
                 )
 
@@ -1238,7 +1271,7 @@ def _validate_reconciliation_result_candidate(
     phase: str,
     segment_id: str | None,
     result: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     if context.binding.actor_profile != "default":
         raise ValueError("reconciliation actor profile must be default")
     expected_keys = {
@@ -1253,6 +1286,17 @@ def _validate_reconciliation_result_candidate(
         "exit_gate_ref",
         "verification_result",
     }
+    prepared = getattr(context, "prepared_repository_reconciliation", None)
+    if getattr(context, "workspace_registry", None) is not None:
+        if type(prepared) is not PreparedRepositoryReconciliation:
+            raise ValueError("prepared repository reconciliation proof is required")
+        canonical_result = prepared.result()
+        if result != canonical_result:
+            raise ValueError(
+                "repository reconciliation does not match the fresh server proof"
+            )
+        result = canonical_result
+        expected_keys = expected_keys | {"repository_proof"}
     if set(result) != expected_keys:
         raise ValueError("invalid reconciliation result fields")
     latest = context.connection.execute(
@@ -1282,12 +1326,18 @@ def _validate_reconciliation_result_candidate(
             raise ValueError("reconciliation target segment must be nonblank")
     elif target_segment is not None:
         raise ValueError("reconciliation target segment must be absent")
-    for key in ("canon_route", "exit_gate_ref"):
-        value = result[key]
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"reconciliation {key} must be nonblank")
+    canon_route = result["canon_route"]
+    if not isinstance(canon_route, str) or not canon_route.strip():
+        raise ValueError("reconciliation canon_route must be nonblank")
+    exit_gate_ref = result["exit_gate_ref"]
+    if getattr(context, "workspace_registry", None) is not None:
+        if not isinstance(exit_gate_ref, dict):
+            raise ValueError("reconciliation exit_gate_ref must be a pinned artifact")
+    elif not isinstance(exit_gate_ref, str) or not exit_gate_ref.strip():
+        raise ValueError("reconciliation exit_gate_ref must be nonblank")
     if result["verification_result"] != "accepted":
         raise ValueError("reconciliation verification was not accepted")
+    return result
 
 
 def _validate_segment_projection(
