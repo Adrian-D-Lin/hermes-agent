@@ -89,7 +89,7 @@ def _binding(module, **changes):
         "canonical_digest": "sha256:task-payload",
         "session_id": "session-1",
         "workspace_id": "workspace-1",
-        "plugin_version": "0.4.1",
+        "plugin_version": "0.4.2",
         "protocol_version": "2",
         "execution_context": "run-1",
     }
@@ -2186,7 +2186,12 @@ def test_segment_materialization_coordinator_resumes_only_failed_member(
     monkeypatch.setattr(
         workspace_mod._SegmentWorkspaceController,
         "_resolve_integration_head",
-        staticmethod(lambda _reg: first_base),
+        staticmethod(
+            lambda registration: {
+                "repo-1": first_base,
+                "repo-2": second_base,
+            }[registration.repository_identity]
+        ),
     )
 
     def injected_failure(self, member):

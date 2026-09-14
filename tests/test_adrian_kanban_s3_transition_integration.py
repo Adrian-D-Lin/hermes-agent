@@ -246,6 +246,7 @@ def test_dev2_transition_preflights_then_materializes_before_mutation_transactio
             "phase_close_ref": "close-dev2",
             "to_phase": "DEV2",
             "to_segment_id": "S1",
+            "reconciliation_ref": "reconcile-dev2",
         }
 
     def materialize(conn, supplied_registry, **fields):
@@ -256,6 +257,11 @@ def test_dev2_transition_preflights_then_materializes_before_mutation_transactio
         assert type(fields["materialized_at"]) is int
         events.append("materialize")
         return "/controlled/initiative-1/S1"
+
+    def revalidate(_boundary, conn, reconciliation_ref):
+        assert conn.in_transaction is False
+        assert reconciliation_ref == "reconcile-dev2"
+        events.append("reconcile")
 
     def handler(context):
         assert context.connection.in_transaction is True
@@ -277,6 +283,11 @@ def test_dev2_transition_preflights_then_materializes_before_mutation_transactio
             "segment_id": None,
             "phase_close_ref": "close-dev2",
         },
+    )
+    monkeypatch.setattr(
+        commands_module._CommandBoundary,
+        "_revalidate_repository_reconciliation",
+        revalidate,
     )
     boundary = commands_module._CommandBoundary(
         database_path=str(c.path),
@@ -305,7 +316,7 @@ def test_dev2_transition_preflights_then_materializes_before_mutation_transactio
     )
 
     assert result["result"] == "ACCEPTED", result
-    assert events == ["preflight", "materialize", "handler"]
+    assert events == ["preflight", "reconcile", "materialize", "handler"]
 
 
 def test_failed_transition_preflight_has_no_workspace_or_mutation_side_effect(
@@ -337,7 +348,6 @@ def test_failed_transition_preflight_has_no_workspace_or_mutation_side_effect(
         },
         workspace_registry=registry,
     )
-
     result = _submit(
         boundary,
         "kanban_transition_initiative",
@@ -486,6 +496,13 @@ def test_real_dev1_to_dev2_transition_materializes_then_commits_exact_segment(
             "kanban_transition_initiative": commands_module._handle_transition_initiative
         },
         workspace_registry=registry,
+    )
+    # This test isolates segment materialization. Repository-proof behavior is
+    # covered with real Git evidence in test_adrian_kanban_repository_reconciliation.
+    monkeypatch.setattr(
+        boundary,
+        "_revalidate_repository_reconciliation",
+        lambda *_args: None,
     )
 
     response = _submit(

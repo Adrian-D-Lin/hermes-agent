@@ -350,7 +350,7 @@ def test_dashboard_styles_give_cards_and_details_explicit_contrast():
         ".adrian-kanban-attachment",
     ):
         assert selector in css
-    assert "background: #0b2545" in css
+    assert "background: #040F20" in css
     assert "color: var(--color-foreground, #" in css
 
     column_rule = re.search(r"\.adrian-kanban-column\s*\{([^}]+)\}", css, re.DOTALL)
@@ -359,26 +359,26 @@ def test_dashboard_styles_give_cards_and_details_explicit_contrast():
 
     detail_rule = re.search(r"\.adrian-kanban-detail-panel\s*\{([^}]+)\}", css, re.DOTALL)
     assert detail_rule is not None
-    assert "background: #0b2545" in detail_rule.group(1)
+    assert "background: #040F20" in detail_rule.group(1)
     assert "user-select: text" in detail_rule.group(1)
 
     selector_rule = re.search(
         r"\.adrian-kanban-project-selector\s*\{([^}]+)\}", css, re.DOTALL
     )
     assert selector_rule is not None
-    assert "background: #102f57" in selector_rule.group(1)
+    assert "background: #1a1b1f" in selector_rule.group(1)
     assert "color: var(--color-foreground, #f8fafc)" in selector_rule.group(1)
 
     assert ".adrian-kanban-refresh," in css
     assert ".adrian-kanban-mutation" in css
-    assert "background: #102f57" in css
-    assert "background: #163b68" in css
+    assert "background: #1a1b1f" in css
+    assert "background: #2e3138" in css
 
     close_rule = re.search(
         r"\.adrian-kanban-detail-close\s*\{([^}]+)\}", css, re.DOTALL
     )
     assert close_rule is not None
-    assert "background: #102f57" in close_rule.group(1)
+    assert "background: #1a1b1f" in close_rule.group(1)
     assert "color: var(--color-foreground, #f8fafc)" in close_rule.group(1)
 
 

@@ -457,6 +457,13 @@ def test_dev4_5_transition_materializes_next_segment_from_updated_main(
         },
         workspace_registry=registry,
     )
+    # This test isolates successor-workspace materialization. Repository-proof
+    # freshness has its own real-Git integration suite.
+    monkeypatch.setattr(
+        transition_boundary,
+        "_revalidate_repository_reconciliation",
+        lambda *_args: None,
+    )
 
     transitioned = _submit_transition(
         transition_boundary,
