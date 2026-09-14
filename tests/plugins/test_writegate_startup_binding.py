@@ -263,6 +263,7 @@ def test_trusted_logical_confirmation_presents_all_roots_once(
         logical_workspace_id="coord-init-1",
         member_roots=(str(member_a), str(member_b)),
         binding_version=1,
+        profile="default",
     )
     assert first is not None
     assert len(presentations) == 1
@@ -280,9 +281,54 @@ def test_trusted_logical_confirmation_presents_all_roots_once(
         logical_workspace_id="coord-init-1",
         member_roots=(str(member_a), str(member_b)),
         binding_version=1,
+        profile="default",
     )
     assert replay.id == first.id
     assert len(presentations) == 1
+
+
+def test_trusted_logical_confirmation_replaces_binding_when_profile_changes(
+    reg, mods, tmp_path, monkeypatch
+):
+    member = tmp_path / "coord" / "repo-a"
+    member.mkdir(parents=True)
+    decisions = []
+
+    def approve_once(_presentation, kind):
+        assert kind == "CONFIRMED_WORKTREE_BINDING"
+        decisions.append(True)
+        return {
+            "approved": True,
+            "decision": "once",
+            "approval_reference": "host-ref",
+            "decision_at": "2026-09-01T10:00:00+00:00",
+        }
+
+    monkeypatch.setattr(mods.tool, "_present_and_get_decision", approve_once)
+    legacy = mods.tool.confirm_trusted_logical_binding(
+        session_id="sess-logical",
+        project="project-1",
+        initiative="init-1",
+        board="board-1",
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(member),),
+        binding_version=1,
+    )
+    current = mods.tool.confirm_trusted_logical_binding(
+        session_id="sess-logical",
+        project="project-1",
+        initiative="init-1",
+        board="board-1",
+        logical_workspace_id="coord-init-1",
+        member_roots=(str(member),),
+        binding_version=1,
+        profile="default",
+    )
+
+    assert current.id != legacy.id
+    assert current.profile == "default"
+    assert reg.get_active_binding("sess-logical").id == current.id
+    assert len(decisions) == 2
 
 
 def test_declined_logical_replacement_preserves_existing_binding(

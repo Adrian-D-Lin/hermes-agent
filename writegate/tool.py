@@ -171,6 +171,7 @@ def confirm_trusted_logical_binding(
         and existing.logical_workspace_id == logical_workspace_id
         and existing.member_roots == candidate.member_roots
         and existing.binding_version == binding_version
+        and existing.profile == candidate.profile
     ):
         return existing
 
