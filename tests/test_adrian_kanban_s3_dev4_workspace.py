@@ -47,8 +47,18 @@ def _workspace_case(commands_module, tmp_path, monkeypatch):
                 repository_identity="repo-1",
                 repository_root=str(repository),
                 controlled_worktree_root=str(controlled_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
+    )
+    monkeypatch.setattr(
+        workspace._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(lambda _registration: subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "origin/main"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()),
     )
     with sqlite3.connect(path) as conn:
         conn.execute(
@@ -446,6 +456,13 @@ def test_dev4_5_transition_materializes_next_segment_from_updated_main(
             "kanban_transition_initiative": commands_module._handle_transition_initiative
         },
         workspace_registry=registry,
+    )
+    # This test isolates successor-workspace materialization. Repository-proof
+    # freshness has its own real-Git integration suite.
+    monkeypatch.setattr(
+        transition_boundary,
+        "_revalidate_repository_reconciliation",
+        lambda *_args: None,
     )
 
     transitioned = _submit_transition(

@@ -171,6 +171,7 @@ VALID_HOOKS: Set[str] = {
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
+    "pre_user_turn",
     # Streaming LLM output observer hooks. Fired asynchronously off the token
     # path by agent.plugin_stream_hooks; callbacks observe immutable normalized
     # text/lifecycle payloads and cannot transform the stream.
@@ -396,6 +397,7 @@ VALID_HOOKS: Set[str] = {
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
     "transform_api_error_classification",
+    "pre_user_turn",
 }
 
 # Timeout coverage is an allowlist for the agent-turn hot path, not every
@@ -436,11 +438,15 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "pre_verify",
     "on_session_start",
     "on_session_end",
+    "pre_user_turn",
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
 # Skipping would let the tool run without a completed policy decision.
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {
+    "pre_tool_call",
+    "pre_user_turn",
+}
 
 # Documented parent-thread serialization contract — never move the callback
 # body onto a timeout worker (see website/docs/user-guide/features/hooks.md).
@@ -452,6 +458,9 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
     "pre_tool_call plugin callback timed out or is still running"
+)
+_PRE_USER_TURN_TIMEOUT_BLOCK_MESSAGE = (
+    "pre_user_turn plugin callback timed out or is still running"
 )
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -3670,7 +3679,7 @@ _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
 _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
 
 
-def _resolve_hook_callback_timeout() -> float:
+def _resolve_hook_callback_timeout(hook_name: Optional[str] = None) -> float:
     """Return the effective hook-callback timeout in seconds.
 
     Reads ``plugins.hook_callback_timeout`` via the cached readonly config
@@ -3702,14 +3711,25 @@ def _resolve_hook_callback_timeout() -> float:
             timeout,
             _HOOK_CALLBACK_TIMEOUT_SECS,
         )
-        return _HOOK_CALLBACK_TIMEOUT_SECS
+        timeout = _HOOK_CALLBACK_TIMEOUT_SECS
     if timeout > _MAX_HOOK_CALLBACK_TIMEOUT_SECS:
         logger.warning(
             "plugins.hook_callback_timeout=%g exceeds max %gs; clamping",
             timeout,
             _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
         )
-        return _MAX_HOOK_CALLBACK_TIMEOUT_SECS
+        timeout = _MAX_HOOK_CALLBACK_TIMEOUT_SECS
+    if hook_name == "pre_user_turn" and timeout > 0:
+        try:
+            from tools.approval import _get_approval_timeout
+
+            approval_timeout = float(_get_approval_timeout())
+        except Exception:
+            approval_timeout = 300.0
+        return min(
+            _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
+            max(timeout, approval_timeout + 30.0),
+        )
     return timeout
 
 
@@ -3728,6 +3748,14 @@ def _pre_tool_call_timeout_block() -> Dict[str, str]:
     return {
         "action": "block",
         "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+    }
+
+
+def _pre_user_turn_timeout_block() -> Dict[str, str]:
+    """Fail-closed directive when a pre_user_turn policy callback times out."""
+    return {
+        "action": "fail_closed",
+        "response": _PRE_USER_TURN_TIMEOUT_BLOCK_MESSAGE,
     }
 
 
@@ -5603,7 +5631,7 @@ class PluginManager:
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
-        timeout = _resolve_hook_callback_timeout()
+        timeout = _resolve_hook_callback_timeout(hook_name)
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
 
@@ -5629,7 +5657,11 @@ class PluginManager:
                                 callback_name,
                             )
                             if fail_closed:
-                                results.append(_pre_tool_call_timeout_block())
+                                results.append(
+                                    _pre_user_turn_timeout_block()
+                                    if hook_name == "pre_user_turn"
+                                    else _pre_tool_call_timeout_block()
+                                )
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
@@ -5680,7 +5712,11 @@ class PluginManager:
                             timeout,
                         )
                         if fail_closed:
-                            results.append(_pre_tool_call_timeout_block())
+                            results.append(
+                                _pre_user_turn_timeout_block()
+                                if hook_name == "pre_user_turn"
+                                else _pre_tool_call_timeout_block()
+                            )
                         continue
                     if "exc" in failure:
                         raise failure["exc"]
@@ -5696,6 +5732,12 @@ class PluginManager:
                     callback_name,
                     exc,
                 )
+                if fail_closed:
+                    results.append(
+                        _pre_user_turn_timeout_block()
+                        if hook_name == "pre_user_turn"
+                        else _pre_tool_call_timeout_block()
+                    )
         return results
 
     def _subscribe_event(

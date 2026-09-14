@@ -298,6 +298,7 @@ def preflight_approved_initiative_transition_override(
         "initiative_id": stored_proposal["initiative_id"],
         "to_phase": rederived["destination"]["phase"],
         "to_segment_id": rederived["destination"]["segment_id"],
+        "reconciliation_ref": rederived["reconciliation_ref"],
     }
 
 

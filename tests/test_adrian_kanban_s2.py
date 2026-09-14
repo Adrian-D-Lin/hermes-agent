@@ -89,7 +89,7 @@ def _binding(module, **changes):
         "canonical_digest": "sha256:task-payload",
         "session_id": "session-1",
         "workspace_id": "workspace-1",
-        "plugin_version": "0.2.0",
+        "plugin_version": "0.4.2",
         "protocol_version": "2",
         "execution_context": "run-1",
     }
@@ -1254,6 +1254,8 @@ def _workspace_plan(provider_modules, tmp_path):
                 repository_identity="repo-1",
                 repository_root=str(repository),
                 controlled_worktree_root=str(repository / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -1299,10 +1301,12 @@ def test_workspace_registry_requires_one_shared_root_across_repository_members(
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(first_repo), str(shared_root)
+                "repo-1", str(first_repo), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
             workspace_mod._RepositoryRegistration(
-                "repo-2", str(second_repo), str(shared_root)
+                "repo-2", str(second_repo), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
@@ -1312,10 +1316,12 @@ def test_workspace_registry_requires_one_shared_root_across_repository_members(
         workspace_mod._TrustedRepositoryRegistry(
             (
                 workspace_mod._RepositoryRegistration(
-                    "repo-1", str(first_repo), str(shared_root)
+                    "repo-1", str(first_repo), str(shared_root),
+                    github_repository="Adrian-D-Lin/GRC", integration_branch="main",
                 ),
                 workspace_mod._RepositoryRegistration(
-                    "repo-2", str(second_repo), str(tmp_path / "other-root")
+                    "repo-2", str(second_repo), str(tmp_path / "other-root"),
+                    github_repository="Adrian-D-Lin/GRC", integration_branch="main",
                 ),
             )
         )
@@ -1351,10 +1357,12 @@ def test_workspace_plan_exposes_one_segment_root_above_all_repository_members(
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(first_repo), str(shared_root)
+                "repo-1", str(first_repo), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
             workspace_mod._RepositoryRegistration(
-                "repo-2", str(second_repo), str(shared_root)
+                "repo-2", str(second_repo), str(shared_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
@@ -1416,6 +1424,8 @@ def test_workspace_plan_rejects_escape_missing_registry_and_binding_mismatch(
                 "repo-1",
                 str(repository),
                 str(repository / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -1552,6 +1562,128 @@ def test_workspace_verification_is_read_only(provider_modules, tmp_path):
     conn.close()
 
 
+def _materialized_workspace_member(member, observed_head):
+    return replace(
+        member,
+        observed_head=observed_head,
+        member_state="materialized",
+    )
+
+
+def test_workspace_freshness_includes_untracked_files_in_dirty_state(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+
+    clean = executor.inspect_freshness(member)
+    assert clean.ready is True
+    assert clean.recorded_head == base_sha
+    assert clean.local_head == base_sha
+    assert clean.remote_head == base_sha
+    assert clean.recorded_is_ancestor_of_local is True
+    assert clean.local_is_ancestor_of_remote is True
+    assert clean.remote_is_ancestor_of_local is True
+
+    (Path(member.target_path) / "untracked.txt").write_text(
+        "untracked\n", encoding="utf-8"
+    )
+    dirty = executor.inspect_freshness(member)
+    assert dirty.ready is False
+    assert dirty.clean_including_untracked is False
+    assert dirty.failures == ("worktree_dirty",)
+    conn.close()
+
+
+def test_workspace_freshness_fast_forwards_only_remote_advancement(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+
+    (repository / "remote-change.txt").write_text("remote\n", encoding="utf-8")
+    _git(repository, "add", "remote-change.txt")
+    _git(repository, "commit", "-m", "advance origin main")
+    _git(repository, "push", "origin", "main")
+    remote_head = _git(repository, "rev-parse", "HEAD")
+
+    freshness = executor.inspect_freshness(member)
+    assert freshness.ready is True
+    assert freshness.local_head == base_sha
+    assert freshness.remote_head == remote_head
+    assert freshness.local_is_ancestor_of_remote is True
+    assert freshness.remote_is_ancestor_of_local is False
+
+    advanced = executor.fast_forward_to_remote(
+        member,
+        expected_local_head=base_sha,
+        expected_remote_head=remote_head,
+    )
+    assert advanced.ready is True
+    assert advanced.observed_head == remote_head
+    assert _git(member.target_path, "status", "--porcelain") == ""
+    conn.close()
+
+
+def test_workspace_freshness_exposes_unexplained_local_advancement(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+    target = Path(member.target_path)
+
+    (target / "local-change.txt").write_text("local\n", encoding="utf-8")
+    _git(target, "add", "local-change.txt")
+    _git(target, "commit", "-m", "unrecorded local advancement")
+    local_head = _git(target, "rev-parse", "HEAD")
+
+    freshness = executor.inspect_freshness(member)
+    assert freshness.ready is True
+    assert freshness.recorded_head == base_sha
+    assert freshness.local_head == local_head
+    assert freshness.remote_head == base_sha
+    assert freshness.recorded_is_ancestor_of_local is True
+    assert freshness.local_is_ancestor_of_remote is False
+    assert freshness.remote_is_ancestor_of_local is True
+    conn.close()
+
+
+def test_workspace_fast_forward_rechecks_exact_heads_and_untracked_cleanliness(
+    provider_modules, tmp_path
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+
+    (repository / "remote-change.txt").write_text("remote\n", encoding="utf-8")
+    _git(repository, "add", "remote-change.txt")
+    _git(repository, "commit", "-m", "advance origin main")
+    _git(repository, "push", "origin", "main")
+    freshness = executor.inspect_freshness(member)
+    assert freshness.remote_head is not None
+    (Path(member.target_path) / "race.txt").write_text("race\n", encoding="utf-8")
+
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="untracked"):
+        executor.fast_forward_to_remote(
+            member,
+            expected_local_head=base_sha,
+            expected_remote_head=freshness.remote_head,
+        )
+    assert _git(member.target_path, "rev-parse", "HEAD") == base_sha
+    conn.close()
+
+
 def test_workspace_plan_rejects_symlink_escape(provider_modules, tmp_path):
     workspace_mod = provider_modules["workspace"]
     conn = _journal_connection(provider_modules["schema"])
@@ -1573,7 +1705,8 @@ def test_workspace_plan_rejects_symlink_escape(provider_modules, tmp_path):
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(repository), str(controlled_root)
+                "repo-1", str(repository), str(controlled_root),
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
@@ -1600,6 +1733,8 @@ def test_workspace_plan_rejects_inactive_or_memberless_workspace(
                 "repo-1",
                 str(repository),
                 str(repository / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -1941,11 +2076,16 @@ def test_workspace_activation_retry_is_idempotent_and_still_verifies_members(
 
 
 def test_segment_materialization_coordinator_pins_current_main_and_activates(
-    provider_modules, tmp_path
+    provider_modules, tmp_path, monkeypatch
 ):
     """The system-owned coordinator performs the complete pre-DEV2 operation."""
     workspace_mod = provider_modules["workspace"]
     conn, repository, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    monkeypatch.setattr(
+        workspace_mod._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(lambda _reg: base_sha),
+    )
     conn.execute(
         "UPDATE segment_workspace_members SET required_base_sha = NULL "
         "WHERE workspace_id = ?",
@@ -1954,7 +2094,8 @@ def test_segment_materialization_coordinator_pins_current_main_and_activates(
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(repository), plan.members[0].controlled_worktree_root
+                "repo-1", str(repository), plan.members[0].controlled_worktree_root,
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
@@ -2030,15 +2171,28 @@ def test_segment_materialization_coordinator_resumes_only_failed_member(
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
-                "repo-1", str(first_repo), shared_root
+                "repo-1", str(first_repo), shared_root,
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
             workspace_mod._RepositoryRegistration(
-                "repo-2", str(second_repo), shared_root
+                "repo-2", str(second_repo), shared_root,
+                github_repository="Adrian-D-Lin/GRC", integration_branch="main",
             ),
         )
     )
     original_materialize = workspace_mod._GitWorkspaceExecutor.materialize
     fail_second = {"enabled": True}
+
+    monkeypatch.setattr(
+        workspace_mod._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(
+            lambda registration: {
+                "repo-1": first_base,
+                "repo-2": second_base,
+            }[registration.repository_identity]
+        ),
+    )
 
     def injected_failure(self, member):
         if member.repository_identity == "repo-2" and fail_second["enabled"]:
@@ -2553,11 +2707,15 @@ def _two_repository_workspace_plan(provider_modules, tmp_path):
                 "repo-1",
                 str(repository_one),
                 str(shared_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
             workspace_mod._RepositoryRegistration(
                 "repo-2",
                 str(repository_two),
                 str(shared_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )
@@ -4198,6 +4356,8 @@ def _insert_ready_segment_dispatch_task(provider_modules, conn, tmp_path):
                 repository_identity="repo-1",
                 repository_root=str(repository_root),
                 controlled_worktree_root=str(shared_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
     )

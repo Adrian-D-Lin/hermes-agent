@@ -19,13 +19,19 @@ from writegate.kanban_approvals import (
     validate_approved,
 )
 
+from .coordination_workspace import (
+    CoordinationWorkspaceError,
+    CoordinationWorkspaceStore,
+)
 from .initiative_checkpoints import admit_orchestration_checkpoint
 from .diagnostics import CommandRejected, FailedCheck, NotEvaluatedCheck
 from .segment_manifest import PreparedSegmentManifest
 from .phase_result_scope import validate_phase_result_scope
 from .phase_admission import admit_phase_result
+from .repository_reconciliation import PreparedRepositoryReconciliation
 from .segment_projection import admit_segment_projection, persist_segment_projection
 from .transition_evidence import validate_transition_evidence
+from .workspace import _WorkspaceRejected
 
 INITIATIVE_PHASES = frozenset(
     {
@@ -460,6 +466,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
     board = board.strip()
     if update_kind not in {
         "body_update",
+        "coordination_membership_expansion",
         "phase_result",
         "segment_manifest_projection",
         "orchestration_checkpoint",
@@ -592,6 +599,90 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
             "predecessor_task_id": admission.predecessor_task_id,
             "successor_task_id": successor_task_id,
             "cleanup_required": cleanup_required,
+        }
+
+    if update_kind == "coordination_membership_expansion":
+        if set(update.keys()) != {"repository_ids"}:
+            raise ValueError(
+                "coordination_membership_expansion update must contain only "
+                "repository_ids"
+            )
+        repository_ids = update["repository_ids"]
+        if not isinstance(repository_ids, list) or not repository_ids:
+            raise ValueError("repository_ids must be a non-empty list")
+        for repository_id in repository_ids:
+            if not (type(repository_id) is str and repository_id.strip()):
+                raise ValueError(
+                    "repository_ids must contain nonblank strings"
+                )
+        if len(repository_ids) != len(set(repository_ids)):
+            raise ValueError("repository_ids must be unique")
+
+        registry = context.workspace_registry
+        if registry is None:
+            raise ValueError("workspace_registry is required")
+        for repository_id in repository_ids:
+            try:
+                registry.lookup(repository_id)
+            except _WorkspaceRejected as exc:
+                raise ValueError(
+                    f"repository ID {repository_id!r} rejected by registry: {exc}"
+                ) from None
+
+        logical_workspace_id = f"coord-{initiative_id}"
+        store = CoordinationWorkspaceStore(context.connection)
+        try:
+            workspace = store.read_active(initiative_id)
+        except CoordinationWorkspaceError as exc:
+            raise ValueError(
+                f"failed to read active coordination workspace: {exc}"
+            ) from None
+        project_id = workspace.get("project_id")
+        if not (type(project_id) is str and project_id.strip()):
+            raise ValueError("workspace project_id must be a nonblank string")
+        expected_binding_ref = f"tracker:{board}:{initiative_id}"
+        if workspace.get("controller_binding_ref") != expected_binding_ref:
+            raise ValueError("workspace controller_binding_ref mismatch")
+        binding_version = workspace.get("binding_version")
+        if not (
+            type(binding_version) is int
+            and not isinstance(binding_version, bool)
+            and binding_version > 0
+        ):
+            raise ValueError(
+                "workspace binding_version must be a positive non-Boolean integer"
+            )
+
+        _consume_approval(
+            context.connection,
+            context,
+            approval_id,
+            "kanban_update_initiative",
+            expected_version,
+            payload,
+            initiative_id,
+            None,
+        )
+        now = int(time.time())
+        updated_workspace = store.add_planned_members_in_active_transaction(
+            logical_workspace_id,
+            repository_ids,
+            expected_binding_version=binding_version,
+            at=now,
+        )
+        record_version = _advance_initiative_version(
+            context.connection, context, initiative_id, expected_version
+        )
+        return {
+            "initiative_id": initiative_id,
+            "update_kind": update_kind,
+            "record_version": record_version,
+            "logical_workspace_id": logical_workspace_id,
+            "writegate_binding_version": updated_workspace["binding_version"],
+            "repository_ids": sorted(
+                member["repository_identity"]
+                for member in updated_workspace["members"]
+            ),
         }
 
     if update_kind == "segment_manifest_projection":
@@ -864,7 +955,7 @@ def _handle_update_initiative(context: Any) -> dict[str, Any]:
         validate_phase_result_scope(context, initiative_id, update)
         admit_phase_result(context, card_id, initiative_id, update)
         if result_kind == "repository_reconciliation":
-            _validate_reconciliation_result_candidate(
+            result = _validate_reconciliation_result_candidate(
                 context,
                 card_id,
                 initiative_id,
@@ -1122,14 +1213,46 @@ def _validate_reconciliation(
                     remediation,
                 )
 
-        for key in ("canon_route", "exit_gate_ref"):
-            value = canonical_payload.get(key)
-            if not isinstance(value, str) or not value.strip():
+        canon_route = canonical_payload.get("canon_route")
+        if not isinstance(canon_route, str) or not canon_route.strip():
+            small(
+                "RECONCILIATION_FIELD_INVALID:canon_route",
+                "canonical_payload.canon_route",
+                "present nonblank string",
+                "missing or blank",
+                remediation,
+            )
+        repository_proof = canonical_payload.get("repository_proof")
+        exit_gate_ref = canonical_payload.get("exit_gate_ref")
+        if repository_proof is None:
+            if not isinstance(exit_gate_ref, str) or not exit_gate_ref.strip():
                 small(
-                    f"RECONCILIATION_FIELD_INVALID:{key}",
-                    f"canonical_payload.{key}",
-                    "present nonblank string",
+                    "RECONCILIATION_FIELD_INVALID:exit_gate_ref",
+                    "canonical_payload.exit_gate_ref",
+                    "present nonblank legacy reference",
                     "missing or blank",
+                    remediation,
+                )
+        else:
+            if not isinstance(repository_proof, dict):
+                small(
+                    "RECONCILIATION_PROOF_INVALID",
+                    "canonical_payload.repository_proof",
+                    "server-derived repository proof object",
+                    "missing or malformed",
+                    remediation_invalid,
+                )
+            if not isinstance(exit_gate_ref, dict) or set(exit_gate_ref) != {
+                "repository_identity",
+                "path",
+                "commit",
+                "sha256",
+            }:
+                small(
+                    "RECONCILIATION_FIELD_INVALID:exit_gate_ref",
+                    "canonical_payload.exit_gate_ref",
+                    "pinned artifact with repository_identity, path, commit, sha256",
+                    "missing or malformed",
                     remediation,
                 )
 
@@ -1148,7 +1271,7 @@ def _validate_reconciliation_result_candidate(
     phase: str,
     segment_id: str | None,
     result: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     if context.binding.actor_profile != "default":
         raise ValueError("reconciliation actor profile must be default")
     expected_keys = {
@@ -1163,6 +1286,17 @@ def _validate_reconciliation_result_candidate(
         "exit_gate_ref",
         "verification_result",
     }
+    prepared = getattr(context, "prepared_repository_reconciliation", None)
+    if getattr(context, "workspace_registry", None) is not None:
+        if type(prepared) is not PreparedRepositoryReconciliation:
+            raise ValueError("prepared repository reconciliation proof is required")
+        canonical_result = prepared.result()
+        if result != canonical_result:
+            raise ValueError(
+                "repository reconciliation does not match the fresh server proof"
+            )
+        result = canonical_result
+        expected_keys = expected_keys | {"repository_proof"}
     if set(result) != expected_keys:
         raise ValueError("invalid reconciliation result fields")
     latest = context.connection.execute(
@@ -1192,12 +1326,18 @@ def _validate_reconciliation_result_candidate(
             raise ValueError("reconciliation target segment must be nonblank")
     elif target_segment is not None:
         raise ValueError("reconciliation target segment must be absent")
-    for key in ("canon_route", "exit_gate_ref"):
-        value = result[key]
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"reconciliation {key} must be nonblank")
+    canon_route = result["canon_route"]
+    if not isinstance(canon_route, str) or not canon_route.strip():
+        raise ValueError("reconciliation canon_route must be nonblank")
+    exit_gate_ref = result["exit_gate_ref"]
+    if getattr(context, "workspace_registry", None) is not None:
+        if not isinstance(exit_gate_ref, dict):
+            raise ValueError("reconciliation exit_gate_ref must be a pinned artifact")
+    elif not isinstance(exit_gate_ref, str) or not exit_gate_ref.strip():
+        raise ValueError("reconciliation exit_gate_ref must be nonblank")
     if result["verification_result"] != "accepted":
         raise ValueError("reconciliation verification was not accepted")
+    return result
 
 
 def _validate_segment_projection(
@@ -1527,6 +1667,18 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
     predecessor_id = preflight["predecessor_id"]
     from_phase = preflight["from_phase"]
     from_segment_id = preflight["from_segment_id"]
+    delivery_proof = getattr(context, "prepared_transition_delivery", None)
+    if getattr(context, "workspace_registry", None) is not None:
+        if not isinstance(delivery_proof, dict):
+            raise ValueError("prepared transition delivery proof is required")
+        if delivery_proof.get("workspace_id") is None:
+            raise ValueError("prepared transition delivery workspace_id is required")
+        if delivery_proof.get("phase") != from_phase:
+            raise ValueError("prepared transition delivery phase mismatch")
+        if delivery_proof.get("segment_id") != from_segment_id:
+            raise ValueError("prepared transition delivery segment mismatch")
+        if delivery_proof.get("phase_close_ref") != phase_close_ref:
+            raise ValueError("prepared transition delivery phase_close_ref mismatch")
     _consume_approval(
         context.connection,
         context,
@@ -1546,14 +1698,17 @@ def _handle_transition_initiative(context: Any) -> dict[str, Any]:
         sort_keys=True,
         separators=(",", ":"),
     )
+    transition_payload = {
+        "from_phase": from_phase,
+        "from_segment_id": from_segment_id,
+        "to_phase": to_phase,
+        "to_segment_id": to_segment_id,
+        "phase_close_ref": phase_close_ref,
+    }
+    if delivery_proof is not None:
+        transition_payload["delivery_proof"] = delivery_proof
     canonical_payload = json.dumps(
-        {
-            "from_phase": from_phase,
-            "from_segment_id": from_segment_id,
-            "to_phase": to_phase,
-            "to_segment_id": to_segment_id,
-            "phase_close_ref": phase_close_ref,
-        },
+        transition_payload,
         sort_keys=True,
         separators=(",", ":"),
     )

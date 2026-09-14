@@ -170,8 +170,16 @@ def test_runtime_repository_registry_uses_one_configured_shared_root(
             "kanban": {
                 "controlled_worktree_root": str(shared),
                 "repository_registry": {
-                    "repo-1": {"repository_root": str(first)},
-                    "repo-2": {"repository_root": str(second)},
+                    "repo-1": {
+                        "repository_root": str(first),
+                        "github_repository": "Adrian-D-Lin/GRC",
+                        "integration_branch": "main",
+                    },
+                    "repo-2": {
+                        "repository_root": str(second),
+                        "github_repository": "Adrian-D-Lin/GRC",
+                        "integration_branch": "main",
+                    },
                 },
             }
         },
@@ -1133,11 +1141,17 @@ def test_planned_member_base_is_trusted_late_bound_and_idempotent(
             repository_identity="repo-1",
             repository_root=str(repository),
             controlled_worktree_root=str(repository / ".segment-worktrees"),
+            github_repository="Adrian-D-Lin/GRC",
+            integration_branch="main",
         ),
     ))
     conn = sqlite3.connect(database_path, isolation_level=None)
     controller = workspace._SegmentWorkspaceController(conn, registry)
 
+    monkeypatch.setattr(
+        controller, "_resolve_integration_head",
+        staticmethod(lambda _reg: expected_sha),
+    )
     assert (
         controller.pin_planned_member_base("initiative-1:S1", "repo-1", pinned_at=10)
         == expected_sha
@@ -1152,7 +1166,7 @@ def test_planned_member_base_is_trusted_late_bound_and_idempotent(
         "AND repository_identity = 'repo-1'"
     ).fetchone() == (expected_sha, None, "planned", 10)
 
-    monkeypatch.setattr(controller, "_resolve_origin_main", lambda _root: "9" * 40)
+    monkeypatch.setattr(controller, "_resolve_integration_head", lambda _reg: "9" * 40)
     with pytest.raises(workspace._WorkspaceRejected, match="base mismatch"):
         controller.pin_planned_member_base("initiative-1:S1", "repo-1", pinned_at=12)
     conn.close()

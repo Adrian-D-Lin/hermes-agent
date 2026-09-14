@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from .journal import ExternalOperationJournal, JournalIntent, JournalRejected
+from .repository_binding import RepositoryBindingError, RepositoryBindingResolver, normalize_github_repository
 
 __all__ = ()
 
@@ -55,16 +56,66 @@ def _validate_bool(value, name):
     return value
 
 
+def _validate_integration_branch(value, name):
+    if not isinstance(value, str):
+        raise _WorkspaceRejected(f"{name} must be str")
+    if not value.strip():
+        raise _WorkspaceRejected(f"{name} must be nonblank")
+    if value != value.strip():
+        raise _WorkspaceRejected(f"{name} must not have leading/trailing whitespace")
+    if any(ord(c) < 32 or c.isspace() for c in value):
+        raise _WorkspaceRejected(
+            f"{name} must not contain whitespace or control characters"
+        )
+    if value.startswith("/") or value.endswith("/") or "//" in value:
+        raise _WorkspaceRejected(f"{name} contains an invalid slash")
+    if ".." in value:
+        raise _WorkspaceRejected(f"{name} must not contain ..")
+    if any(c in value for c in "~^:?*[\\"):
+        raise _WorkspaceRejected(f"{name} contains invalid characters")
+    if value == "@" or "@{" in value:
+        raise _WorkspaceRejected(f"{name} contains invalid @ syntax")
+    if value.endswith(".") or any(
+        part.endswith(".lock") for part in value.split("/")
+    ):
+        raise _WorkspaceRejected(f"{name} has an invalid suffix")
+    return value
+
+
 @dataclass(frozen=True)
 class _RepositoryRegistration:
     repository_identity: str
     repository_root: str
     controlled_worktree_root: str
+    github_repository: str
+    integration_branch: str
 
     def __post_init__(self):
         _validate_nonblank_str(self.repository_identity, "repository_identity")
         _validate_absolute_str(self.repository_root, "repository_root")
         _validate_absolute_str(self.controlled_worktree_root, "controlled_worktree_root")
+        object.__setattr__(
+            self,
+            "github_repository",
+            normalize_github_repository(self.github_repository),
+        )
+        _validate_integration_branch(self.integration_branch, "integration_branch")
+
+    @property
+    def canonical_ssh_url(self):
+        return f"git@github.com:{self.github_repository}.git"
+
+    @property
+    def remote_branch_ref(self):
+        return f"refs/heads/{self.integration_branch}"
+
+    @property
+    def remote_tracking_ref(self):
+        return f"refs/remotes/origin/{self.integration_branch}"
+
+    @property
+    def remote_label(self):
+        return f"origin/{self.integration_branch}"
 
 
 @dataclass(frozen=True)
@@ -199,6 +250,42 @@ class _MemberVerification:
             _validate_nonblank_str(f, "failure")
 
 
+@dataclass(frozen=True)
+class _MemberFreshness:
+    repository_identity: str
+    target_path: str
+    recorded_head: str
+    local_head: Optional[str]
+    remote_head: Optional[str]
+    branch_matches: bool
+    clean_including_untracked: bool
+    recorded_is_ancestor_of_local: bool
+    local_is_ancestor_of_remote: bool
+    remote_is_ancestor_of_local: bool
+    ready: bool
+    failures: Tuple[str, ...]
+
+    def __post_init__(self):
+        _validate_nonblank_str(self.repository_identity, "repository_identity")
+        _validate_absolute_str(self.target_path, "target_path")
+        _validate_sha(self.recorded_head, "recorded_head")
+        _validate_sha_or_none(self.local_head, "local_head")
+        _validate_sha_or_none(self.remote_head, "remote_head")
+        _validate_bool(self.branch_matches, "branch_matches")
+        _validate_bool(self.clean_including_untracked, "clean_including_untracked")
+        _validate_bool(
+            self.recorded_is_ancestor_of_local,
+            "recorded_is_ancestor_of_local",
+        )
+        _validate_bool(self.local_is_ancestor_of_remote, "local_is_ancestor_of_remote")
+        _validate_bool(self.remote_is_ancestor_of_local, "remote_is_ancestor_of_local")
+        _validate_bool(self.ready, "ready")
+        if not isinstance(self.failures, tuple):
+            raise _WorkspaceRejected("failures must be tuple")
+        for failure in self.failures:
+            _validate_nonblank_str(failure, "failure")
+
+
 class _TrustedRepositoryRegistry:
     def __init__(self, registrations: Tuple[_RepositoryRegistration, ...] = ()):
         if not isinstance(registrations, tuple):
@@ -251,28 +338,17 @@ class _SegmentWorkspaceController:
         self._registry = registry
 
     @staticmethod
-    def _resolve_origin_main(repository_root: str) -> str:
+    def _resolve_integration_head(registration: "_RepositoryRegistration") -> str:
         try:
-            result = subprocess.run(
-                ["git", "rev-parse", "refs/remotes/origin/main"],
-                cwd=repository_root,
-                shell=False,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise _WorkspaceRejected(f"git command failed: {exc}") from exc
-        if result.returncode != 0:
+            result = RepositoryBindingResolver(
+                registration
+            ).resolve_integration_head(allow_offline=True)
+        except RepositoryBindingError as exc:
             raise _WorkspaceRejected(
-                f"git rev-parse failed: {result.stderr.strip()}"
-            )
-        sha = result.stdout.strip()
-        _validate_sha(sha, "origin/main")
-        return sha
+                f"failed to resolve integration head for "
+                f"{registration.repository_identity}: {exc}"
+            ) from exc
+        return result.head_sha
 
     def load(self, *, workspace_id: str, expected_initiative_id: str, expected_segment_id: str, expected_controller_binding: str) -> _WorkspacePlan:
         _validate_nonblank_str(workspace_id, "workspace_id")
@@ -379,7 +455,7 @@ class _SegmentWorkspaceController:
             raise _WorkspaceRejected("pinned_at must be positive exact int")
 
         registration = self._registry.lookup(repository_identity)
-        trusted_sha = self._resolve_origin_main(registration.repository_root)
+        trusted_sha = self._resolve_integration_head(registration)
 
         if self._conn.in_transaction:
             raise _WorkspaceRejected("active transaction not allowed")
@@ -686,6 +762,215 @@ class _GitWorkspaceExecutor:
         if proc.returncode == 1:
             return False
         raise _WorkspaceRejected(f"git merge-base --is-ancestor failed with rc={proc.returncode}")
+
+    def inspect_freshness(self, member: _WorkspaceMember) -> _MemberFreshness:
+        if not isinstance(member, _WorkspaceMember):
+            raise _WorkspaceRejected("invalid member type")
+        if member.member_state != "materialized":
+            raise _WorkspaceRejected("member must be materialized")
+        if member.observed_head is None:
+            raise _WorkspaceRejected("member must have recorded head")
+
+        recorded_head = member.observed_head
+        _validate_sha(recorded_head, "recorded_head")
+        verification = self.verify(member)
+        if not verification.ready:
+            return _MemberFreshness(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                recorded_head=recorded_head,
+                local_head=None,
+                remote_head=None,
+                branch_matches=False,
+                clean_including_untracked=False,
+                recorded_is_ancestor_of_local=False,
+                local_is_ancestor_of_remote=False,
+                remote_is_ancestor_of_local=False,
+                ready=False,
+                failures=verification.failures,
+            )
+
+        local_head = verification.observed_head
+        if local_head is None:
+            raise _WorkspaceRejected("local head unavailable after verification")
+        _validate_sha(local_head, "local_head")
+
+        try:
+            self._git(member.repository_root, "fetch", "--no-tags", "origin")
+        except _WorkspaceRejected:
+            return _MemberFreshness(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                recorded_head=recorded_head,
+                local_head=local_head,
+                remote_head=None,
+                branch_matches=verification.branch_matches,
+                clean_including_untracked=False,
+                recorded_is_ancestor_of_local=False,
+                local_is_ancestor_of_remote=False,
+                remote_is_ancestor_of_local=False,
+                ready=False,
+                failures=("fetch_failed",),
+            )
+
+        try:
+            remote_head = self._git(
+                member.repository_root,
+                "rev-parse",
+                "refs/remotes/origin/main",
+            )
+            _validate_sha(remote_head, "remote_head")
+        except _WorkspaceRejected:
+            return _MemberFreshness(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                recorded_head=recorded_head,
+                local_head=local_head,
+                remote_head=None,
+                branch_matches=verification.branch_matches,
+                clean_including_untracked=False,
+                recorded_is_ancestor_of_local=False,
+                local_is_ancestor_of_remote=False,
+                remote_is_ancestor_of_local=False,
+                ready=False,
+                failures=("remote_ref_missing",),
+            )
+
+        try:
+            status_output = self._git(
+                member.target_path,
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            )
+        except _WorkspaceRejected:
+            return _MemberFreshness(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                recorded_head=recorded_head,
+                local_head=local_head,
+                remote_head=remote_head,
+                branch_matches=verification.branch_matches,
+                clean_including_untracked=False,
+                recorded_is_ancestor_of_local=False,
+                local_is_ancestor_of_remote=False,
+                remote_is_ancestor_of_local=False,
+                ready=False,
+                failures=("status_failed",),
+            )
+        clean_including_untracked = status_output.strip() == ""
+
+        try:
+            recorded_is_ancestor_of_local = self._is_ancestor(
+                member.target_path,
+                recorded_head,
+                local_head,
+            )
+            local_is_ancestor_of_remote = self._is_ancestor(
+                member.target_path,
+                local_head,
+                remote_head,
+            )
+            remote_is_ancestor_of_local = self._is_ancestor(
+                member.target_path,
+                remote_head,
+                local_head,
+            )
+        except _WorkspaceRejected:
+            return _MemberFreshness(
+                repository_identity=member.repository_identity,
+                target_path=member.target_path,
+                recorded_head=recorded_head,
+                local_head=local_head,
+                remote_head=remote_head,
+                branch_matches=verification.branch_matches,
+                clean_including_untracked=clean_including_untracked,
+                recorded_is_ancestor_of_local=False,
+                local_is_ancestor_of_remote=False,
+                remote_is_ancestor_of_local=False,
+                ready=False,
+                failures=("ancestry_failed",),
+            )
+
+        failures = []
+        if not verification.branch_matches:
+            failures.append("branch_mismatch")
+        if not clean_including_untracked:
+            failures.append("worktree_dirty")
+
+        return _MemberFreshness(
+            repository_identity=member.repository_identity,
+            target_path=member.target_path,
+            recorded_head=recorded_head,
+            local_head=local_head,
+            remote_head=remote_head,
+            branch_matches=verification.branch_matches,
+            clean_including_untracked=clean_including_untracked,
+            recorded_is_ancestor_of_local=recorded_is_ancestor_of_local,
+            local_is_ancestor_of_remote=local_is_ancestor_of_remote,
+            remote_is_ancestor_of_local=remote_is_ancestor_of_local,
+            ready=len(failures) == 0,
+            failures=tuple(failures),
+        )
+
+    def fast_forward_to_remote(
+        self,
+        member: _WorkspaceMember,
+        *,
+        expected_local_head: str,
+        expected_remote_head: str,
+    ) -> _MemberVerification:
+        if not isinstance(member, _WorkspaceMember):
+            raise _WorkspaceRejected("invalid member type")
+        _validate_sha(expected_local_head, "expected_local_head")
+        _validate_sha(expected_remote_head, "expected_remote_head")
+
+        verification = self.verify(member)
+        if not verification.ready:
+            raise _WorkspaceRejected(f"member not ready: {verification.failures}")
+        if not verification.branch_matches:
+            raise _WorkspaceRejected("branch mismatch")
+
+        status_output = self._git(
+            member.target_path,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        )
+        if status_output.strip() != "":
+            raise _WorkspaceRejected("worktree not clean including untracked")
+
+        remote_head = self._git(
+            member.repository_root,
+            "rev-parse",
+            "refs/remotes/origin/main",
+        )
+        _validate_sha(remote_head, "remote_head")
+        if remote_head != expected_remote_head:
+            raise _WorkspaceRejected("remote head mismatch")
+
+        local_head = self._git(member.target_path, "rev-parse", "HEAD")
+        _validate_sha(local_head, "local_head")
+        if local_head != expected_local_head:
+            raise _WorkspaceRejected("local head mismatch")
+
+        if not self._is_ancestor(
+            member.target_path,
+            expected_local_head,
+            expected_remote_head,
+        ):
+            raise _WorkspaceRejected("local head is not ancestor of remote head")
+
+        self._git(member.target_path, "merge", "--ff-only", expected_remote_head)
+
+        final_verification = self.verify(member)
+        if not final_verification.ready:
+            raise _WorkspaceRejected(
+                f"postcondition verification failed: {final_verification.failures}"
+            )
+        if final_verification.observed_head != expected_remote_head:
+            raise _WorkspaceRejected("postcondition head mismatch")
+        return final_verification
 
     def verify_merge(self, member, *, expected_main_sha, expected_source_head):
         if not isinstance(member, _WorkspaceMember):

@@ -337,6 +337,116 @@ CREATE TABLE IF NOT EXISTS external_operation_journal (
         REFERENCES segment_workspace_members (workspace_id, repository_identity)
 );
 
+-- Initiative coordination workspaces are distinct from segment workspaces and
+-- do not fabricate a segment projection. Exactly one active workspace exists
+-- for an initiative.
+CREATE TABLE IF NOT EXISTS initiative_coordination_workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    initiative_card_id INTEGER NOT NULL,
+    initiative_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    lifecycle_state TEXT NOT NULL CHECK (
+        lifecycle_state IN (
+            'planned', 'materializing', 'materialized',
+            'failed', 'merged', 'retired'
+        )
+    ),
+    controller_binding_ref TEXT NOT NULL,
+    binding_version INTEGER NOT NULL DEFAULT 1 CHECK (binding_version > 0),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    failure_detail TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (initiative_card_id, initiative_id)
+        REFERENCES adrian_kanban_cards (id, initiative_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_initiative_coordination_workspaces_active
+    ON initiative_coordination_workspaces (initiative_card_id, initiative_id)
+    WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS initiative_coordination_workspace_members (
+    workspace_id TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    required_base_sha TEXT,
+    observed_head TEXT,
+    member_state TEXT NOT NULL CHECK (
+        member_state IN (
+            'planned', 'materializing', 'materialized',
+            'failed', 'merged', 'retired'
+        )
+    ),
+    failure_detail TEXT,
+    observed_at INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, repository_identity),
+    FOREIGN KEY (workspace_id)
+        REFERENCES initiative_coordination_workspaces (workspace_id)
+);
+
+CREATE TABLE IF NOT EXISTS initiative_coordination_operation_journal (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id TEXT NOT NULL,
+    idempotency_id TEXT NOT NULL,
+    member_target TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    operation_kind TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'verified', 'failed')),
+    intended_git_evidence TEXT,
+    intended_filesystem_evidence TEXT,
+    observed_git_evidence TEXT,
+    observed_filesystem_evidence TEXT,
+    error_disposition TEXT,
+    recovery_disposition TEXT,
+    actor_evidence TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (operation_id, member_target, ordinal),
+    FOREIGN KEY (workspace_id, repository_identity)
+        REFERENCES initiative_coordination_workspace_members (
+            workspace_id, repository_identity
+        )
+);
+
+-- Initiative-closure journal: append-only recovery checkpoints spanning the
+-- irreversible Tracker close, permanent archive verification, and eventual
+-- coordination-workspace retirement.
+CREATE TABLE IF NOT EXISTS initiative_closure_operation_journal (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id TEXT NOT NULL,
+    initiative_id TEXT NOT NULL,
+    workspace_id TEXT,
+    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'prepared', 'merged', 'closed', 'archive_verified',
+            'retired', 'consumed', 'failed'
+        )
+    ),
+    evidence_json TEXT NOT NULL,
+    error_disposition TEXT,
+    recovery_stage TEXT CHECK (
+        recovery_stage IS NULL OR recovery_stage IN (
+            'prepared', 'merged', 'closed', 'archive_verified',
+            'retired', 'consumed'
+        )
+    ),
+    actor_evidence TEXT NOT NULL,
+    created_at INTEGER NOT NULL CHECK (created_at > 0),
+    UNIQUE (operation_id, ordinal),
+    FOREIGN KEY (initiative_id)
+        REFERENCES adrian_kanban_initiatives (initiative_id),
+    CHECK (
+        (state = 'failed' AND error_disposition IS NOT NULL
+            AND recovery_stage IS NOT NULL)
+        OR
+        (state != 'failed' AND error_disposition IS NULL
+            AND recovery_stage IS NULL)
+    )
+);
+
 -- Command receipts: one row per accepted mutation, keyed by the authority-global
 -- idempotency key. The row records the operation, target, request digest, and
 -- the exact accepted response envelope. Its existence proves the accepted
@@ -683,6 +793,49 @@ CREATE TABLE IF NOT EXISTS task_purge_cleanup_events (
 """
 
 
+SCHEMA_SQL += """
+CREATE TABLE IF NOT EXISTS adrian_kanban_session_startup_records (
+    session_id TEXT PRIMARY KEY,
+    protocol_version TEXT NOT NULL CHECK (TRIM(protocol_version) != ''),
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'awaiting_project_selection',
+            'awaiting_initiative_selection',
+            'resolving_lifecycle_and_work',
+            'verifying_workspace',
+            'awaiting_writegate_confirmation',
+            'anchored',
+            'failed_recoverable',
+            'cancelled'
+        )
+    ),
+    held_opening_prompt TEXT NOT NULL,
+    selected_project_id TEXT,
+    selected_initiative_id TEXT,
+    accepted_phase TEXT,
+    accepted_segment_id TEXT,
+    logical_workspace_id TEXT,
+    writegate_binding_version TEXT,
+    writegate_binding_ref TEXT,
+    failure_detail TEXT,
+    creation_stage TEXT CHECK (
+        creation_stage IS NULL OR creation_stage IN (
+            'awaiting_title',
+            'awaiting_objective',
+            'awaiting_approval'
+        )
+    ),
+    creation_draft_json TEXT,
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    release_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        release_status IN ('pending', 'issued', 'observed')
+    )
+);
+"""
+
+
 def create_schema(conn: object) -> None:
     """Apply the foundational schema (idempotent)."""
     conn.executescript(SCHEMA_SQL)
@@ -705,3 +858,27 @@ def create_schema(conn: object) -> None:
         conn.execute("ALTER TABLE adrian_kanban_cards ADD COLUMN body TEXT")
     if "closed_at" not in existing:
         conn.execute("ALTER TABLE adrian_kanban_cards ADD COLUMN closed_at INTEGER")
+    startup_cols = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(adrian_kanban_session_startup_records)"
+        )
+    }
+    if "release_status" not in startup_cols:
+        conn.execute(
+            "ALTER TABLE adrian_kanban_session_startup_records "
+            "ADD COLUMN release_status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK (release_status IN ('pending', 'issued', 'observed'))"
+        )
+    if "creation_stage" not in startup_cols:
+        conn.execute(
+            "ALTER TABLE adrian_kanban_session_startup_records "
+            "ADD COLUMN creation_stage TEXT CHECK ("
+            "creation_stage IS NULL OR creation_stage IN ("
+            "'awaiting_title', 'awaiting_objective', 'awaiting_approval'))"
+        )
+    if "creation_draft_json" not in startup_cols:
+        conn.execute(
+            "ALTER TABLE adrian_kanban_session_startup_records "
+            "ADD COLUMN creation_draft_json TEXT"
+        )

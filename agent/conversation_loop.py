@@ -48,6 +48,7 @@ from agent.turn_context import (
     compose_user_api_content,
     reanchor_current_turn_user_idx,
 )
+from agent.turn_admission import resolve_pre_user_turn
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
@@ -1949,6 +1950,43 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    _admission = resolve_pre_user_turn(
+        agent,
+        user_message,
+        conversation_history,
+        task_id,
+        persist_user_message,
+        getattr(agent, "model", None),
+        getattr(agent, "platform", None),
+    )
+    if _admission is not None:
+        _action = _admission.get("action")
+        if _action == "respond":
+            # Admission responses are real user-visible replies even though
+            # they deliberately bypass the model turn and transcript
+            # persistence (for example, Session Startup project/initiative
+            # selection).  Stream the response through the same callback as a
+            # model answer before returning the authoritative final response.
+            #
+            # Desktop uses receipt of an assistant payload to distinguish a
+            # locally completed turn from one that needs durable-history
+            # hydration.  Returning only ``final_response`` made a fast
+            # intercepted turn look payload-free, so Desktop immediately
+            # hydrated the intentionally empty persisted transcript and
+            # blanked the selection dialogue.
+            _response = _admission["result"].get("final_response")
+            if stream_callback is not None and isinstance(_response, str) and _response:
+                stream_callback(_response)
+            return _admission["result"]
+        if _action == "fail":
+            _response = _admission["result"].get("final_response")
+            if stream_callback is not None and isinstance(_response, str) and _response:
+                stream_callback(_response)
+            return _admission["result"]
+        if _action == "rewrite":
+            user_message = _admission["model_message"]
+            persist_user_message = _admission["persist_message"]
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later

@@ -312,8 +312,20 @@ def test_approved_override_into_dev2_materializes_planned_segment_before_movemen
                 repository_identity="repo-1",
                 repository_root=str(repository),
                 controlled_worktree_root=str(controlled_root),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="main",
             ),
         )
+    )
+    monkeypatch.setattr(
+        commands_module._CommandBoundary,
+        "_revalidate_repository_reconciliation",
+        lambda self, conn, reconciliation_ref: None,
+    )
+    monkeypatch.setattr(
+        workspace._SegmentWorkspaceController,
+        "_resolve_integration_head",
+        staticmethod(lambda _registration: base_sha),
     )
     with sqlite3.connect(path) as conn:
         card_id = conn.execute(

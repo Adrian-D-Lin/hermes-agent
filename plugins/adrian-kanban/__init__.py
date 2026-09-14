@@ -56,11 +56,25 @@ def _trusted_repository_registry_getter():
                 f"kanban.repository_registry.{repository_id}.repository_root "
                 "must be an absolute path"
             )
+        github_repository = entry.get("github_repository")
+        if not isinstance(github_repository, str) or not github_repository.strip():
+            raise ValueError(
+                f"kanban.repository_registry.{repository_id}.github_repository "
+                "must be nonblank"
+            )
+        integration_branch = entry.get("integration_branch")
+        if not isinstance(integration_branch, str) or not integration_branch.strip():
+            raise ValueError(
+                f"kanban.repository_registry.{repository_id}.integration_branch "
+                "must be nonblank"
+            )
         registrations.append(
             _RepositoryRegistration(
                 repository_identity=repository_id,
                 repository_root=resolved_root,
                 controlled_worktree_root=shared_root,
+                github_repository=github_repository,
+                integration_branch=integration_branch,
             )
         )
     return _TrustedRepositoryRegistry(tuple(registrations))
@@ -121,6 +135,7 @@ def register(ctx) -> None:
     from .provider import AdrianKanbanAuthorityProvider, register_provider
     from .routing import ModelToolBoardResolver, resolve_expected_version
     from .phase_preparer import GitPhaseResultPreparer
+    from .session_startup_runtime import build_session_startup_hook
 
     cached_provider = _provider_cache.get(database_path)
     if cached_provider is not None and cached_provider.is_healthy():
@@ -181,6 +196,10 @@ def register(ctx) -> None:
     )
     ctx.register_hook(
         "pre_tool_call", build_pre_tool_hook(preparer, segment_preparer)
+    )
+    ctx.register_hook(
+        "pre_user_turn",
+        build_session_startup_hook(database_path, trusted_registry, boundary),
     )
     return None
 

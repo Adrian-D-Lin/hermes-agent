@@ -355,6 +355,11 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
         supplied = {"board": "orchestrator"}
         if operation in commands_module.INITIATIVE_OPERATIONS:
             supplied["initiative_id"] = "initiative-1"
+            if operation == "kanban_update_initiative":
+                # This generic delegation test uses a recording boundary;
+                # supplying an approval keeps it out of the real public
+                # approval workflow tested separately.
+                supplied["approval_id"] = "approval-update-initiative"
         elif operation == "kanban_link":
             supplied.update(parent_id="task-parent", child_id="task-child")
         elif operation in commands_module.ORDINARY_TASK_OPERATIONS:
