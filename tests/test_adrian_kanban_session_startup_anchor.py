@@ -212,6 +212,7 @@ def _binding(member_roots, **overrides):
         "logical_workspace_id": "coord-initiative-1",
         "member_roots": tuple(member_roots),
         "binding_version": 1,
+        "profile": "default",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -276,6 +277,7 @@ def test_happy_composition_uses_only_authoritative_fields(modules, tmp_path):
             "logical_workspace_id": "coord-initiative-1",
             "member_roots": (str(member_root),),
             "binding_version": 1,
+            "profile": "default",
         }
     ]
 
@@ -583,6 +585,34 @@ def test_revalidate_stale_valid_binding_is_repairable(modules, tmp_path):
     assert result["classification"] == "focused_revalidation_required"
     assert result["reasons"] == ["binding_board_changed", "binding_ref_changed"]
     assert result["writegate_binding_ref"] == "43"
+
+
+def test_revalidate_missing_binding_profile_requires_focused_repair(
+    modules, tmp_path
+):
+    database = tmp_path / "tracker.db"
+    root = tmp_path / "primary"
+    _seed_materialized_workspace(database, modules["schema"])
+    member_root = tmp_path / "member"
+    materializer = _FakeMaterializer(
+        {
+            "workspace_id": "coord-initiative-1",
+            "binding_version": 1,
+            "member_roots": [str(member_root)],
+        }
+    )
+    resolver = _revalidator(
+        modules,
+        database,
+        root,
+        materializer,
+        lambda _session_id: _binding([str(member_root)], profile=None),
+    )
+
+    result = resolver.revalidate(*_anchored_inputs(root))
+
+    assert result["classification"] == "focused_revalidation_required"
+    assert result["reasons"] == ["binding_profile_changed"]
 
 
 def test_revalidate_root_order_preserves_primary_member_semantics(modules, tmp_path):

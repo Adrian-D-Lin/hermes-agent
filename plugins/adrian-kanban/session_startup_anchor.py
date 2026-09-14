@@ -332,6 +332,7 @@ class SessionStartupAnchorResolver:
                 logical_workspace_id=workspace_id,
                 member_roots=member_roots,
                 binding_version=binding_version,
+                profile="default",
             )
             if binding_record is None:
                 raise SessionStartupAnchorError(
@@ -778,6 +779,8 @@ class SessionStartupAnchorResolver:
                     reasons.append("binding_board_changed")
                 if binding_fields["logical_workspace_id"] != materialized_workspace_id:
                     reasons.append("binding_workspace_changed")
+                if getattr(binding, "profile", None) != "default":
+                    reasons.append("binding_profile_changed")
                 canonical_binding_roots = tuple(
                     _canonical_path(root) for root in binding_roots
                 )
