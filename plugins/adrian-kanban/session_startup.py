@@ -11,6 +11,7 @@ from .validation import (
     SessionStartupRevisionError,
     SessionStartupStateError,
 )
+from .session_startup_onboarding import OnboardingCoordinator
 
 PROTOCOL_VERSION = "v0.29"
 
@@ -33,6 +34,7 @@ class SessionStartupController:
             [Dict[str, Any], Dict[str, Any], Dict[str, Any]], Dict[str, Any]
         ],
         initiative_creation_coordinator: Any,
+        onboarding_coordinator: Optional[OnboardingCoordinator] = None,
     ) -> None:
         self._store = store
         self._project_loader = project_loader
@@ -47,6 +49,13 @@ class SessionStartupController:
                     f"{method}"
                 )
         self._initiative_creation_coordinator = initiative_creation_coordinator
+        if onboarding_coordinator is not None and not isinstance(
+            onboarding_coordinator, OnboardingCoordinator
+        ):
+            raise TypeError(
+                "onboarding_coordinator must be an OnboardingCoordinator"
+            )
+        self._onboarding_coordinator = onboarding_coordinator
 
     def handle(
         self,
@@ -59,23 +68,56 @@ class SessionStartupController:
         """Main hook callback."""
         if not session_id or not str(session_id).strip():
             return self._fail_closed("Missing or blank session ID.")
-        if user_message is None or not isinstance(user_message, str) or not user_message.strip():
-            return self._fail_closed("User message must be a non-blank text string.")
-
+        # Onboarding accepts blank input (blank = accept the default for the
+        # current field), so the blank guard is lifted only while the
+        # durable onboarding substate is active.
+        onboarding_active = False
         try:
             record = self._store.read_session_startup(session_id=session_id)
-            if record is None:
+        except Exception as exc:
+            return self._fail_closed(f"Failed to read session startup: {exc}")
+        if record is None:
+            # A brand-new record has no durable onboarding substate, so a
+            # blank/None opening prompt has nothing to act on: fail closed
+            # before creating the startup record. Blank input is only allowed
+            # while an existing active onboarding record is in progress.
+            if (
+                user_message is None
+                or not isinstance(user_message, str)
+                or not user_message.strip()
+            ):
+                return self._fail_closed(
+                    "User message must be a non-blank text string."
+                )
+            try:
                 record = self._store.create_or_read_session_startup(
                     session_id=session_id,
                     opening_prompt=user_message,
                     protocol_version=PROTOCOL_VERSION,
                 )
+            except Exception as exc:
+                return self._fail_closed(
+                    f"Failed to initialize session startup: {exc}"
+                )
+            try:
                 projects = self._load_projects()
-                if not projects:
-                    return self._fail_closed("No active projects available.")
-                return self._present_projects(projects)
-        except Exception as exc:
-            return self._fail_closed(f"Failed to initialize session startup: {exc}")
+            except Exception as exc:
+                return self._fail_closed(
+                    f"Failed to initialize project list: {exc}"
+                )
+            # The menu always appends "Create a new project" as the
+            # final choice, so creation stays available even when the
+            # project list is empty.
+            return self._present_projects(projects)
+        onboarding_active = bool(record.get("onboarding_json"))
+        if (
+            user_message is None
+            or not isinstance(user_message, str)
+            or (not user_message.strip() and not onboarding_active)
+        ):
+            return self._fail_closed(
+                "User message must be a non-blank text string."
+            )
 
         state = record["state"]
 
@@ -110,18 +152,62 @@ class SessionStartupController:
         except Exception as exc:
             return self._fail_closed(f"Failed to load projects: {exc}")
 
-        if not projects:
-            return self._fail_closed("No active projects available.")
+        # Durable project onboarding (S2B) is routed through the injected
+        # coordinator whenever its substate is present.
+        if record.get("onboarding_json"):
+            coordinator = self._onboarding_coordinator
+            if coordinator is None:
+                return self._fail_closed(
+                    "Project onboarding is active but the coordinator is "
+                    "not configured."
+                )
+            try:
+                result = coordinator.handle(record, user_message)
+            except Exception as exc:
+                return self._fail_closed(f"Project onboarding failed: {exc}")
+            # Route the coordinator result through the existing handback
+            # handling so a successful executor transitions to the initiative
+            # picker instead of returning a raw handback object.
+            if isinstance(result, dict) and result.get("action") == "handback":
+                return self._hand_back_new_project(
+                    record, result.get("project_id"), result.get("revision")
+                )
+            # A cancel clears the onboarding substate; the controller owns
+            # project loading and menu rendering, so route the narrow
+            # return-to-projects action through the normal project menu.
+            if isinstance(result, dict) and result.get("action") == "return_to_projects":
+                prefix = result.get("prefix")
+                return self._present_projects(
+                    projects, prefix=prefix or None
+                )
+            return result
 
         selection = user_message.strip()
         if not selection:
             return self._present_projects(projects)
 
         result = self._resolve_project(projects, selection)
+        if isinstance(result, dict) and result.get("status") == "create_project":
+            coordinator = self._onboarding_coordinator
+            if coordinator is None:
+                return self._fail_closed(
+                    "New project onboarding is not configured for this "
+                    "runtime."
+                )
+            try:
+                return coordinator.start_onboarding(record)
+            except Exception as exc:
+                return self._fail_closed(f"Project onboarding failed: {exc}")
         if result is None:
             return self._present_projects(projects)
         if isinstance(result, str):
             return self._present_projects(projects, prefix=result)
+
+        # Executor success hands back the new project's identity: reload the
+        # project list, locate that exact project, and emit the normal
+        # initiative picker immediately — no Session Startup restart.
+        if isinstance(result, dict) and result.get("action") == "handback":
+            return self._hand_back_new_project(record, result.get("project_id"))
 
         project = result
         try:
@@ -134,6 +220,56 @@ class SessionStartupController:
         except (SessionStartupRevisionError, SessionStartupStateError) as exc:
             return self._transition_failed(record, exc)
 
+        return self._present_initiatives(record, project)
+
+    def _hand_back_new_project(
+        self, record: Dict[str, Any], project_id: Optional[str],
+        revision: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Complete project selection after successful onboarding.
+
+        The executor already cleared the onboarding substate and returned
+        the new project's identity; this reloads the project list,
+        transitions the record to ``awaiting_initiative_selection``, and
+        emits the initiative picker for the new project.
+
+        ``revision`` is the newest record revision the executor's persist
+        callback returned; it is used for the transition CAS so the update
+        is not rejected as stale after the onboarding journal was written.
+        """
+        if not isinstance(project_id, str) or not project_id.strip():
+            return self._fail_closed(
+                "The new project's identity is unavailable. Please re-run "
+                "Session Startup."
+            )
+        try:
+            projects = self._load_projects()
+            project = next(
+                (p for p in projects if p["id"] == project_id.strip()), None
+            )
+            if project is None:
+                # The executor returned an identity that the reloaded project
+                # list cannot confirm. Do not fabricate a placeholder: fail
+                # closed with an actionable response.
+                return self._fail_closed(
+                    "The new project's identity could not be confirmed after "
+                    "creation. Please re-run Session Startup."
+                )
+        except Exception as exc:
+            return self._fail_closed(f"Failed to load projects: {exc}")
+
+        expected = revision if revision is not None else record["revision"]
+        try:
+            record = self._store.transition_session_startup(
+                session_id=record["session_id"],
+                expected_revision=expected,
+                to_state="awaiting_initiative_selection",
+                selected_project_id=project["id"],
+            )
+        except Exception as exc:
+            return self._fail_closed(
+                f"Failed to complete project onboarding: {exc}"
+            )
         return self._present_initiatives(record, project)
 
     def _handle_initiative_selection(
@@ -904,7 +1040,12 @@ class SessionStartupController:
             idx = int(selection)
             if 1 <= idx <= len(projects):
                 return projects[idx - 1]
+            if idx == len(projects) + 1:
+                # Final menu entry: "Create a new project".
+                return {"status": "create_project"}
             return "Invalid project selection. Please choose a valid project number or name."
+        if selection.strip().lower() == "create a new project":
+            return {"status": "create_project"}
         matches = [p for p in projects if p["id"] == selection]
         if len(matches) == 1:
             return matches[0]
@@ -946,6 +1087,7 @@ class SessionStartupController:
         lines.append("Select a project:")
         for i, p in enumerate(projects, 1):
             lines.append(f"{i}. {p['name']} ({p['id']})")
+        lines.append(f"{len(projects) + 1}. Create a new project")
         return {"action": "respond", "response": "\n".join(lines)}
 
     def _present_initiatives(
