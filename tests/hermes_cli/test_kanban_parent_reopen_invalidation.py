@@ -152,6 +152,16 @@ def test_counter_reset_on_invalidated_descendants(conn):
     assert child.consecutive_failures == 0
 
 
+@pytest.mark.skipif(
+    not (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "plugin_api.py"
+    ).is_file(),
+    reason="the superseded native Kanban dashboard is not shipped",
+)
 def test_dashboard_and_db_paths_produce_identical_outcomes(tmp_path, monkeypatch):
     fastapi = pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

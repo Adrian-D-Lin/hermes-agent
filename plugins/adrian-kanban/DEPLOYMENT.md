@@ -48,11 +48,15 @@ Preserve any unrelated entries already present in `plugins.enabled` and
 `plugins.disabled`; the lists above state only the two required Tracker
 entries.  `kanban` is the superseded native Hermes Kanban product surface and
 must remain disabled, while `adrian-kanban` is the enabled Initiative Tracker.
-The Desktop's separately bundled native Kanban extension is also off by
-default and must not be manually enabled.  The retained
+The Adrian distribution does not ship the superseded native product surfaces:
+`plugins/kanban` (server dashboard/service) and
+`apps/desktop/src/plugins/kanban` (bundled Desktop board). Do not restore those
+directories during an upstream merge. The retained
 `hermes_cli.kanban_db*` modules are not a second board: they are the shared
 task/run, comment, attachment, dispatch, transaction, and workspace substrate
-used by the Initiative Tracker itself.
+used by the Initiative Tracker itself. `hermes_cli.kanban_authority` is likewise
+required. None of these shared modules may be removed until every Initiative
+Tracker caller has first been replaced.
 
 Each active Hermes Project with a Tracker `board_slug` must have one absolute
 `primary_path` that resolves to exactly one registered repository. Do not infer
