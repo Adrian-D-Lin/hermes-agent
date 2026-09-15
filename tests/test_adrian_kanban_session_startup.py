@@ -1969,13 +1969,29 @@ def test_runtime_hook_excludes_nested_worker_and_every_nondefault_profile_withou
 ):
     runtime = adrian_plugin_modules["session_startup_runtime"]
     opened = []
+    construction = []
 
     class ForbiddenStore:
         def __init__(self, *args, **kwargs):
             opened.append((args, kwargs))
             raise AssertionError("excluded callback opened the store")
 
+    class ForbiddenOnboardingFactory:
+        def __init__(self, *args, **kwargs):
+            construction.append((args, kwargs))
+            raise AssertionError("excluded callback constructed onboarding")
+
     monkeypatch.setattr(runtime, "AdmittedStore", ForbiddenStore)
+    monkeypatch.setattr(
+        runtime, "make_onboarding_callbacks", ForbiddenOnboardingFactory
+    )
+    monkeypatch.setattr(
+        runtime, "RepositoryProvisioner", ForbiddenOnboardingFactory
+    )
+    monkeypatch.setattr(
+        runtime, "build_onboarding_operation_executor", ForbiddenOnboardingFactory
+    )
+    monkeypatch.setattr(runtime, "OnboardingCoordinator", ForbiddenOnboardingFactory)
     monkeypatch.setattr(
         runtime,
         "SessionStartupAnchorResolver",
@@ -2004,6 +2020,7 @@ def test_runtime_hook_excludes_nested_worker_and_every_nondefault_profile_withou
         )
         assert hook() == {"action": "allow"}
     assert opened == []
+    assert construction == []
 
 
 def test_runtime_hook_uses_fresh_store_and_forwards_top_level_turns(
@@ -2012,6 +2029,7 @@ def test_runtime_hook_uses_fresh_store_and_forwards_top_level_turns(
     runtime = adrian_plugin_modules["session_startup_runtime"]
     stores = []
     calls = []
+    executor_calls = []
 
     class FakeStore:
         def __init__(self, database_path):
@@ -2033,6 +2051,39 @@ def test_runtime_hook_uses_fresh_store_and_forwards_top_level_turns(
             calls.append(("handle", kwargs))
             return {"action": "respond", "response": "choose"}
 
+    def fake_callbacks():
+        callbacks = {
+            "repo_inspector": lambda repo: "main",
+            "proposal_preparer": lambda payload: {},
+        }
+        calls.append(("callbacks", callbacks))
+        return callbacks
+
+    provisioners = []
+
+    class FakeProvisioner:
+        def __init__(self, *args, **kwargs):
+            provisioners.append(self)
+
+    def fake_executor_factory(provisioner):
+        def executor(_record, _proposal, _persist):
+            return {"status": "created", "project": {"id": "p1"}}
+
+        executor_calls.append((provisioner, executor))
+        return executor
+
+    coordinators = []
+
+    class FakeCoordinator:
+        def __init__(self, store, operation_executor, **callbacks):
+            self.store = store
+            self.operation_executor = operation_executor
+            self.callbacks = callbacks
+            coordinators.append(self)
+
+        def handle(self, *args, **kwargs):
+            return {"action": "respond", "response": "choose"}
+
     resolver = type(
         "Resolver",
         (),
@@ -2050,6 +2101,12 @@ def test_runtime_hook_uses_fresh_store_and_forwards_top_level_turns(
     monkeypatch.setattr(
         runtime, "SessionStartupAnchorResolver", lambda **_kwargs: resolver
     )
+    monkeypatch.setattr(runtime, "make_onboarding_callbacks", fake_callbacks)
+    monkeypatch.setattr(runtime, "RepositoryProvisioner", FakeProvisioner)
+    monkeypatch.setattr(
+        runtime, "build_onboarding_operation_executor", fake_executor_factory
+    )
+    monkeypatch.setattr(runtime, "OnboardingCoordinator", FakeCoordinator)
     monkeypatch.setattr(
         runtime.profiles, "get_active_profile_name", lambda: "default"
     )
@@ -2077,6 +2134,67 @@ def test_runtime_hook_uses_fresh_store_and_forwards_top_level_turns(
         "session-2",
     ]
     assert all(fields["user_message"] == "opening" for fields in handles)
+    inits = [fields for kind, fields in calls if kind == "init"]
+    callback_payloads = [payload for kind, payload in calls if kind == "callbacks"]
+    assert len(inits) == len(coordinators) == 2
+    for turn in range(2):
+        assert inits[turn]["store"] is stores[turn]
+        assert inits[turn]["onboarding_coordinator"] is coordinators[turn]
+        assert coordinators[turn].store is stores[turn]
+        assert coordinators[turn].callbacks == callback_payloads[turn]
+        executor_provisioner, executor = executor_calls[turn]
+        assert executor_provisioner is provisioners[turn]
+        assert coordinators[turn].operation_executor is executor
+
+
+def test_runtime_hook_onboarding_construction_failure_is_fail_closed(
+    adrian_plugin_modules, monkeypatch, tmp_path
+):
+    runtime = adrian_plugin_modules["session_startup_runtime"]
+
+    class FakeStore:
+        def __init__(self, database_path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    def broken_callbacks():
+        raise RuntimeError("onboarding dependency unavailable")
+
+    resolver = type(
+        "Resolver",
+        (),
+        {
+            "resolve": lambda *args: {},
+            "revalidate": lambda *args: {},
+            "replace": lambda *args: {},
+        },
+    )()
+    monkeypatch.setattr(runtime, "AdmittedStore", FakeStore)
+    monkeypatch.setattr(runtime, "make_onboarding_callbacks", broken_callbacks)
+    monkeypatch.setattr(
+        runtime, "SessionStartupAnchorResolver", lambda **_kwargs: resolver
+    )
+    monkeypatch.setattr(
+        runtime.profiles, "get_active_profile_name", lambda: "default"
+    )
+    hook = runtime.build_session_startup_hook(
+        str((tmp_path / "tracker.db").resolve()),
+        object(),
+        type("Boundary", (), {"submit": lambda *_args, **_kwargs: {}})(),
+    )
+
+    result = hook(session_id="session-1", user_message="opening")
+    assert result == {
+        "action": "fail_closed",
+        "response": (
+            "[Session Startup] runtime error: onboarding dependency unavailable"
+        ),
+    }
 
 
 def test_runtime_hook_dependency_failure_is_explicit_and_recoverable(

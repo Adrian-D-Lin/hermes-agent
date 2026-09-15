@@ -11,6 +11,10 @@ from .projections import list_projection
 from .session_startup import SessionStartupController
 from .session_startup_anchor import SessionStartupAnchorResolver
 from .session_startup_creation import SessionStartupInitiativeCreationCoordinator
+from .session_startup_executor import build_onboarding_operation_executor
+from .session_startup_onboarding import OnboardingCoordinator
+from .session_startup_proposal import make_onboarding_callbacks
+from .session_startup_provisioning import RepositoryProvisioner
 from .store import AdmittedStore
 
 
@@ -121,6 +125,15 @@ def build_session_startup_hook(
 
         try:
             with AdmittedStore(database_path=normalized_path) as store:
+                callbacks = make_onboarding_callbacks()
+                operation_executor = build_onboarding_operation_executor(
+                    RepositoryProvisioner()
+                )
+                onboarding_coordinator = OnboardingCoordinator(
+                    store,
+                    operation_executor=operation_executor,
+                    **callbacks,
+                )
                 controller = SessionStartupController(
                     store=store,
                     project_loader=load_projects,
@@ -129,6 +142,7 @@ def build_session_startup_hook(
                     anchor_revalidator=anchor_resolver.revalidate,
                     anchor_replacer=anchor_resolver.replace,
                     initiative_creation_coordinator=creation_coordinator,
+                    onboarding_coordinator=onboarding_coordinator,
                 )
                 return controller.handle(
                     session_id=session_id,
