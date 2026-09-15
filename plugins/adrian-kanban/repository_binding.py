@@ -74,6 +74,49 @@ def normalize_github_repository(remote: str) -> str:
     return f"{owner.lower()}/{repo.lower()}"
 
 
+def validate_github_repository_name(name: Any) -> str:
+    """Validate and return a bare GitHub repository name."""
+    if not isinstance(name, str):
+        raise ValueError("repository name must be text")
+    text = name.strip()
+    if not text:
+        raise ValueError("repository name is required")
+    if len(text) > 100:
+        raise ValueError("repository name must be at most 100 characters")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", text):
+        raise ValueError(
+            "repository name contains invalid characters "
+            "(letters, digits, dots, hyphens, underscores only)"
+        )
+    return text
+
+
+def validate_integration_branch(branch: Any) -> str:
+    """Validate and return a Git-safe integration branch name."""
+    if not isinstance(branch, str):
+        raise ValueError("integration branch must be text")
+    text = branch.strip()
+    if not text:
+        raise ValueError("integration branch is required")
+    if len(text) > 100:
+        raise ValueError("integration branch must be at most 100 characters")
+    if any(ord(char) < 32 or char.isspace() for char in text):
+        raise ValueError("integration branch contains invalid characters")
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", text):
+        raise ValueError("integration branch contains invalid characters")
+    if text.startswith("/") or text.endswith("/") or "//" in text:
+        raise ValueError("integration branch contains an invalid slash pattern")
+    if ".." in text:
+        raise ValueError("integration branch contains an invalid dot pattern")
+    if text == "@" or "@{" in text:
+        raise ValueError("integration branch contains invalid @ syntax")
+    if text.endswith(".") or any(
+        part.endswith(".lock") for part in text.split("/")
+    ):
+        raise ValueError("integration branch has an invalid suffix")
+    return text
+
+
 class RepositoryBindingResolver:
     """Resolve a registered repository's configured integration head."""
 
