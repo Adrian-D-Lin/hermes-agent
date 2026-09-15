@@ -1,4 +1,6 @@
 {
   "schema_version": 1,
-  "keys": {}
+  "keys": {
+    "adrian-release-1": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAbfNhR4pnBicYXG2zVrlgoEY4qH82/TvzAUKIIYTbWHo=\n-----END PUBLIC KEY-----\n"
+  }
 }
