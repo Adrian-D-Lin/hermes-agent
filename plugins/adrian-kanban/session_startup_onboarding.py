@@ -464,21 +464,11 @@ class OnboardingCoordinator:
 
     # -- persistence --------------------------------------------------------
 
-    def _persist(
-        self,
-        record: Dict[str, Any],
-        stage: str,
-        draft: Dict[str, Any],
-        journal: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    def render(self, record: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            record = self._store.set_session_startup_onboarding(
-                session_id=record["session_id"],
-                expected_revision=record["revision"],
-                onboarding={"stage": stage, "draft": draft, "journal": journal},
-            )
-        except (SessionStartupRevisionError, SessionStartupStateError) as exc:
-            return self._persist_failed(record, exc)
+            stage, draft, journal = self._state(record)
+        except ValueError as exc:
+            return _resp(f"Stored onboarding state is invalid: {exc}")
         if stage == "choose_mode":
             return self._mode_prompt()
         if stage in ("create_details", "bind_details"):
@@ -510,7 +500,24 @@ class OnboardingCoordinator:
                 f"Project creation is blocked: {error_text}\n"
                 "Enter retry to run the persisted proposal again, or Cancel."
             )
-        raise ValueError(f"unsupported onboarding stage {stage!r}")
+        return _resp(f"Unexpected onboarding stage: {stage!r}")
+
+    def _persist(
+        self,
+        record: Dict[str, Any],
+        stage: str,
+        draft: Dict[str, Any],
+        journal: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            record = self._store.set_session_startup_onboarding(
+                session_id=record["session_id"],
+                expected_revision=record["revision"],
+                onboarding={"stage": stage, "draft": draft, "journal": journal},
+            )
+        except (SessionStartupRevisionError, SessionStartupStateError) as exc:
+            return self._persist_failed(record, exc)
+        return self.render(record)
 
     def _cancel(
         self, record: Dict[str, Any], prefix: str = ""

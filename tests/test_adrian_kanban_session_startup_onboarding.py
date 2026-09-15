@@ -1355,3 +1355,38 @@ def test_blank_message_allowed_when_onboarding_active(
         record = _record(store, "session-1")
         assert record is not None
         assert record["onboarding_json"] is not None
+
+
+def test_persisted_onboarding_prompt_uses_the_public_renderer(
+    adrian_plugin_modules, kanban_home
+):
+    Store = adrian_plugin_modules["store"].AdmittedStore
+    with Store(database_path=_db_path(kanban_home, "shared-renderer")) as store:
+        coordinator = _coordinator(adrian_plugin_modules, store)
+        controller = _controller(
+            adrian_plugin_modules, store, coordinator=coordinator
+        )
+        controller.handle("session-1", "opening")
+        choose_mode = controller.handle("session-1", "3")
+        record = _record(store, "session-1")
+        assert coordinator.render(record) == choose_mode
+
+        display_name = controller.handle("session-1", "1")
+        record = _record(store, "session-1")
+        assert coordinator.render(record) == display_name
+        assert controller.resume_notice("session-1") == display_name["response"]
+        assert display_name["response"].count("[Session Startup]") == 1
+
+
+def test_onboarding_renderer_reports_invalid_durable_state(
+    adrian_plugin_modules, kanban_home
+):
+    Store = adrian_plugin_modules["store"].AdmittedStore
+    with Store(database_path=_db_path(kanban_home, "invalid-renderer")) as store:
+        coordinator = _coordinator(adrian_plugin_modules, store)
+        rendered = coordinator.render({"onboarding_json": "not-json"})
+
+    assert rendered["action"] == "respond"
+    assert rendered["response"].startswith(
+        "[Session Startup] Stored onboarding state is invalid:"
+    )

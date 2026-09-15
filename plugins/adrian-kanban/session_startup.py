@@ -141,6 +141,60 @@ class SessionStartupController:
 
         return self._fail_closed(f"Unexpected state: {state}")
 
+    def resume_notice(self, session_id: Optional[str]) -> Optional[str]:
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None
+        record = self._store.read_session_startup(session_id=session_id)
+        if record is None or record.get("state") == "cancelled":
+            return None
+
+        def response_text(rendered, source):
+            if not isinstance(rendered, dict) or not isinstance(rendered.get("response"), str) or not rendered["response"].strip():
+                raise ValueError(f"Malformed response from {source}.")
+            return rendered["response"]
+
+        state = record.get("state")
+        if record.get("onboarding_json"):
+            if self._onboarding_coordinator is None:
+                raise ValueError("Onboarding coordinator is required for onboarding state.")
+            return response_text(self._onboarding_coordinator.render(record), "onboarding coordinator")
+
+        if state == "awaiting_project_selection":
+            return response_text(self._present_projects(self._load_projects()), "project selection")
+
+        if state == "awaiting_initiative_selection":
+            projects = self._load_projects()
+            selected = [p for p in projects if p.get("id") == record.get("selected_project_id")]
+            if len(selected) == 0:
+                raise ValueError("Selected project not found.")
+            if len(selected) > 1:
+                raise ValueError("Selected project is ambiguous.")
+            project = selected[0]
+            if record.get("creation_stage") is not None:
+                return response_text(self._initiative_creation_prompt(record["creation_stage"]), "initiative creation prompt")
+            return response_text(self._present_initiatives(record, project), "initiative selection")
+
+        if state in ("resolving_lifecycle_and_work", "verifying_workspace", "awaiting_writegate_confirmation"):
+            return response_text(self._handle_in_progress(record), "in-progress handler")
+
+        if state == "failed_recoverable":
+            detail = record.get("failure_detail")
+            failure = detail.strip() if isinstance(detail, str) and detail.strip() else "an unspecified failure"
+            return f"[Session Startup] Session startup needs recovery: {failure}. Enter Retry to continue Session Startup."
+
+        if state == "anchored":
+            release_status = record.get("release_status")
+            if release_status == "observed":
+                return None
+            if release_status in ("pending", "issued"):
+                held = record.get("held_opening_prompt")
+                if not isinstance(held, str):
+                    raise ValueError("held_opening_prompt must be a string.")
+                return f"[Session Startup] Your opening request is awaiting release:\n{held}\nEnter Retry to continue Session Startup."
+            raise ValueError(f"Unknown release status: {release_status}")
+
+        raise ValueError(f"Unknown state or status: {state}")
+
     def _fail_closed(self, message: str) -> Dict[str, Any]:
         return {"action": "respond", "response": f"[Session Startup] {message}"}
 
@@ -330,10 +384,25 @@ class SessionStartupController:
             return self._fail_closed(
                 f"Failed to begin initiative creation: {exc}"
             )
-        return self._routing_response(
-            "Enter the new initiative title, or enter Cancel to return to "
-            "the initiative list."
-        )
+        return self._initiative_creation_prompt("awaiting_title")
+
+    def _initiative_creation_prompt(self, stage: Any) -> Dict[str, Any]:
+        if stage == "awaiting_title":
+            return self._routing_response(
+                "Enter the new initiative title, or enter Cancel to return to "
+                "the initiative list."
+            )
+        if stage == "awaiting_objective":
+            return self._routing_response(
+                "Enter the new initiative objective, or enter Cancel to return "
+                "to the initiative list."
+            )
+        if stage == "awaiting_approval":
+            return self._routing_response(
+                "A creation proposal is awaiting resolution. Enter Retry to "
+                "present it again, Change to replace it, or Cancel."
+            )
+        return self._fail_closed(f"Unexpected initiative creation stage: {stage}")
 
     def _handle_initiative_creation(
         self,
@@ -367,10 +436,7 @@ class SessionStartupController:
                 return self._fail_closed(
                     f"Failed to retain the initiative title: {exc}"
                 )
-            return self._routing_response(
-                "Enter the new initiative objective, or enter Cancel to return "
-                "to the initiative list."
-            )
+            return self._initiative_creation_prompt("awaiting_objective")
 
         if stage == "awaiting_objective":
             if lowered in {"cancel", "back"}:
@@ -428,10 +494,7 @@ class SessionStartupController:
                 return self._clear_initiative_creation(record, project)[1]
             if lowered == "retry":
                 return self._execute_initiative_creation(record, project)
-            return self._routing_response(
-                "A creation proposal is awaiting resolution. Enter Retry to "
-                "present it again, Change to replace it, or Cancel."
-            )
+            return self._initiative_creation_prompt("awaiting_approval")
 
         return self._fail_closed(f"Unexpected initiative creation stage: {stage}")
 

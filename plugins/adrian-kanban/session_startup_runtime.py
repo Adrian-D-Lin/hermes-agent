@@ -63,11 +63,38 @@ def build_initiative_loader(database_path: str) -> Callable[[str], List[Dict[str
     return load
 
 
-def build_session_startup_hook(
+def _build_controller(
+    store: AdmittedStore,
+    initiative_loader: Callable[[str], List[Dict[str, Any]]],
+    anchor_resolver: SessionStartupAnchorResolver,
+    creation_coordinator: SessionStartupInitiativeCreationCoordinator,
+) -> SessionStartupController:
+    callbacks = make_onboarding_callbacks()
+    operation_executor = build_onboarding_operation_executor(
+        RepositoryProvisioner()
+    )
+    onboarding_coordinator = OnboardingCoordinator(
+        store,
+        operation_executor=operation_executor,
+        **callbacks,
+    )
+    return SessionStartupController(
+        store=store,
+        project_loader=load_projects,
+        initiative_loader=initiative_loader,
+        anchor_resolver=anchor_resolver.resolve,
+        anchor_revalidator=anchor_resolver.revalidate,
+        anchor_replacer=anchor_resolver.replace,
+        initiative_creation_coordinator=creation_coordinator,
+        onboarding_coordinator=onboarding_coordinator,
+    )
+
+
+def build_session_startup_hooks(
     database_path: str,
     trusted_registry: Any,
     command_boundary: Any,
-) -> Callable[..., Dict[str, Any]]:
+) -> tuple[Callable[..., Dict[str, Any]], Callable[..., Dict[str, str] | None]]:
     if not isinstance(database_path, str) or not database_path.strip():
         raise ValueError(
             f"database_path must be a nonblank string, got {database_path!r}"
@@ -125,24 +152,8 @@ def build_session_startup_hook(
 
         try:
             with AdmittedStore(database_path=normalized_path) as store:
-                callbacks = make_onboarding_callbacks()
-                operation_executor = build_onboarding_operation_executor(
-                    RepositoryProvisioner()
-                )
-                onboarding_coordinator = OnboardingCoordinator(
-                    store,
-                    operation_executor=operation_executor,
-                    **callbacks,
-                )
-                controller = SessionStartupController(
-                    store=store,
-                    project_loader=load_projects,
-                    initiative_loader=initiative_loader,
-                    anchor_resolver=anchor_resolver.resolve,
-                    anchor_revalidator=anchor_resolver.revalidate,
-                    anchor_replacer=anchor_resolver.replace,
-                    initiative_creation_coordinator=creation_coordinator,
-                    onboarding_coordinator=onboarding_coordinator,
+                controller = _build_controller(
+                    store, initiative_loader, anchor_resolver, creation_coordinator
                 )
                 return controller.handle(
                     session_id=session_id,
@@ -157,11 +168,52 @@ def build_session_startup_hook(
                 "response": f"[Session Startup] runtime error: {exc}",
             }
 
-    return callback
+    def session_resume_payload_callback(
+        session_id: str | None = None,
+        method: str | None = None,
+        result: Any = None,
+        **kwargs: Any,
+    ) -> Dict[str, str] | None:
+        if construction_error is not None:
+            return {
+                "id": "adrian-kanban/session-startup",
+                "text": f"[Session Startup] Recovery unavailable: {construction_error}",
+            }
+
+        try:
+            with AdmittedStore(database_path=normalized_path) as store:
+                controller = _build_controller(
+                    store, initiative_loader, anchor_resolver, creation_coordinator
+                )
+                notice = controller.resume_notice(session_id)
+                if notice is None:
+                    return None
+                return {
+                    "id": "adrian-kanban/session-startup",
+                    "text": notice,
+                }
+        except Exception as exc:
+            return {
+                "id": "adrian-kanban/session-startup",
+                "text": f"[Session Startup] Recovery unavailable: {exc}",
+            }
+
+    return callback, session_resume_payload_callback
+
+
+def build_session_startup_hook(
+    database_path: str,
+    trusted_registry: Any,
+    command_boundary: Any,
+) -> Callable[..., Dict[str, Any]]:
+    return build_session_startup_hooks(
+        database_path, trusted_registry, command_boundary
+    )[0]
 
 
 __all__ = [
     "build_initiative_loader",
     "build_session_startup_hook",
+    "build_session_startup_hooks",
     "load_projects",
 ]

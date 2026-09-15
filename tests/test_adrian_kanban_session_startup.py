@@ -2221,3 +2221,161 @@ def test_runtime_hook_dependency_failure_is_explicit_and_recoverable(
     assert result["action"] == "fail_closed"
     assert result["response"].startswith("[Session Startup]")
     assert "registry unavailable" in result["response"]
+
+
+def test_resume_notice_projects_pending_menus_without_mutation(
+    adrian_plugin_modules, kanban_home
+):
+    Store = adrian_plugin_modules["store"].AdmittedStore
+    with Store(database_path=_db_path(kanban_home, "resume-menus")) as store:
+        record = store.create_or_read_session_startup(
+            session_id="session-1", opening_prompt="original", protocol_version="v0.29"
+        )
+        controller = _startup_controller(adrian_plugin_modules, store)
+        project_notice = controller.resume_notice("session-1")
+        after_project = store.read_session_startup(session_id="session-1")
+        record = store.transition_session_startup(
+            session_id="session-1",
+            expected_revision=record["revision"],
+            to_state="awaiting_initiative_selection",
+            selected_project_id="project-1",
+        )
+        initiative_notice = controller.resume_notice("session-1")
+        after_initiative = store.read_session_startup(session_id="session-1")
+
+    assert "Select a project:" in project_notice
+    assert "1. Orchestrator" in project_notice
+    assert "Active initiatives for Orchestrator:" in initiative_notice
+    assert "Session Startup [DEV2 / S1]" in initiative_notice
+    assert after_project["revision"] == 0
+    assert after_initiative == record
+
+
+def test_resume_notice_projects_creation_failure_and_held_release(
+    adrian_plugin_modules, kanban_home
+):
+    Store = adrian_plugin_modules["store"].AdmittedStore
+    with Store(database_path=_db_path(kanban_home, "resume-states")) as store:
+        store.create_or_read_session_startup(
+            session_id="creation", opening_prompt="create", protocol_version="v0.29"
+        )
+        selected = store.transition_session_startup(
+            session_id="creation",
+            expected_revision=0,
+            to_state="awaiting_initiative_selection",
+            selected_project_id="project-1",
+        )
+        creation = store.update_session_startup_creation_draft(
+            session_id="creation",
+            expected_revision=selected["revision"],
+            creation_stage="awaiting_title",
+            creation_draft={},
+        )
+        controller = _startup_controller(adrian_plugin_modules, store)
+        assert "Enter the new initiative title" in controller.resume_notice("creation")
+        assert store.read_session_startup(session_id="creation") == creation
+
+        store.create_or_read_session_startup(
+            session_id="failed", opening_prompt="retry me", protocol_version="v0.29"
+        )
+        store.transition_session_startup(
+            session_id="failed",
+            expected_revision=0,
+            to_state="failed_recoverable",
+            failure_detail="workspace unavailable",
+        )
+        assert controller.resume_notice("failed") == (
+            "[Session Startup] Session startup needs recovery: workspace unavailable. "
+            "Enter Retry to continue Session Startup."
+        )
+
+        anchored = _advance_to_anchored(store, session_id="anchored")
+        assert controller.resume_notice("anchored") == (
+            "[Session Startup] Your opening request is awaiting release:\nhello\n"
+            "Enter Retry to continue Session Startup."
+        )
+        issued = store.set_release_status(
+            session_id="anchored",
+            expected_revision=anchored["revision"],
+            release_status="issued",
+        )
+        store.set_release_status(
+            session_id="anchored",
+            expected_revision=issued["revision"],
+            release_status="observed",
+        )
+        assert controller.resume_notice("anchored") is None
+
+
+def test_resume_notice_is_silent_for_blank_absent_and_cancelled(
+    adrian_plugin_modules, kanban_home
+):
+    Store = adrian_plugin_modules["store"].AdmittedStore
+    with Store(database_path=_db_path(kanban_home, "resume-silent")) as store:
+        controller = _startup_controller(adrian_plugin_modules, store)
+        assert controller.resume_notice(None) is None
+        assert controller.resume_notice("   ") is None
+        assert controller.resume_notice("absent") is None
+        record = store.create_or_read_session_startup(
+            session_id="cancelled", opening_prompt="cancel", protocol_version="v0.29"
+        )
+        store.cancel_session_startup(
+            session_id="cancelled", expected_revision=record["revision"]
+        )
+        assert controller.resume_notice("cancelled") is None
+
+
+def test_runtime_resume_hook_returns_notice_and_visible_recovery(
+    adrian_plugin_modules, monkeypatch, tmp_path
+):
+    runtime = adrian_plugin_modules["session_startup_runtime"]
+    stores = []
+
+    class FakeStore:
+        def __init__(self, database_path):
+            self.database_path = database_path
+            self.closed = False
+            stores.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+    class FakeController:
+        def __init__(self, notice="resume setup", error=None):
+            self.notice = notice
+            self.error = error
+
+        def resume_notice(self, session_id):
+            if self.error:
+                raise self.error
+            assert session_id == "stored-session"
+            return self.notice
+
+    controller = FakeController()
+    monkeypatch.setattr(runtime, "AdmittedStore", FakeStore)
+    monkeypatch.setattr(runtime, "build_initiative_loader", lambda _path: object())
+    monkeypatch.setattr(runtime, "SessionStartupAnchorResolver", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        runtime, "SessionStartupInitiativeCreationCoordinator", lambda *_args: object()
+    )
+    monkeypatch.setattr(runtime, "_build_controller", lambda *_args: controller)
+    _pre_user, resume = runtime.build_session_startup_hooks(
+        str((tmp_path / "tracker.db").resolve()), object(), object()
+    )
+
+    assert resume(session_id="stored-session", method="session.resume", result={}) == {
+        "id": "adrian-kanban/session-startup",
+        "text": "resume setup",
+    }
+    controller.notice = None
+    assert resume(session_id="stored-session") is None
+    controller.error = RuntimeError("database busy")
+    assert resume(session_id="stored-session") == {
+        "id": "adrian-kanban/session-startup",
+        "text": "[Session Startup] Recovery unavailable: database busy",
+    }
+    assert len(stores) == 3
+    assert all(store.closed for store in stores)

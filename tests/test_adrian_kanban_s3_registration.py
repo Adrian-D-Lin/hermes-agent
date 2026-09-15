@@ -123,6 +123,7 @@ def test_register_wires_one_complete_plugin_authority_runtime(
     assert [name for name, _callback in context.hooks] == [
         "pre_tool_call",
         "pre_user_turn",
+        "session_resume_payload",
     ]
     status = package._authority.provider_status(database_path)
     assert status.present is True

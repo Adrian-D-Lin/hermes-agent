@@ -136,7 +136,7 @@ def register(ctx) -> None:
     from .provider import AdrianKanbanAuthorityProvider, register_provider
     from .routing import ModelToolBoardResolver, resolve_expected_version
     from .phase_preparer import GitPhaseResultPreparer
-    from .session_startup_runtime import build_session_startup_hook
+    from .session_startup_runtime import build_session_startup_hooks
 
     cached_provider = _provider_cache.get(database_path)
     if cached_provider is not None and cached_provider.is_healthy():
@@ -202,12 +202,11 @@ def register(ctx) -> None:
     ctx.register_hook(
         "pre_tool_call", build_pre_tool_hook(preparer, segment_preparer)
     )
-    ctx.register_hook(
-        "pre_user_turn",
-        build_session_startup_hook(
-            database_path, _trusted_repository_registry_getter, boundary
-        ),
+    pre_user_turn_hook, session_resume_payload_hook = build_session_startup_hooks(
+        database_path, _trusted_repository_registry_getter, boundary
     )
+    ctx.register_hook("pre_user_turn", pre_user_turn_hook)
+    ctx.register_hook("session_resume_payload", session_resume_payload_hook)
     return None
 
 
