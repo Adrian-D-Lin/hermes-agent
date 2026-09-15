@@ -97,6 +97,13 @@ import {
 import { detectBundleSkew } from './bundle-skew'
 import { detectBundleSwap } from './bundle-swap'
 import { registerChatOnboardingWindow } from './chat-onboarding-window'
+import {
+  buildClientReleaseIdentity,
+  parseClientReleasePolicy,
+  parseTrustedReleaseKeys,
+  resolveClientReleasePolicy,
+  verifyClientReleaseArtifactFile
+} from './client-release-contract'
 import { writeComposerPaste } from './composer-paste'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
@@ -745,6 +752,10 @@ function loadInstallStamp() {
           builtAt: parsed.builtAt || null,
           dirty: Boolean(parsed.dirty),
           source: parsed.source || null,
+          clientRelease: parsed.clientRelease || null,
+          clientReleaseSequence: parsed.clientReleaseSequence ?? null,
+          clientProtocolEpoch: parsed.clientProtocolEpoch ?? null,
+          desktopBundleVersion: parsed.desktopBundleVersion || null,
           path: p
         })
       }
@@ -758,6 +769,25 @@ function loadInstallStamp() {
 }
 
 const INSTALL_STAMP = loadInstallStamp()
+
+function loadClientReleaseTrust() {
+  const candidates = [
+    process.resourcesPath ? path.join(process.resourcesPath, 'client-release-trust.json') : null,
+    path.join(APP_ROOT, 'client-release-trust.json')
+  ].filter(Boolean)
+
+  for (const candidate of candidates) {
+    try {
+      return parseTrustedReleaseKeys(JSON.parse(fs.readFileSync(candidate, 'utf8')))
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        throw new Error(`Hermes client-release trust bundle at ${candidate} is invalid: ${error?.message || error}`)
+      }
+    }
+  }
+
+  throw new Error('Hermes client-release trust bundle is unavailable in this Desktop installation.')
+}
 
 if (INSTALL_STAMP) {
   console.log(
@@ -8135,27 +8165,33 @@ async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) 
   const disposition = headers['content-disposition'] || headers['Content-Disposition']
   const filename = filenameFromContentDisposition(disposition) || ctx.suggested || ctx.fallbackName
 
-  const result = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: filename,
-    title: 'Save File'
-  })
+  let destinationPath = typeof ctx.destinationPath === 'string' ? ctx.destinationPath : ''
 
-  if (result.canceled || !result.filePath) {
-    ctx.abort?.()
+  if (!destinationPath) {
+    const result = await dialog.showSaveDialog(mainWindow, {
+      defaultPath: filename,
+      title: 'Save File'
+    })
 
-    return { canceled: true, saved: false }
+    if (result.canceled || !result.filePath) {
+      ctx.abort?.()
+
+      return { canceled: true, saved: false }
+    }
+
+    destinationPath = result.filePath
   }
 
   try {
     // Failure-atomic: exclusive temp create beside the destination, rename into
     // place only once the body is complete (#96597).
-    await pumpStreamToFile(res, result.filePath, fsPumpDeps())
+    await pumpStreamToFile(res, destinationPath, fsPumpDeps())
   } catch (error) {
     ctx.abort?.()
     throw error
   }
 
-  return { path: result.filePath, saved: true }
+  return { path: destinationPath, saved: true }
 }
 
 // Read a bounded amount of an error response body for the thrown message.
@@ -8251,6 +8287,121 @@ async function saveGatewayFile(payload: GatewayFileSavePayload = {}) {
       return await saveGatewayFileViaDataUrl(connection, requestPaths.dataUrl, ctx)
     }
 
+    throw error
+  }
+}
+
+async function stageRemoteClientRelease(connection, policy) {
+  const parsed = parseClientReleasePolicy(policy)
+  const artifact = parsed.artifact
+
+  if (!artifact || !parsed.target) {
+    throw new Error('This gateway did not provide an installer for the required Desktop release.')
+  }
+
+  if (artifact.platform !== process.platform || artifact.arch !== process.arch) {
+    throw new Error(`The gateway installer targets ${artifact.platform}/${artifact.arch}, not this Desktop.`)
+  }
+
+  if (process.platform !== 'win32') {
+    throw new Error('Gateway-managed Desktop installation is currently implemented for Windows clients only.')
+  }
+
+  const releaseRoot = path.join(app.getPath('userData'), 'client-release-updates')
+  fs.mkdirSync(releaseRoot, { recursive: true })
+
+  const destinationPath = path.join(
+    releaseRoot,
+    `Hermes-Setup-${parsed.target.release_sequence}-${crypto.randomBytes(4).toString('hex')}.exe`
+  )
+
+  const url = `${connection.baseUrl}${artifact.download_path}`
+
+  const ctx = {
+    destinationPath,
+    fallbackName: path.basename(destinationPath),
+    suggested: path.basename(destinationPath)
+  }
+
+  try {
+    if (connection.authMode === 'oauth') {
+      await requestWithOauthFallback(connection.baseUrl, {
+        ensureNativeAccessToken,
+        requestWithBearer: bearer => downloadViaTokenToFile(url, null, ctx, { bearer }),
+        requestWithCookie: () => downloadViaOauthSessionToFile(url, ctx)
+      })
+    } else {
+      await downloadViaTokenToFile(url, connection.token, ctx)
+    }
+
+    await verifyClientReleaseArtifactFile(destinationPath, parsed, loadClientReleaseTrust())
+
+    return destinationPath
+  } catch (error) {
+    try {
+      fs.unlinkSync(destinationPath)
+    } catch {
+      // The streaming helper removes partial files; this covers a completed
+      // artifact that subsequently failed signature verification.
+    }
+
+    throw error
+  }
+}
+
+async function applyRemoteClientRelease() {
+  if (updateInFlight) {
+    throw new Error('An update is already in progress.')
+  }
+
+  updateInFlight = true
+
+  try {
+    const connection: any = await startHermes()
+
+    if (connection?.mode !== 'remote') {
+      throw new Error('Gateway-managed Desktop updates require an active remote gateway connection.')
+    }
+
+    const policy = parseClientReleasePolicy(connection.clientReleasePolicy)
+
+    if (policy.decision !== 'update_required' && policy.decision !== 'update_when_idle') {
+      throw new Error('This Desktop client does not require a gateway-managed update.')
+    }
+
+    emitUpdateProgress({
+      stage: 'download',
+      message: 'Downloading the gateway-approved Desktop release',
+      percent: null
+    })
+    const installer = await stageRemoteClientRelease(connection, policy)
+    emitUpdateProgress({ stage: 'restart', message: 'Launching the verified Hermes installer', percent: 100 })
+
+    // The downloaded binary is never given server-provided argv. Its signed
+    // build pin chooses the Adrian release branch; --update activates Hermes'
+    // existing transactional updater and rollback/recovery lifecycle.
+    const child = spawnUpdaterProcess(installer, ['--update'], {
+      cwd: path.dirname(installer),
+      detached: true,
+      stdio: 'ignore'
+    })
+
+    const dwellStartedAt = Date.now()
+    const handoff = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
+
+    if (!handoff.ok) {
+      throw new Error(handoff.message || 'The verified Hermes installer failed to start.')
+    }
+
+    isQuittingForHandoff = true
+    setTimeout(
+      () => app.quit(),
+      Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
+    )
+
+    return { ok: true, handedOff: true, release: policy.target?.release }
+  } catch (error) {
+    updateInFlight = false
     throw error
   }
 }
@@ -10108,9 +10259,11 @@ async function buildRemoteConnection(
 }
 
 const sshConnections = new Map<string, any>()
+
 const sshIsolatedKeepalives = createSshIsolatedKeepaliveRegistry({
   log: chunk => sshRememberLog(chunk)
 })
+
 const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PATH)
 
 // Managed SSH update lifecycle (#93042): while an update owns a registered
@@ -12950,6 +13103,28 @@ async function runHermesStart() {
         throw new Error('Hermes backend start was superseded by a newer connection attempt.')
       }
 
+      const connection = createPrimaryRemoteConnection(remote, hermesLog.slice(-80), getWindowState())
+
+      const clientReleasePolicy = await resolveClientReleasePolicy(() =>
+        postJsonForBackend(
+          connection,
+          '/api/client-release/policy',
+          buildClientReleaseIdentity(INSTALL_STAMP, {
+            arch: process.arch,
+            isPackaged: IS_PACKAGED,
+            platform: process.platform
+          }),
+          { timeoutMs: 8_000 }
+        )
+      )
+
+      // Policy negotiation is part of the same supersedable boot attempt as
+      // health probing. A late answer from a route the user already replaced
+      // must never become the renderer's active compatibility decision.
+      if (!backendConnectionState.isCurrentAttempt(connectionAttempt)) {
+        throw new Error('Hermes backend start was superseded by a newer connection attempt.')
+      }
+
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -12958,7 +13133,7 @@ async function runHermesStart() {
         error: null
       })
 
-      return createPrimaryRemoteConnection(remote, hermesLog.slice(-80), getWindowState())
+      return { ...connection, clientReleasePolicy }
     }
 
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
@@ -17549,6 +17724,12 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
     ok: false,
     error: 'apply-failed',
     message: error?.message || String(error)
+  }))
+)
+ipcMain.handle('hermes:client-release:apply', async () =>
+  applyRemoteClientRelease().catch(error => ({
+    ok: false,
+    error: String(error?.message || error)
   }))
 )
 

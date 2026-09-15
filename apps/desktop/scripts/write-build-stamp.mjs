@@ -26,7 +26,7 @@
  * commit as unpinned and follows the branch instead of fetching a fake SHA.
  */
 
-import { mkdirSync, writeFileSync } from "fs"
+import { mkdirSync, readFileSync, writeFileSync } from "fs"
 import { resolve, join, relative } from "path"
 import { execSync } from "child_process"
 
@@ -42,6 +42,7 @@ const DESKTOP_ROOT = resolve(import.meta.dirname, "..")
 const REPO_ROOT = resolve(DESKTOP_ROOT, "..", "..")
 const OUT_DIR = join(DESKTOP_ROOT, "build")
 const OUT_FILE = join(OUT_DIR, "install-stamp.json")
+const CLIENT_RELEASE_FILE = join(DESKTOP_ROOT, "client-release.json")
 
 function tryExec(cmd, opts) {
   try {
@@ -114,8 +115,31 @@ export function isFallbackCommit(commit) {
   return typeof commit === "string" && /^0{7,40}$/.test(commit)
 }
 
+export function readClientReleaseMetadata(file = CLIENT_RELEASE_FILE) {
+  const raw = JSON.parse(readFileSync(file, "utf8"))
+  const release = typeof raw?.release === "string" ? raw.release.trim() : ""
+  const bundleVersion = typeof raw?.bundle_version === "string" ? raw.bundle_version.trim() : ""
+  const releaseSequence = Number(raw?.release_sequence)
+  const protocolEpoch = Number(raw?.protocol_epoch)
+
+  if (
+    raw?.schema_version !== 1 ||
+    !release ||
+    !bundleVersion ||
+    !Number.isSafeInteger(releaseSequence) ||
+    releaseSequence <= 0 ||
+    !Number.isSafeInteger(protocolEpoch) ||
+    protocolEpoch <= 0
+  ) {
+    throw new Error("apps/desktop/client-release.json is invalid")
+  }
+
+  return { release, releaseSequence, protocolEpoch, bundleVersion }
+}
+
 function main() {
   const stamp = resolveStamp()
+  const clientRelease = readClientReleaseMetadata()
   if (!stamp || !stamp.commit) {
     // Should not happen — fromFallback() always provides a commit.
     console.error(
@@ -155,7 +179,11 @@ function main() {
     branch: stamp.branch,
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
-    source: stamp.source
+    source: stamp.source,
+    clientRelease: clientRelease.release,
+    clientReleaseSequence: clientRelease.releaseSequence,
+    clientProtocolEpoch: clientRelease.protocolEpoch,
+    desktopBundleVersion: clientRelease.bundleVersion
   }
 
   mkdirSync(OUT_DIR, { recursive: true })

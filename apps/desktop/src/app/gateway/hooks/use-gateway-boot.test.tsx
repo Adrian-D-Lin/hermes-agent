@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DesktopConnectionsRegistry } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $desktopBoot } from '@/store/boot'
+import { $clientReleasePolicy } from '@/store/client-release'
 import {
   $connectionsRegistry,
   _resetConnectionsForTests,
@@ -284,6 +285,7 @@ beforeEach(() => {
 
   closeSecondaryGateways()
   $activeGatewayProfile.set('default')
+  $clientReleasePolicy.set(null)
   $connection.set(null)
   $profiles.set([])
   $sessionTiles.set([])
@@ -328,6 +330,7 @@ afterEach(() => {
 
   closeSecondaryGateways()
   $activeGatewayProfile.set('default')
+  $clientReleasePolicy.set(null)
   $connection.set(null)
   $profiles.set([])
   $sessionTiles.set([])
@@ -574,6 +577,40 @@ describe('primary failure foreground isolation', () => {
 })
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('does not open a WebSocket or publish sessions when Primus requires a Desktop update', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection.mockResolvedValue({
+      ...remotePrimaryConn,
+      clientReleasePolicy: {
+        allow_sessions: false,
+        artifact: null,
+        decision: 'update_required',
+        mode: 'enforce',
+        policy_state: 'enabled',
+        reason: 'Client protocol is outside the supported range.',
+        schema_version: 1,
+        target: {
+          bundle_version: '1',
+          minimum_client_sequence: 2026090101,
+          protocol_epoch: 1,
+          release: '0.21.3-adrian.1',
+          release_sequence: 2026091501
+        }
+      }
+    } as typeof remotePrimaryConn)
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect(FakeWebSocket.instances).toHaveLength(0)
+    expect(desktop.getGatewayWsUrl).not.toHaveBeenCalled()
+    expect($gatewayState.get()).not.toBe('open')
+    expect($sessionsLoading.get()).toBe(false)
+    expect($clientReleasePolicy.get()?.decision).toBe('update_required')
+    expect($desktopBoot.get().visible).toBe(false)
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it

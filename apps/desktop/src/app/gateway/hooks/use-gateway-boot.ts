@@ -24,6 +24,7 @@ import {
   resumeDesktopBootForRetry,
   setDesktopBootStep
 } from '@/store/boot'
+import { applyConnectionClientReleasePolicy, clearClientReleasePolicy } from '@/store/client-release'
 import { resetBackgroundPollingGuard } from '@/store/composer-status'
 import {
   $gateway,
@@ -236,6 +237,20 @@ export function useGatewayBoot({
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
+    let clientReleaseBlocked = false
+
+    const acceptConnectionRelease = (connection: HermesConnection): boolean => {
+      clientReleaseBlocked = !applyConnectionClientReleasePolicy(connection)
+
+      if (clientReleaseBlocked) {
+        gateway.close()
+        setSessionsLoading(false)
+        completeDesktopBoot('Hermes Desktop update required')
+      }
+
+      return !clientReleaseBlocked
+    }
+
     // Consecutive unanswered liveness probes (#95327): a busy-but-healthy
     // backend can fail one probe; only a STREAK proves a genuinely dead
     // socket while turns are in flight. Reset on any successful probe or a
@@ -331,7 +346,7 @@ export function useGatewayBoot({
     }
 
     const attemptReconnect = async (manual?: { profile: string; activationEpoch: number }) => {
-      if (cancelled || reconnecting || gatewayOpen() || $gatewaySwitching.get()) {
+      if (cancelled || clientReleaseBlocked || reconnecting || gatewayOpen() || $gatewaySwitching.get()) {
         return
       }
 
@@ -360,6 +375,10 @@ export function useGatewayBoot({
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out reconnecting to Hermes backend'
         )
+
+        if (!acceptConnectionRelease(conn)) {
+          return
+        }
 
         setPrimaryGatewayConnection(conn)
 
@@ -465,7 +484,14 @@ export function useGatewayBoot({
     }
 
     function scheduleReconnect(manual?: { profile: string; activationEpoch: number }) {
-      if (cancelled || reconnecting || reconnectTimer !== null || gatewayOpen() || $gatewaySwitching.get()) {
+      if (
+        cancelled ||
+        clientReleaseBlocked ||
+        reconnecting ||
+        reconnectTimer !== null ||
+        gatewayOpen() ||
+        $gatewaySwitching.get()
+      ) {
         return
       }
 
@@ -654,6 +680,10 @@ export function useGatewayBoot({
         )
 
         if (!ownsSwitch()) {
+          return
+        }
+
+        if (!acceptConnectionRelease(conn)) {
           return
         }
 
@@ -1106,6 +1136,10 @@ export function useGatewayBoot({
           return
         }
 
+        if (!acceptConnectionRelease(conn)) {
+          return
+        }
+
         stage = 'minting'
 
         setDesktopBootStep({
@@ -1232,6 +1266,10 @@ export function useGatewayBoot({
     // dismiss any boot overlay. This is what keeps a live, mid-stream session
     // intact across an HMR update.
     async function adoptBoot() {
+      if (survivor?.connection && !acceptConnectionRelease(survivor.connection)) {
+        return
+      }
+
       bootCompleted = true
       completeDesktopBoot()
 
@@ -1265,6 +1303,7 @@ export function useGatewayBoot({
 
     return () => {
       cancelled = true
+      clearClientReleasePolicy()
       offSwitchLifecycle()
       endGatewaySwitch()
       clearReconnectTimer()

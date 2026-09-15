@@ -12,6 +12,19 @@ class ConfigUpdate(BaseModel):
     config: dict
     profile: Optional[str] = None
 
+
+class ClientReleaseIdentity(BaseModel):
+    """Identity reported by a Desktop client during authenticated remote boot."""
+
+    release: str
+    release_sequence: int
+    protocol_epoch: int
+    bundle_version: str
+    build_sha: str = ""
+    platform: str
+    arch: str
+    install_kind: Literal["packaged", "source", "development"]
+
 class EnvVarUpdate(BaseModel):
     key: str
     value: str
@@ -519,4 +532,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

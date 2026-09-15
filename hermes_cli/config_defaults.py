@@ -2140,6 +2140,24 @@ DEFAULT_CONFIG = {
     "updates": {
         # Passive version/banner checks only; explicit `hermes update --check` remains enabled.
         "check": True,
+        # Optional server-owned release policy for Desktop clients connecting in remote mode.
+        # Disabled by default: upgrading a server must never strand an existing client. When
+        # enabled, the client reports its release identity to the authenticated policy route.
+        # ``advisory`` permits sessions while offering an update; ``enforce`` blocks incompatible
+        # clients until they install a hash- and signature-verified platform artifact. Artifact
+        # ``file`` paths remain server-private; clients receive only an authenticated API path.
+        "remote_clients": {
+            "enabled": False,
+            "mode": "advisory",  # advisory | enforce
+            "target_release": "",
+            "target_sequence": 0,
+            "minimum_sequence": 0,
+            "protocol_epoch": 1,
+            "desktop_bundle_version": "",
+            # Keyed by Electron's ``<platform>-<arch>`` (for example win32-x64).
+            # Each value: {file, sha256, signature, key_id}.
+            "artifacts": {},
+        },
         # Pre-update backup. quick = snapshot small critical state (pairing JSONs, cron jobs,
         # config.yaml, .env, auth.json, profile DBs) into <HERMES_HOME>/state-snapshots/, skipping
         # files >1 GiB; restore via ``/snapshot``. full = quick PLUS a ``hermes backup`` zip in

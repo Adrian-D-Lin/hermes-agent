@@ -568,6 +568,9 @@ declare global {
         setBranch: (name: string) => Promise<{ branch: string }>
         onProgress: (callback: (payload: DesktopUpdateProgress) => void) => () => void
       }
+      clientRelease: {
+        apply: () => Promise<{ ok: boolean; handedOff?: boolean; release?: string; error?: string }>
+      }
       uninstall: {
         summary: () => Promise<DesktopUninstallSummary>
         run: (mode: DesktopUninstallMode) => Promise<DesktopUninstallResult>
@@ -840,7 +843,39 @@ export interface HermesConnection {
   // True when `profile` is a request scope on a SHARED registry remote/cloud
   // backend (one host, many profiles) — the registry analogue of sharedPrimary.
   sharedRemote?: boolean
+  /** Server-owned compatibility decision negotiated before a remote backend
+   *  is published. Older servers return a synthetic policy_disabled value. */
+  clientReleasePolicy?: ClientReleasePolicy
   windowButtonPosition: { x: number; y: number } | null
+}
+
+export interface ClientReleaseArtifact {
+  arch: string
+  download_path: string
+  key_id: string
+  platform: string
+  sha256: string
+  signature: string
+  signature_algorithm: 'ed25519'
+}
+
+export interface ClientReleaseTarget {
+  bundle_version: string
+  minimum_client_sequence: number
+  protocol_epoch: number
+  release: string
+  release_sequence: number
+}
+
+export interface ClientReleasePolicy {
+  allow_sessions: boolean
+  artifact: ClientReleaseArtifact | null
+  decision: 'current' | 'policy_disabled' | 'update_required' | 'update_when_idle'
+  mode: 'advisory' | 'disabled' | 'enforce'
+  policy_state: 'disabled' | 'enabled'
+  reason: string
+  schema_version: 1
+  target: ClientReleaseTarget | null
 }
 
 export interface HermesTitleBarTheme {

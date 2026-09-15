@@ -220,6 +220,10 @@
         "to": "install-stamp.json"
       },
       {
+        "from": "client-release-trust.json",
+        "to": "client-release-trust.json"
+      },
+      {
         "from": "assets/icon.ico",
         "to": "icon.ico"
       }
