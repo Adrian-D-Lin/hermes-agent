@@ -29,6 +29,8 @@ from .workspace import (
     _GitWorkspaceExecutor,
     _SegmentWorkspaceController,
     _TrustedRepositoryRegistry,
+    _WorkspaceRejected,
+    _resolve_trusted_registry,
 )
 
 __all__ = ()
@@ -101,23 +103,26 @@ class _LifecycleDispatcher:
         conn: sqlite3.Connection,
         *,
         spawn_fn: Optional[Callable] = None,
-        workspace_registry: Optional[_TrustedRepositoryRegistry] = None,
+        workspace_registry: Optional[
+            "_TrustedRepositoryRegistry | Callable[[], _TrustedRepositoryRegistry]"
+        ] = None,
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise _DispatcherRejected(
-                "provider must be AdrianKanbanAuthorityProvider"
+                "provider must be an AdrianKanbanAuthorityProvider"
             )
         if type(conn) is not sqlite3.Connection:
             raise _DispatcherRejected("conn must be sqlite3.Connection")
         if spawn_fn is not None and not callable(spawn_fn):
             raise _DispatcherRejected("spawn_fn must be callable or None")
-        if (
-            workspace_registry is not None
-            and type(workspace_registry) is not _TrustedRepositoryRegistry
-        ):
-            raise _DispatcherRejected(
-                "workspace_registry must be _TrustedRepositoryRegistry or None"
-            )
+        if workspace_registry is not None:
+            try:
+                _resolve_trusted_registry(workspace_registry)
+            except _WorkspaceRejected:
+                raise _DispatcherRejected(
+                    "workspace_registry must be _TrustedRepositoryRegistry, "
+                    "a zero-argument getter returning one, or None"
+                ) from None
         self._provider = provider
         self._conn = conn
         self._spawn_fn = spawn_fn
@@ -216,9 +221,8 @@ class _LifecycleDispatcher:
                 raise _DispatcherRejected(
                     "trusted workspace registry is required for segment dispatch"
                 )
-            controller = _SegmentWorkspaceController(
-                self._conn, self._workspace_registry
-            )
+            registry = _resolve_trusted_registry(self._workspace_registry)
+            controller = _SegmentWorkspaceController(self._conn, registry)
             cur = self._conn.execute(
                 "SELECT controller_binding_ref FROM segment_workspaces "
                 "WHERE workspace_id = ? AND active = 1",
@@ -504,7 +508,9 @@ def _dispatch_ready_once(
     spawn_fn: Optional[Callable] = None,
     board: Optional[str] = None,
     max_launches: Optional[int] = None,
-    workspace_registry: Optional[_TrustedRepositoryRegistry] = None,
+    workspace_registry: Optional[
+        "_TrustedRepositoryRegistry | Callable[[], _TrustedRepositoryRegistry]"
+    ] = None,
 ) -> _DispatchTickResult:
     """Run one governed dispatch tick around the lifecycle dispatcher engine.
 
@@ -604,7 +610,9 @@ def _run_dispatcher_daemon(
     board: Optional[str] = None,
     max_launches: Optional[int] = None,
     stop_event: Optional[threading.Event] = None,
-    workspace_registry: Optional[_TrustedRepositoryRegistry] = None,
+    workspace_registry: Optional[
+        "_TrustedRepositoryRegistry | Callable[[], _TrustedRepositoryRegistry]"
+    ] = None,
 ) -> None:
     """Bounded plugin daemon loop around :func:`_dispatch_ready_once`.
 
@@ -641,7 +649,10 @@ def _run_dispatcher_daemon(
                     spawn_fn=spawn_fn,
                     board=board,
                     max_launches=max_launches,
-                    workspace_registry=workspace_registry,
+                    # Resolve the live registry once per dispatch tick so a
+                    # successful new-project onboarding is visible to the next
+                    # tick without restarting the daemon.
+                    workspace_registry=_resolve_trusted_registry(workspace_registry),
                 )
             except Exception as exc:  # noqa: BLE001 - survive a failed tick
                 _LOGGER.error(

@@ -77,8 +77,8 @@ def main() -> int:
         create_schema(conn)
 
         provider = AdrianKanbanAuthorityProvider(database_path)
-        registry = _trusted_repository_registry_getter()
-        provider.bind_workspace_registry(registry)
+        registry_getter = _trusted_repository_registry_getter
+        provider.bind_workspace_registry(registry_getter)
         _authority.clear_authority_providers()
         register_provider(provider)
 
@@ -88,7 +88,7 @@ def main() -> int:
             interval_seconds=args.interval,
             dispatcher_session_id=f"adrian-kanban-dispatcher:{os.getpid()}",
             max_launches=args.max_launches,
-            workspace_registry=registry,
+            workspace_registry=registry_getter,
         )
     finally:
         conn.close()

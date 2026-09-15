@@ -9,7 +9,7 @@ import sqlite3
 import time
 import uuid
 from types import MappingProxyType, SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from .attachments import PreparedAttachment, prepare_url_attachment
 from .phase_admission import prepare_phase_result
@@ -85,6 +85,7 @@ from .workspace import (
     _materialize_segment_workspace,
     _merge_segment_workspace,
     _retire_segment_workspace,
+    _resolve_trusted_registry,
 )
 
 # Public operation taxonomy. These sets are frozen by the ratified Canon
@@ -1936,7 +1937,8 @@ def _handle_create(context: Any) -> dict[str, Any]:
                 raise ValueError("workspace registry is required for segment tasks")
             try:
                 segment_workspace_plan = _SegmentWorkspaceController(
-                    context.connection, context.workspace_registry
+                    context.connection,
+                    _resolve_trusted_registry(context.workspace_registry),
                 ).load(
                     workspace_id=lifecycle_snapshot.segment_workspace_id,
                     expected_initiative_id=initiative_id,
@@ -3624,14 +3626,18 @@ class _CommandBoundary:
         task_input_preparer: Any = None,
         segment_manifest_preparer: Any = None,
         phase_result_preparer: Any = None,
-        workspace_registry: _TrustedRepositoryRegistry | None = None,
+        workspace_registry: _TrustedRepositoryRegistry | Callable[[], _TrustedRepositoryRegistry] | None = None,
     ) -> None:
         if type(provider) is not AdrianKanbanAuthorityProvider:
             raise TypeError("provider must be an AdrianKanbanAuthorityProvider")
-        if workspace_registry is not None and not isinstance(
-            workspace_registry, _TrustedRepositoryRegistry
-        ):
-            raise TypeError("workspace_registry must be a _TrustedRepositoryRegistry")
+        if workspace_registry is not None:
+            try:
+                _resolve_trusted_registry(workspace_registry)
+            except _WorkspaceRejected:
+                raise TypeError(
+                    "workspace_registry must be a _TrustedRepositoryRegistry "
+                    "or a zero-argument getter returning one"
+                ) from None
         if not isinstance(database_path, str) or not database_path.strip():
             raise ValueError("database_path must be a nonblank string")
         if state_resolver is not None and not callable(state_resolver):
@@ -3681,7 +3687,7 @@ class _CommandBoundary:
         try:
             prepared_payload, _ = _prepare_repository_reconciliation_payload(
                 conn,
-                self._workspace_registry,
+                _resolve_trusted_registry(self._workspace_registry),
                 payload,
                 actor_profile=actor_profile,
                 require_supplied_proof=False,
@@ -3700,7 +3706,7 @@ class _CommandBoundary:
         try:
             revalidate_stored_repository_reconciliation(
                 conn,
-                self._workspace_registry,
+                _resolve_trusted_registry(self._workspace_registry),
                 reconciliation_ref,
             )
         except (RepositoryReconciliationError, _WorkspaceRejected, ValueError) as exc:
@@ -3815,13 +3821,14 @@ class _CommandBoundary:
                 attempt_id, action, _COMMAND_EXECUTION_FAILED
             )
         try:
+            registry = _resolve_trusted_registry(self._workspace_registry)
             context = _CommandContext(
                 operation=action,
                 payload=payload,
                 connection=conn,
                 attempt_id=attempt_id,
                 known_profiles=self._known_profiles,
-                workspace_registry=self._workspace_registry,
+                workspace_registry=registry,
             )
             result = handler(context)
             if not isinstance(result, dict):
@@ -3875,7 +3882,7 @@ class _CommandBoundary:
                     conn.execute("PRAGMA foreign_keys=ON")
                     archive_result = finalize_initiative_archive(
                         conn,
-                        self._workspace_registry,
+                        _resolve_trusted_registry(self._workspace_registry),
                         load_projects,
                         initiative_id=fields["payload"]["initiative_id"],
                         actor_evidence=json.dumps(
@@ -3997,7 +4004,7 @@ class _CommandBoundary:
                 payload, prepared_repository_reconciliation = (
                     _prepare_repository_reconciliation_payload(
                         conn,
-                        self._workspace_registry,
+                        _resolve_trusted_registry(self._workspace_registry),
                         payload,
                         actor_profile=(
                             actor_profile.strip()
@@ -4180,7 +4187,7 @@ class _CommandBoundary:
                         raise ValueError("DEV2 transition requires a target segment")
                     _materialize_segment_workspace(
                         conn,
-                        self._workspace_registry,
+                        _resolve_trusted_registry(self._workspace_registry),
                         initiative_id=override_preflight["initiative_id"],
                         segment_id=to_segment_id,
                         materialized_at=int(time.time()),
@@ -4191,6 +4198,7 @@ class _CommandBoundary:
                 and "gate_override" not in payload
                 and "_approved_gate_override_request_id" not in payload
             ):
+                registry = _resolve_trusted_registry(self._workspace_registry)
                 preflight_context = _CommandContext(
                     operation=action,
                     payload=payload,
@@ -4211,18 +4219,18 @@ class _CommandBoundary:
                     prepared_phase_result=prepared_phase_result,
                     initial_authorizer=fields.get("initial_authorizer"),
                     override_now=fields.get("override_now"),
-                    workspace_registry=self._workspace_registry,
+                    workspace_registry=registry,
                 )
                 preflight_result = _preflight_transition_initiative(preflight_context)
                 self._revalidate_repository_reconciliation(
                     conn,
                     preflight_result["reconciliation_ref"],
                 )
-                if self._workspace_registry is not None:
+                if registry is not None:
                     try:
                         prepared_transition_delivery = verify_transition_delivery(
                             conn,
-                            self._workspace_registry,
+                            registry,
                             initiative_id=preflight_result["initiative_id"],
                             from_phase=preflight_result["from_phase"],
                             from_segment_id=preflight_result["from_segment_id"],
@@ -4254,7 +4262,7 @@ class _CommandBoundary:
                             ),
                         ) from None
                 if preflight_result["to_phase"] == "DEV2":
-                    if self._workspace_registry is None:
+                    if registry is None:
                         raise ValueError(
                             "workspace_registry is required for DEV2 transition materialization"
                         )
@@ -4263,7 +4271,7 @@ class _CommandBoundary:
                         raise ValueError("DEV2 transition requires a target segment")
                     _materialize_segment_workspace(
                         conn,
-                        self._workspace_registry,
+                        registry,
                         initiative_id=preflight_result["initiative_id"],
                         segment_id=to_segment_id,
                         materialized_at=int(time.time()),
@@ -4293,7 +4301,9 @@ class _CommandBoundary:
                     prepared_phase_result=prepared_phase_result,
                     initial_authorizer=fields.get("initial_authorizer"),
                     override_now=fields.get("override_now"),
-                    workspace_registry=self._workspace_registry,
+                    workspace_registry=_resolve_trusted_registry(
+                        self._workspace_registry
+                    ),
                 )
                 dev4_effect = _preflight_dev4_workspace_checkpoint_effect(
                     preflight_context
@@ -4303,7 +4313,7 @@ class _CommandBoundary:
                         raise ValueError(
                             "workspace_registry is required for DEV4 checkpoint effect"
                         )
-                    registry = self._workspace_registry
+                    registry = _resolve_trusted_registry(self._workspace_registry)
                     step = dev4_effect["step"]
                     if step == "DEV4.3":
                         merge_result = _merge_segment_workspace(
@@ -4376,7 +4386,9 @@ class _CommandBoundary:
                         prepared_transition_delivery=prepared_transition_delivery,
                         initial_authorizer=fields.get("initial_authorizer"),
                         override_now=fields.get("override_now"),
-                        workspace_registry=self._workspace_registry,
+                        workspace_registry=_resolve_trusted_registry(
+                            self._workspace_registry
+                        ),
                     )
                     try:
                         conn.execute("BEGIN IMMEDIATE")
@@ -4386,7 +4398,7 @@ class _CommandBoundary:
                             conn.execute("ROLLBACK")
                     coordination_result = prepare_coordination_closure(
                         conn,
-                        self._workspace_registry,
+                        _resolve_trusted_registry(self._workspace_registry),
                         initiative_id=initiative_id.strip(),
                         actor_evidence=json.dumps(
                             {
@@ -4468,7 +4480,9 @@ class _CommandBoundary:
                     prepared_transition_delivery=prepared_transition_delivery,
                     initial_authorizer=fields.get("initial_authorizer"),
                     override_now=fields.get("override_now"),
-                    workspace_registry=self._workspace_registry,
+                    workspace_registry=_resolve_trusted_registry(
+                        self._workspace_registry
+                    ),
                 )
                 try:
                     result = handler(context)

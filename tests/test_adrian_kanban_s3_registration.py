@@ -137,8 +137,11 @@ def test_register_wires_one_complete_plugin_authority_runtime(
     assert "adrian_kanban_cards" in tables
     assert "adrian_kanban_command_receipts" in tables
     provider = package._provider_cache[database_path]
-    assert provider._workspace_registry.controlled_worktree_root == controlled_root
-    registration = provider._workspace_registry.lookup("orchestrator")
+    from importlib import import_module as _import_module
+    _ws = _import_module(f"{package.__name__}.workspace")
+    registry = _ws._resolve_trusted_registry(provider._workspace_registry)
+    assert registry.controlled_worktree_root == controlled_root
+    registration = registry.lookup("orchestrator")
     assert registration.repository_root == repository_root
 
     delegated = package._authority.delegate_authority_operation(

@@ -15,7 +15,7 @@ from .coordination_freshness import CoordinationFreshnessController
 from .coordination_materialization import CoordinationMaterializer
 from .coordination_workspace import CoordinationWorkspaceStore
 from .schema import create_schema
-from .workspace import _TrustedRepositoryRegistry
+from .workspace import _TrustedRepositoryRegistry, _WorkspaceRejected, _resolve_trusted_registry
 
 __all__ = ["SessionStartupAnchorError", "SessionStartupAnchorResolver"]
 
@@ -156,7 +156,7 @@ class SessionStartupAnchorResolver:
         self,
         *,
         tracker_database_path: str,
-        registry: _TrustedRepositoryRegistry,
+        registry: "_TrustedRepositoryRegistry | Callable[[], _TrustedRepositoryRegistry]",
         connection_factory: Callable[..., sqlite3.Connection] = sqlite3.connect,
         materializer_factory: Optional[
             Callable[[sqlite3.Connection], CoordinationMaterializer]
@@ -184,9 +184,13 @@ class SessionStartupAnchorResolver:
                 f"{tracker_database_path!r}"
             )
         if not isinstance(registry, _TrustedRepositoryRegistry):
-            raise SessionStartupAnchorError(
-                "registry must be _TrustedRepositoryRegistry"
-            )
+            try:
+                _resolve_trusted_registry(registry)
+            except _WorkspaceRejected:
+                raise SessionStartupAnchorError(
+                    "registry must be a _TrustedRepositoryRegistry or a "
+                    "zero-argument getter returning one"
+                ) from None
         if not callable(connection_factory):
             raise SessionStartupAnchorError("connection_factory must be callable")
         if materializer_factory is not None and not callable(materializer_factory):
@@ -227,6 +231,7 @@ class SessionStartupAnchorResolver:
         record: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Resolve and return the five trusted controller anchor fields."""
+        registry = _resolve_trusted_registry(self._registry)
         project = _require_dict(project, "project")
         initiative = _require_dict(initiative, "initiative")
         record = _require_dict(record, "record")
@@ -254,7 +259,7 @@ class SessionStartupAnchorResolver:
                 accepted_segment_id, "initiative.current_segment_id"
             )
 
-        repository_identity = _resolve_repository(self._registry, primary_path)
+        repository_identity = _resolve_repository(registry, primary_path)
         controller_binding_ref = f"tracker:{board_slug}:{initiative_id}"
 
         epoch = _resolve_positive_epoch(self._epoch_provider)
@@ -427,7 +432,7 @@ class SessionStartupAnchorResolver:
             raise SessionStartupAnchorError(
                 "record.selected_initiative_id does not match initiative.initiative_id"
             )
-        _resolve_repository(self._registry, primary_path)
+        _resolve_repository(_resolve_trusted_registry(self._registry), primary_path)
 
         if stored_phase != current_phase or stored_segment != current_segment:
             conn = self._connection_factory(self._tracker_database_path)
@@ -592,7 +597,7 @@ class SessionStartupAnchorResolver:
                 "record.selected_initiative_id does not match initiative.initiative_id"
             )
 
-        _resolve_repository(self._registry, primary_path)
+        _resolve_repository(_resolve_trusted_registry(self._registry), primary_path)
 
         conn = self._connection_factory(self._tracker_database_path)
         try:
@@ -816,7 +821,10 @@ class SessionStartupAnchorResolver:
     ) -> CoordinationMaterializer:
         if self._materializer_factory is not None:
             return self._materializer_factory(conn)
-        return CoordinationMaterializer(conn=conn, registry=self._registry)
+        return CoordinationMaterializer(
+            conn=conn,
+            registry=_resolve_trusted_registry(self._registry),
+        )
 
     def _get_freshness(
         self, conn: sqlite3.Connection, session_id: str
@@ -834,7 +842,7 @@ class SessionStartupAnchorResolver:
             return self._freshness_factory(conn, advancement_confirmer)
         return CoordinationFreshnessController(
             conn=conn,
-            registry=self._registry,
+            registry=_resolve_trusted_registry(self._registry),
             advancement_confirmer=advancement_confirmer,
         )
 

@@ -144,10 +144,12 @@ def register(ctx) -> None:
     else:
         provider = AdrianKanbanAuthorityProvider(database_path)
         _provider_cache[database_path] = provider
-    trusted_registry = _trusted_repository_registry_getter()
-    provider.bind_workspace_registry(trusted_registry)
+    provider.bind_workspace_registry(_trusted_repository_registry_getter)
     preparer = GitTaskInputPreparer()
-    segment_preparer = GitSegmentManifestPreparer(_trusted_repository_ids_getter)
+    segment_preparer = GitSegmentManifestPreparer(
+        _trusted_repository_ids_getter,
+        registry_getter=_trusted_repository_registry_getter,
+    )
     handlers = {
         "kanban_show": _handle_show,
         "kanban_list": _handle_list,
@@ -185,8 +187,10 @@ def register(ctx) -> None:
             ),
             task_input_preparer=preparer,
             segment_manifest_preparer=segment_preparer,
-            phase_result_preparer=GitPhaseResultPreparer(),
-            workspace_registry=trusted_registry,
+            phase_result_preparer=GitPhaseResultPreparer(
+                registry_getter=_trusted_repository_registry_getter
+            ),
+            workspace_registry=_trusted_repository_registry_getter,
         )
         provider.bind_command_boundary(boundary)
         register_provider(provider)
@@ -200,7 +204,9 @@ def register(ctx) -> None:
     )
     ctx.register_hook(
         "pre_user_turn",
-        build_session_startup_hook(database_path, trusted_registry, boundary),
+        build_session_startup_hook(
+            database_path, _trusted_repository_registry_getter, boundary
+        ),
     )
     return None
 

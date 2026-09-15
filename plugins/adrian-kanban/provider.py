@@ -9,7 +9,7 @@ from hermes_cli import kanban_authority as _authority
 
 from .capability import CapabilityBinding, CapabilityRegistry, CapabilityRejected
 from .versioning import PLUGIN_NAME, PLUGIN_VERSION, PROTOCOL_VERSION
-from .workspace import _SegmentWorkspaceController
+from .workspace import _SegmentWorkspaceController, _resolve_trusted_registry
 
 PROVIDER_NAME = PLUGIN_NAME
 
@@ -32,20 +32,32 @@ class AdrianKanbanAuthorityProvider:
     def bind_workspace_registry(self, registry) -> None:
         from .workspace import _TrustedRepositoryRegistry
 
-        if type(registry) is not _TrustedRepositoryRegistry:
-            raise CapabilityRejected(
-                "workspace registry must be a _TrustedRepositoryRegistry"
-            )
-        if self._workspace_registry is None:
-            self._workspace_registry = registry
-            return
-        if getattr(registry, "_registrations", None) != getattr(
-            self._workspace_registry, "_registrations", None
-        ):
+        if type(registry) is _TrustedRepositoryRegistry:
+            if self._workspace_registry is None:
+                self._workspace_registry = registry
+                return
+            if not callable(self._workspace_registry):
+                if getattr(registry, "_registrations", None) != getattr(
+                    self._workspace_registry, "_registrations", None
+                ):
+                    raise CapabilityRejected(
+                        "conflicting workspace registry already bound"
+                    )
+                return
             raise CapabilityRejected("conflicting workspace registry already bound")
+        if not callable(registry):
+            raise CapabilityRejected(
+                "workspace registry must be a _TrustedRepositoryRegistry "
+                "or a zero-argument getter"
+            )
+        if self._workspace_registry is not None and self._workspace_registry is not registry:
+            raise CapabilityRejected(
+                "conflicting workspace registry already bound"
+            )
+        self._workspace_registry = registry
 
     def resolve_trusted_workspace_root(self, candidate):
-        registry = self._workspace_registry
+        registry = _resolve_trusted_registry(self._workspace_registry)
         if registry is None or not isinstance(candidate, str):
             return None
         candidate = candidate.strip()

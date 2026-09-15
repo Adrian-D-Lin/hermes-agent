@@ -4430,6 +4430,26 @@ def test_provider_certifies_only_exact_active_derived_segment_root(
         assert provider.resolve_trusted_workspace_root(str(segment_root)) == str(
             segment_root
         )
+        # Equivalent static rebind remains accepted: a second distinct
+        # _TrustedRepositoryRegistry with equal _registrations is not a
+        # conflict.
+        workspace_mod = provider_modules["workspace"]
+        registration = registry._registrations[0]
+        equivalent = workspace_mod._TrustedRepositoryRegistry(
+            (
+                workspace_mod._RepositoryRegistration(
+                    repository_identity=registration.repository_identity,
+                    repository_root=registration.repository_root,
+                    controlled_worktree_root=registration.controlled_worktree_root,
+                    github_repository=registration.github_repository,
+                    integration_branch=registration.integration_branch,
+                ),
+            )
+        )
+        provider.bind_workspace_registry(equivalent)
+        assert provider.resolve_trusted_workspace_root(str(segment_root)) == str(
+            segment_root
+        )
         assert provider.resolve_trusted_workspace_root(str(sibling)) is None
         conn.execute(
             "UPDATE segment_workspaces SET active = 0 "

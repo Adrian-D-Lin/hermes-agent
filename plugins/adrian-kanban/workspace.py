@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from .journal import ExternalOperationJournal, JournalIntent, JournalRejected
 from .repository_binding import RepositoryBindingError, RepositoryBindingResolver, normalize_github_repository
@@ -16,6 +16,37 @@ __all__ = ()
 
 class _WorkspaceRejected(ValueError):
     pass
+
+
+def _resolve_trusted_registry(
+    value: Any,
+) -> Optional["_TrustedRepositoryRegistry"]:
+    """Resolve the current trusted repository registry for one point of use.
+
+    ``value`` is either a static :class:`_TrustedRepositoryRegistry` (test and
+    backward-compatibility construction) or a zero-argument getter that returns
+    one (production wiring).  The current registry is resolved and type-checked
+    at the call site; a resolved getter result is never retained as durable
+    state, and ``None`` remains a legitimate "no registry" value.  A getter
+    result that is not the exact registry type, or a getter that raises, fails
+    closed through the consumer's existing error path.
+    """
+    if value is None:
+        return None
+    if type(value) is _TrustedRepositoryRegistry:
+        return value
+    if callable(value):
+        result = value()
+        if type(result) is not _TrustedRepositoryRegistry:
+            raise _WorkspaceRejected(
+                "trusted repository registry getter must return "
+                "_TrustedRepositoryRegistry"
+            )
+        return result
+    raise _WorkspaceRejected(
+        "trusted repository registry must be _TrustedRepositoryRegistry "
+        "or a zero-argument getter"
+    )
 
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$")
