@@ -89,8 +89,15 @@ class WSTransport:
     socket (pool workers marshal onto the loop and block on the future); from the loop thread itself it would
     deadlock, so it detects that and fires-and-forgets. Loop-thread callers needing completion use ``write_async``."""
 
-    def __init__(self, ws: Any, loop: asyncio.AbstractEventLoop, *, peer: str = "unknown",
-                 auth_identity: dict | None = None) -> None:
+    def __init__(
+        self,
+        ws: Any,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        peer: str = "unknown",
+        auth_identity: dict | None = None,
+        authenticated_tailscale_peer: Any = None,
+    ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
@@ -292,7 +299,26 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         _note_dashboard_client_activity(force=True)
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity)
+        authenticated_tailscale_peer = None
+        client = getattr(ws, "client", None)
+        peer_host = getattr(client, "host", None)
+        if isinstance(peer_host, str):
+            try:
+                authenticated_tailscale_peer = await asyncio.to_thread(
+                    trusted._authenticate_tailscale_peer,
+                    peer_host,
+                    connection_id=uuid.uuid4().hex,
+                    authenticated_at=int(time.time()),
+                )
+            except Exception:
+                authenticated_tailscale_peer = None
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            auth_identity=auth_identity,
+            authenticated_tailscale_peer=authenticated_tailscale_peer,
+        )
         # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
         skin_payload = await asyncio.to_thread(server.resolve_skin)
         # change_events: this backend broadcasts pet/cron/sessions.changed, so clients can demote legacy
