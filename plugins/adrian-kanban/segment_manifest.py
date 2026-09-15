@@ -182,8 +182,8 @@ def _validate_materialization_policy(value, field: str) -> dict:
         ),
         "base_rule": (
             "materialize each segment immediately before DEV2 from each "
-            "member's then-current origin/main after every required predecessor "
-            "is merged"
+            "member's then-current configured integration branch after every "
+            "required predecessor is merged"
         ),
         "writer_rule": (
             "exactly one active writer binding per logical segment workspace; "
@@ -191,7 +191,7 @@ def _validate_materialization_policy(value, field: str) -> dict:
         ),
         "integration_rule": (
             "ancestry-preserving merge commit to every declared member's "
-            "origin/main before successor admission"
+            "configured integration branch before successor admission"
         ),
     }
     policy = _validate_strict_dict(value, field, expected)

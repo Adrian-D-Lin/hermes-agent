@@ -101,7 +101,8 @@ def _manifest(*, initiative_id: str = "initiative-1") -> dict:
             ),
             "base_rule": (
                 "materialize each segment immediately before DEV2 from each member's "
-                "then-current origin/main after every required predecessor is merged"
+                "then-current configured integration branch after every required "
+                "predecessor is merged"
             ),
             "writer_rule": (
                 "exactly one active writer binding per logical segment workspace; "
@@ -109,7 +110,7 @@ def _manifest(*, initiative_id: str = "initiative-1") -> dict:
             ),
             "integration_rule": (
                 "ancestry-preserving merge commit to every declared member's "
-                "origin/main before successor admission"
+                "configured integration branch before successor admission"
             ),
         },
         "segments": [
