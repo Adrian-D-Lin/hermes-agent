@@ -79,7 +79,7 @@ def test_plugin_authority_suppresses_native_http_mutation_before_handler(
     dashboard_module, client, monkeypatch, method, path, kwargs
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )
@@ -98,7 +98,7 @@ def test_authority_resolution_failure_suppresses_native_http_mutation(
     dashboard_module, client, monkeypatch
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: (_ for _ in ()).throw(RuntimeError("bad config")),
     )
@@ -123,7 +123,7 @@ def test_native_authority_keeps_existing_dashboard_behavior(
     dashboard_module, client, monkeypatch
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: "native",
     )
@@ -141,7 +141,7 @@ async def test_plugin_authority_closes_native_authoritative_event_socket(
     dashboard_module, monkeypatch
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )

@@ -8,6 +8,7 @@ import os
 import sqlite3
 
 from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_authority as _authority
 
 from . import PLUGIN_NAME, _trusted_repository_registry_getter
 from .dispatcher import _run_dispatcher_daemon
@@ -55,11 +56,11 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO)
 
-    authority = _kb.resolve_selected_authority()
+    authority = _authority.resolve_selected_authority()
     if authority != PLUGIN_NAME:
         raise SystemExit(f"refusing to run: selected authority is {authority!r}")
 
-    database_path = _kb.resolve_authority_path()
+    database_path = _authority.resolve_authority_path()
     if not os.path.isabs(database_path):
         raise SystemExit(
             f"refusing to run: authority path is not absolute: {database_path!r}"
@@ -78,7 +79,7 @@ def main() -> int:
         provider = AdrianKanbanAuthorityProvider(database_path)
         registry = _trusted_repository_registry_getter()
         provider.bind_workspace_registry(registry)
-        _kb.clear_authority_providers()
+        _authority.clear_authority_providers()
         register_provider(provider)
 
         _run_dispatcher_daemon(

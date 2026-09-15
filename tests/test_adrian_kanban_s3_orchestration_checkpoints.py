@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from writegate.kanban_approvals import create_kanban_approval_schema
 
 
@@ -43,7 +44,7 @@ def _database(tmp_path, monkeypatch, commands_module):
     provider_module = importlib.import_module(f"{commands_module.__package__}.provider")
     schema_module = importlib.import_module(f"{commands_module.__package__}.schema")
     database_path = (tmp_path / "kanban.sqlite3").resolve()
-    with kb.connect_closing(database_path) as conn:
+    with kbc.connect_closing(database_path) as conn:
         schema_module.create_schema(conn)
         create_kanban_approval_schema(conn)
         conn.commit()

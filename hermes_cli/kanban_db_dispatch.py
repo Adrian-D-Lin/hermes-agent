@@ -382,6 +382,7 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -389,8 +390,10 @@ def heartbeat_worker(
     (train loop, crawl) is stuck can still have a live Python process.
     Returns False if the task is not running or its claim expired.
     """
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     now = int(time.time())
-    with _kb.write_txn(conn):
+    with _kb.write_txn(conn, allow_nested=_allow_nested):
         sql = "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ? AND status = 'running'"
         params: tuple = (now, task_id)
         if expected_run_id is not None:
@@ -1097,24 +1100,197 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    worker_session_id: Optional[str] = None,
+) -> None:
+    """Record the child pid and its preassigned session identity."""
     with _kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, "
+                "worker_session_id = COALESCE(?, worker_session_id) WHERE id = ?",
+                (int(pid), worker_session_id, run_id),
+            )
+        _kb._append_event(
+            conn,
+            task_id,
+            "spawned",
+            {"pid": int(pid), "worker_session_id": worker_session_id},
+            run_id=run_id,
+        )
 
 
-def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
+@dataclass(frozen=True)
+class _AdmittedTaskLaunchEvidence:
+    """Outcome returned to an external authority after one admitted launch."""
+
+    task_id: str
+    state: str
+    assignee: Optional[str]
+    workspace: Optional[str]
+    worker_session_id: Optional[str]
+    pid: Optional[int]
+    auto_blocked: bool
+
+
+def _launch_admitted_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_assignee: str,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    board: Optional[str] = None,
+) -> _AdmittedTaskLaunchEvidence:
+    """Launch exactly the task already admitted by an external authority.
+
+    This is deliberately narrower than ``dispatch_once``: selection and
+    policy evaluation remain with the authority provider, while the native
+    host retains its claim, workspace, worker-identity and failure-accounting
+    invariants.
+    """
+    board = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    claimed = _kb.claim_task(
+        conn,
+        task_id,
+        ttl_seconds=ttl_seconds,
+        expected_assignee=expected_assignee,
+    )
+    if claimed is None:
+        return _AdmittedTaskLaunchEvidence(
+            task_id, "claim_lost", expected_assignee, None, None, None, False
+        )
+
+    resolved_branch_name = None
+    try:
+        if claimed.workspace_kind == "worktree":
+            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
+                claimed, board=board
+            )
+        else:
+            workspace = _kbw.resolve_workspace(claimed, board=board)
+    except Exception as exc:
+        auto = _record_task_failure(
+            conn,
+            claimed.id,
+            f"workspace: {exc}",
+            outcome="spawn_failed",
+            failure_limit=failure_limit,
+            release_claim=True,
+            end_run=True,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id, "failed", claimed.assignee, None, None, None, auto
+        )
+
+    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+    if claimed.workspace_kind == "worktree":
+        _kbw.set_branch_name(
+            conn,
+            claimed.id,
+            resolved_branch_name
+            or (claimed.branch_name or "").strip()
+            or f"wt/{claimed.id}",
+        )
+    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+
+    try:
+        from hermes_cli.kanban_writegate_binding import prepare_worker_launch
+
+        worker_session_id = prepare_worker_launch(
+            conn,
+            claimed,
+            str(workspace),
+            board=board,
+            resolved_branch_name=resolved_branch_name,
+        )
+    except Exception as exc:
+        auto = _record_task_failure(
+            conn,
+            claimed.id,
+            f"writegate pre-spawn binding: {exc}",
+            outcome="spawn_failed",
+            failure_limit=failure_limit,
+            release_claim=True,
+            end_run=True,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id, "failed", claimed.assignee, str(workspace), None, None, auto
+        )
+
+    try:
+        pid = _call_spawn_fn(
+            spawn_fn if spawn_fn is not None else _default_spawn,
+            claimed,
+            str(workspace),
+            board,
+            worker_session_id,
+        )
+        if pid:
+            _set_worker_pid(
+                conn,
+                claimed.id,
+                int(pid),
+                worker_session_id=worker_session_id,
+            )
+        _kb._fire_worker_spawned_hook(
+            conn, claimed, str(workspace), pid, board=board
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id,
+            "launched",
+            claimed.assignee,
+            str(workspace),
+            worker_session_id,
+            int(pid) if pid else None,
+            False,
+        )
+    except Exception as exc:
+        from hermes_cli.kanban_writegate_binding import _abandon_pre_spawn_binding
+
+        _abandon_pre_spawn_binding(worker_session_id)
+        auto = _record_task_failure(
+            conn,
+            claimed.id,
+            str(exc),
+            outcome="spawn_failed",
+            failure_limit=failure_limit,
+            release_claim=True,
+            end_run=True,
+        )
+        return _AdmittedTaskLaunchEvidence(
+            task_id,
+            "failed",
+            claimed.assignee,
+            str(workspace),
+            worker_session_id,
+            None,
+            auto,
+        )
+
+
+def _clear_failure_counter(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _allow_nested: bool = False,
+) -> None:
     """Reset the unified consecutive-failures counter.
 
     Called from ``complete_task`` on success. NOT called on spawn success: a
     spawn proves the worker could start, not that the run will succeed, so
     timeouts and crashes must accumulate across spawn boundaries.
     """
-    with _kb.write_txn(conn):
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
+    with _kb.write_txn(conn, allow_nested=_allow_nested):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
@@ -1474,14 +1650,32 @@ def dispatch_once(
     return result
 
 
-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
+def _call_spawn_fn(
+    spawn_fn,
+    task: Task,
+    workspace: str,
+    board: Optional[str],
+    worker_session_id: Optional[str] = None,
+) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
+        params = sig.parameters
+        if "board" in params and "worker_session_id" in params:
+            return spawn_fn(
+                task,
+                workspace,
+                board=board,
+                worker_session_id=worker_session_id,
+            )
+        if "board" in params:
             return spawn_fn(task, workspace, board=board)
+        if "worker_session_id" in params:
+            return spawn_fn(
+                task, workspace, worker_session_id=worker_session_id
+            )
         return spawn_fn(task, workspace)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
@@ -1573,9 +1767,42 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        from hermes_cli.kanban_writegate_binding import prepare_worker_launch
+
+        worker_session_id = prepare_worker_launch(
+            conn,
+            claimed,
+            str(workspace),
+            board=board,
+            resolved_branch_name=resolved_branch_name,
+        )
+    except Exception as exc:
+        if _record_task_failure(
+            conn,
+            claimed.id,
+            f"writegate pre-spawn binding: {exc}",
+            outcome="spawn_failed",
+            failure_limit=failure_limit,
+            release_claim=True,
+            end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
+    try:
+        pid = _call_spawn_fn(
+            spawn_fn if spawn_fn is not None else _default_spawn,
+            claimed,
+            str(workspace),
+            board,
+            worker_session_id,
+        )
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+            _set_worker_pid(
+                conn,
+                claimed.id,
+                int(pid),
+                worker_session_id=worker_session_id,
+            )
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -1585,6 +1812,9 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        from hermes_cli.kanban_writegate_binding import _abandon_pre_spawn_binding
+
+        _abandon_pre_spawn_binding(worker_session_id)
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -1767,6 +1997,9 @@ def _dispatch_once_locked(
     call ``spawn_fn(task, workspace_path, board) -> Optional[int]``, recording
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
+    # Resolve once so the authority binding, spawned child, and later trusted
+    # lookup all record the same board even when the caller passed ``None``.
+    board = _kb._normalize_board_slug(board) or _kb.get_current_board()
     result = DispatchResult()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
@@ -2178,7 +2411,13 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    worker_session_id: Optional[str] = None,
+) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -2260,6 +2499,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    env["HERMES_KANBAN_PROFILE"] = profile_arg
+    if worker_session_id:
+        env["HERMES_KANBAN_WORKER_SESSION_ID"] = worker_session_id
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).

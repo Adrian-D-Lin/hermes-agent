@@ -11,6 +11,8 @@ import pytest
 
 from gateway import kanban_watchers
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_decompose, kanban_specify, kanban_swarm, kanban_transfer
 from tools import kanban_tools
 
@@ -20,7 +22,7 @@ _UNSUPPORTED = "not a recognized Kanban mutation"
 
 def _select_plugin(monkeypatch) -> None:
     monkeypatch.setattr(
-        kb, "resolve_selected_authority", lambda: kb.AUTHORITY_ADRIAN_KANBAN
+        ka, "resolve_selected_authority", lambda: ka.AUTHORITY_ADRIAN_KANBAN
     )
 
 
@@ -28,17 +30,17 @@ def test_native_mutation_authority_guard_allows_native_and_fails_closed_on_resol
     monkeypatch,
 ):
     monkeypatch.setattr(
-        kb, "resolve_selected_authority", lambda: kb.AUTHORITY_NATIVE
+        ka, "resolve_selected_authority", lambda: ka.AUTHORITY_NATIVE
     )
-    assert kb.require_native_mutation_authority("legacy_mutation") is None
+    assert ka.require_native_mutation_authority("legacy_mutation") is None
 
     monkeypatch.setattr(
-        kb,
+        ka,
         "resolve_selected_authority",
         lambda: (_ for _ in ()).throw(RuntimeError("configuration unavailable")),
     )
-    with pytest.raises(kb.AuthorityAdmissionRejected, match=_UNSUPPORTED):
-        kb.require_native_mutation_authority("legacy_mutation")
+    with pytest.raises(ka.AuthorityAdmissionRejected, match=_UNSUPPORTED):
+        ka.require_native_mutation_authority("legacy_mutation")
 
 
 @pytest.mark.parametrize(
@@ -55,9 +57,9 @@ def test_legacy_triage_automation_rejects_before_native_reads(
     monkeypatch, call, outcome_type
 ):
     _select_plugin(monkeypatch)
-    monkeypatch.setattr(kb, "can_exit_triage", lambda: True)
+    monkeypatch.setattr(ka, "can_exit_triage", lambda: True)
     monkeypatch.setattr(
-        kb,
+        kbc,
         "connect_closing",
         lambda *args, **kwargs: pytest.fail("legacy automation opened native DB"),
     )
@@ -71,10 +73,10 @@ def test_legacy_triage_automation_rejects_before_native_reads(
 
 def test_legacy_swarm_rejects_before_native_transaction(monkeypatch):
     _select_plugin(monkeypatch)
-    monkeypatch.setattr(kb, "can_exit_triage", lambda: True)
+    monkeypatch.setattr(ka, "can_exit_triage", lambda: True)
     conn = sqlite3.connect(":memory:")
     try:
-        with pytest.raises(kb.AuthorityAdmissionRejected, match=_UNSUPPORTED):
+        with pytest.raises(ka.AuthorityAdmissionRejected, match=_UNSUPPORTED):
             kanban_swarm.create_swarm(
                 conn,
                 goal="legacy graph",
@@ -92,7 +94,7 @@ def test_board_import_rejects_before_reading_archive_but_export_remains_read_onl
 ):
     _select_plugin(monkeypatch)
 
-    with pytest.raises(kb.AuthorityAdmissionRejected, match=_UNSUPPORTED):
+    with pytest.raises(ka.AuthorityAdmissionRejected, match=_UNSUPPORTED):
         kanban_transfer.import_board(str(tmp_path / "missing.tar.gz"))
 
     monkeypatch.setattr(kb, "_normalize_board_slug", lambda value: "missing")

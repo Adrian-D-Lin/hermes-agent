@@ -10,7 +10,7 @@ import time
 from typing import Any, Callable
 
 from gateway.trusted_authorizer_evidence import mint_current_tailscale_authorizer
-from tools.approval import request_write_gate_approval
+from tools.approval_writegate import request_write_gate_approval
 from writegate.kanban_approvals import (
     KanbanInitiativeApprovalHost,
     KanbanInitiativeApprovalPreparation,

@@ -11,6 +11,7 @@ import os
 import sqlite3
 
 from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_authority as _authority
 from hermes_cli import config as _config
 
 from .versioning import PLUGIN_NAME, PLUGIN_VERSION, release_identity
@@ -89,13 +90,13 @@ def _trusted_repository_ids_getter() -> frozenset[str]:
 
 def register(ctx) -> None:
     """Register the one production authority runtime when it is selected."""
-    authority = _kb.resolve_selected_authority()
+    authority = _authority.resolve_selected_authority()
     if authority == "native":
         return None
     if authority != PLUGIN_NAME:
         raise RuntimeError(f"unknown mutation authority: {authority!r}")
 
-    database_path = _kb.resolve_authority_path()
+    database_path = _authority.resolve_authority_path()
     from .schema import create_schema
 
     conn = sqlite3.connect(database_path)
@@ -208,7 +209,7 @@ def runtime_health() -> dict:
     """Return the selected authority's read-only compatibility health."""
     from .skill_bundle import validate_skill_bundle
 
-    authority = _kb.resolve_selected_authority()
+    authority = _authority.resolve_selected_authority()
     info = {
         "selected_authority": authority,
         "database_path": None,
@@ -218,8 +219,8 @@ def runtime_health() -> dict:
         "versions": release_identity(),
     }
     if authority == PLUGIN_NAME:
-        database_path = _kb.resolve_authority_path()
-        status = _kb.provider_status(database_path)
+        database_path = _authority.resolve_authority_path()
+        status = _authority.provider_status(database_path)
         provider_ok = status.present and status.healthy
         skill_ok = validate_skill_bundle()
         info["database_path"] = database_path

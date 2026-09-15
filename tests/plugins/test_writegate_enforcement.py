@@ -307,7 +307,7 @@ def test_present_approval_preserves_host_reference_and_timestamp(
         "decision_at": "2026-09-01T10:20:30+00:00",
     }
     monkeypatch.setattr(
-        "tools.approval.request_write_gate_approval",
+        "tools.approval_writegate.request_write_gate_approval",
         lambda **kwargs: dict(expected),
     )
     result = mods.tool._present_and_get_decision(
@@ -336,7 +336,7 @@ def test_present_approval_surfaces_exception_request_in_order(
         }
 
     monkeypatch.setattr(
-        "tools.approval.request_write_gate_approval",
+        "tools.approval_writegate.request_write_gate_approval",
         approve_once,
     )
     mods.tool._present_and_get_decision(
@@ -387,7 +387,7 @@ def test_present_approval_surfaces_worktree_binding_in_order(
         }
 
     monkeypatch.setattr(
-        "tools.approval.request_write_gate_approval",
+        "tools.approval_writegate.request_write_gate_approval",
         approve_once,
     )
     mods.tool._present_and_get_decision(

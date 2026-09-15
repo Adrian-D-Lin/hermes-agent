@@ -19,6 +19,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture(scope="module")
@@ -164,7 +166,7 @@ def _plugin_database(tmp_path, monkeypatch, provider_module):
 
     # Initialize native schema and the test-only probe while native remains the
     # selected authority.  The S3 runtime is installed only after this setup.
-    with kb.connect_closing(database_path) as conn:
+    with kbc.connect_closing(database_path) as conn:
         schema_module.create_schema(conn)
         conn.execute(
             "CREATE TABLE boundary_probe (value TEXT PRIMARY KEY, audit TEXT NOT NULL)"
@@ -1530,7 +1532,8 @@ def test_all_retained_s2_mutations_use_the_active_boundary_transaction(
         observed["in_transaction"] = args[0].in_transaction
         return f"native:{operation}"
 
-    monkeypatch.setattr(kb, native_name, native_spy)
+    native_module = adapter_module._kb_dispatch if operation == "kanban_heartbeat" else kb
+    monkeypatch.setattr(native_module, native_name, native_spy)
     if operation == "kanban_heartbeat":
 
         def claim_spy(*args, **kwargs):
@@ -1753,7 +1756,7 @@ def test_native_nested_transaction_switch_requires_an_exact_bool(operation):
         "kanban_unblock": lambda conn: kb.unblock_task(
             conn, "task-exact-bool", _allow_nested=1
         ),
-        "kanban_heartbeat": lambda conn: kb.heartbeat_worker(
+        "kanban_heartbeat": lambda conn: kbd.heartbeat_worker(
             conn, "task-exact-bool", _allow_nested=1
         ),
         "kanban_request_changes": lambda conn: kb.request_changes(
@@ -1802,7 +1805,11 @@ def test_private_heartbeat_stops_when_exact_claim_cannot_be_extended(
         return True
 
     monkeypatch.setattr(kb, "heartbeat_claim", claim_spy)
-    monkeypatch.setattr(kb, "heartbeat_worker", heartbeat_spy)
+    monkeypatch.setattr(
+        _runtime_modules(commands_module)["private_adapter"]._kb_dispatch,
+        "heartbeat_worker",
+        heartbeat_spy,
+    )
 
     def handler(context):
         result = context.mutation_executor._heartbeat_in_active_transaction(
@@ -1849,7 +1856,7 @@ def test_private_complete_composes_inside_boundary_owned_transaction(
     _insert_native_task(database_path, "task-complete-active-transaction")
     cleanup_transaction_states = []
     monkeypatch.setattr(
-        kb,
+        modules["private_adapter"]._kb_workspace,
         "_cleanup_workspace",
         lambda conn, _task_id: cleanup_transaction_states.append(conn.in_transaction),
     )
@@ -1901,7 +1908,7 @@ def test_private_complete_rollback_discards_deferred_workspace_cleanup(
     _insert_native_task(database_path, task_id)
     cleanup_calls = []
     monkeypatch.setattr(
-        kb,
+        modules["private_adapter"]._kb_workspace,
         "_cleanup_workspace",
         lambda _conn, cleaned_task_id: cleanup_calls.append(cleaned_task_id),
     )

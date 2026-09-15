@@ -11,6 +11,7 @@ import sqlite3
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
 
 from tests.test_adrian_kanban_s2 import (
     _insert_dispatch_task,
@@ -68,7 +69,7 @@ def test_dispatch_tick_discovers_only_governed_ready_tasks_in_priority_order(
         ).fetchone()[0] == "blocked"
         assert low.task_id == "task:low"
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -112,7 +113,7 @@ def test_dispatch_tick_derives_live_skill_compatibility_and_fails_closed_on_drif
             "SELECT status FROM tasks WHERE id = 'task:drift'"
         ).fetchone()[0] == "ready"
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -183,7 +184,7 @@ def test_dispatch_tick_derives_exact_accepted_checkpoint_predecessor(
         initiative_id="I1",
         accepted=True,
     )
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     conn.close()
 
 
@@ -260,7 +261,7 @@ def test_dispatch_tick_derives_accepted_completion_from_predecessor_task(
             accepted=True,
         )
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -314,7 +315,7 @@ def test_segment_dispatch_accepts_legitimate_head_advance_after_materialization(
         assert outcome.decision.admitted is True
         assert spawned == [record.task_id]
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 

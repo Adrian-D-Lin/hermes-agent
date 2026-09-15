@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as kb_authority
 
 
 @pytest.fixture()
@@ -28,7 +29,7 @@ def package():
     sys.modules[package_name] = module
     spec.loader.exec_module(module)
     yield module
-    kb.clear_authority_providers()
+    kb_authority.clear_authority_providers()
     for name in tuple(sys.modules):
         if name == package_name or name.startswith(f"{package_name}."):
             sys.modules.pop(name, None)
@@ -78,7 +79,7 @@ def _configure_workspace_registry(package, monkeypatch, tmp_path):
 def test_register_is_inert_while_native_authority_is_selected(
     package, monkeypatch
 ):
-    monkeypatch.setattr(package._kb, "resolve_selected_authority", lambda: "native")
+    monkeypatch.setattr(package._authority, "resolve_selected_authority", lambda: "native")
     context = _Context()
 
     assert package.register(context) is None
@@ -88,7 +89,7 @@ def test_register_is_inert_while_native_authority_is_selected(
 
 
 def test_register_rejects_unknown_authority(package, monkeypatch):
-    monkeypatch.setattr(package._kb, "resolve_selected_authority", lambda: "other")
+    monkeypatch.setattr(package._authority, "resolve_selected_authority", lambda: "other")
 
     with pytest.raises(RuntimeError, match="authority"):
         package.register(_Context())
@@ -99,12 +100,12 @@ def test_register_wires_one_complete_plugin_authority_runtime(
 ):
     database_path = str((tmp_path / "kanban.db").resolve())
     monkeypatch.setattr(
-        package._kb,
+        package._authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )
     monkeypatch.setattr(
-        package._kb,
+        package._authority,
         "resolve_authority_path",
         lambda **_kwargs: database_path,
     )
@@ -123,7 +124,7 @@ def test_register_wires_one_complete_plugin_authority_runtime(
         "pre_tool_call",
         "pre_user_turn",
     ]
-    status = package._kb.provider_status(database_path)
+    status = package._authority.provider_status(database_path)
     assert status.present is True
     assert status.healthy is True
     with sqlite3.connect(database_path) as conn:
@@ -140,7 +141,7 @@ def test_register_wires_one_complete_plugin_authority_runtime(
     registration = provider._workspace_registry.lookup("orchestrator")
     assert registration.repository_root == repository_root
 
-    delegated = package._kb.delegate_authority_operation(
+    delegated = package._authority.delegate_authority_operation(
         "not-a-kanban-operation",
         attempt_id="registration-read-1",
     )
@@ -154,12 +155,12 @@ def test_repeated_registration_reuses_one_provider_instance(
 ):
     database_path = str((tmp_path / "kanban.db").resolve())
     monkeypatch.setattr(
-        package._kb,
+        package._authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )
     monkeypatch.setattr(
-        package._kb,
+        package._authority,
         "resolve_authority_path",
         lambda **_kwargs: database_path,
     )
@@ -204,12 +205,12 @@ def test_runtime_health_reports_exact_versions_and_path(
 ):
     database_path = str((tmp_path / "kanban.db").resolve())
     monkeypatch.setattr(
-        package._kb,
+        package._authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )
     monkeypatch.setattr(
-        package._kb,
+        package._authority,
         "resolve_authority_path",
         lambda **_kwargs: database_path,
     )

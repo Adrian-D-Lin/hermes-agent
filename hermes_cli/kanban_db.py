@@ -802,6 +802,7 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(row["metadata"]),
+            worker_session_id=_row_get(row, "worker_session_id"),
         )
 
 
@@ -1251,6 +1252,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    _task_id: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1267,6 +1269,13 @@ def create_task(
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
+    if type(_task_id) is not str and _task_id is not None:
+        raise TypeError("_task_id must be a nonblank string")
+    if _task_id is not None:
+        _task_id = _task_id.strip()
+        if not _task_id:
+            raise TypeError("_task_id must be a nonblank string")
+
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
@@ -1614,7 +1623,7 @@ def link_tasks(
         raise TypeError("_allow_nested must be a bool")
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -1789,11 +1798,14 @@ def store_attachment_bytes(
     conn: sqlite3.Connection, task_id: str, filename: str, data: bytes, *,
     content_type: Optional[str] = None, uploaded_by: Optional[str] = None,
     board: Optional[str] = None, max_bytes: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> int:
     """Single attachment write path (dashboard, tools, CLI): size cap, safe
     basename, collision-free blob under :func:`task_attachments_dir`, then the
     metadata row. Raises :class:`AttachmentTooLarge` / ``ValueError``; a blob
     whose row insert fails is removed before re-raising. Returns the new id."""
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if max_bytes is None:
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
     if len(data) > max_bytes:
@@ -1807,6 +1819,7 @@ def store_attachment_bytes(
         return add_attachment(
             conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
             content_type=content_type, size=len(data), uploaded_by=uploaded_by,
+            _allow_nested=_allow_nested,
         )
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
@@ -1819,14 +1832,17 @@ def store_attachment_bytes(
 def add_attachment(
     conn: sqlite3.Connection, task_id: str, *, filename: str, stored_path: str,
     content_type: Optional[str] = None, size: int = 0, uploaded_by: Optional[str] = None,
+    _allow_nested: bool = False,
 ) -> int:
     """Record the metadata row (+ ``attached`` event) for a blob the caller already wrote."""
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if not filename or not filename.strip():
         raise ValueError("attachment filename is required")
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         _require_task(conn, task_id)
         cur = conn.execute(
             "INSERT INTO task_attachments "
@@ -2044,7 +2060,12 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
-def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
+def recompute_ready(
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    *,
+    _allow_nested: bool = False,
+) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
 
@@ -2300,6 +2321,8 @@ def heartbeat_claim(
     _allow_nested: bool = False,
 ) -> bool:
     """Extend a running claim; True if we still own it."""
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn, allow_nested=_allow_nested):
@@ -2609,7 +2632,13 @@ def complete_task(
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
-    verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    verified_cards = _gate_created_cards(
+        conn,
+        task_id,
+        created_cards,
+        summary or result,
+        _allow_nested=_allow_nested,
+    )
     metadata = _merge_completion_prose_artifacts(
         conn,
         task_id,
@@ -2621,7 +2650,7 @@ def complete_task(
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
@@ -2671,11 +2700,20 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
-    _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
+    _flag_phantom_prose_refs(
+        conn,
+        task_id,
+        run_id,
+        summary,
+        result,
+        verified_cards,
+        _allow_nested=_allow_nested,
+    )
     # Success wipes the breaker counter (history stays on the event log).
-    _clear_failure_counter(conn, task_id)
-    recompute_ready(conn)  # separate txn so children see ``done``
-    _cleanup_workspace(conn, task_id)
+    _clear_failure_counter(conn, task_id, _allow_nested=_allow_nested)
+    recompute_ready(conn, _allow_nested=_allow_nested)
+    if not _defer_cleanup:
+        _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
@@ -2687,6 +2725,7 @@ _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
 
 def _gate_created_cards(
     conn: sqlite3.Connection, task_id: str, created_cards: Optional[Iterable[str]], preview_text: Optional[str],
+    *, _allow_nested: bool = False,
 ) -> list[str]:
     """Verify ``created_cards`` BEFORE the main write txn; returns the verified
     ids. A phantom id is recorded in its own tiny txn (auditable) then raised
@@ -2695,7 +2734,7 @@ def _gate_created_cards(
         return []
     verified_cards, phantom_cards = _verify_created_cards(conn, task_id, created_cards)
     if phantom_cards:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=_allow_nested):
             _append_event(
                 conn, task_id, "completion_blocked_hallucination",
                 {
@@ -2763,6 +2802,7 @@ def _completed_event_payload(
 def _flag_phantom_prose_refs(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
     summary: Optional[str], result: Optional[str], verified_cards: list[str],
+    *, _allow_nested: bool = False,
 ) -> None:
     """Advisory post-commit scan of summary+result for unresolvable ``t_<hex>``
     references; emits ``suspected_hallucinated_references`` in its own txn so
@@ -2772,7 +2812,7 @@ def _flag_phantom_prose_refs(
         return
     phantom_refs = [p for p in _scan_prose_for_phantom_ids(conn, scan_text) if p not in set(verified_cards)]
     if phantom_refs:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=_allow_nested):
             _append_event(
                 conn, task_id, "suspected_hallucinated_references",
                 {"phantom_refs": phantom_refs, "source": "completion_summary"}, run_id=run_id,
@@ -2994,13 +3034,16 @@ def edit_completed_task_result(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition."""
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -3086,6 +3129,7 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    _allow_nested: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3122,7 +3166,7 @@ def request_review(
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
     staged_copies: list[Path] = []
     try:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=_allow_nested):
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
@@ -3223,10 +3267,13 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
     gating reapplied. Returns ``(ok, implementer | reason)``."""
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3375,11 +3422,18 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _allow_nested: bool = False,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
+    if type(_allow_nested) is not bool:
+        raise TypeError("_allow_nested must be a bool")
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -4245,6 +4299,27 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 
 
 _PLUGIN_COMPAT_LAZY = {
+    '_dispatch_tick_lock': ('hermes_cli.kanban_db_connect', '_dispatch_tick_lock'),
+    '_launch_admitted_task': ('hermes_cli.kanban_db_dispatch', '_launch_admitted_task'),
+    'AUTHORITY_ADRIAN_KANBAN': ('hermes_cli.kanban_authority', 'AUTHORITY_ADRIAN_KANBAN'),
+    'AUTHORITY_NATIVE': ('hermes_cli.kanban_authority', 'AUTHORITY_NATIVE'),
+    'AuthorityAdmissionRejected': ('hermes_cli.kanban_authority', 'AuthorityAdmissionRejected'),
+    'ProviderStatus': ('hermes_cli.kanban_authority', 'ProviderStatus'),
+    '_MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR': ('hermes_cli.kanban_authority', '_MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR'),
+    '_MUTATION_AUTHORITY_HUMAN_DASHBOARD': ('hermes_cli.kanban_authority', '_MUTATION_AUTHORITY_HUMAN_DASHBOARD'),
+    '_enforce_seam_on_write_txn': ('hermes_cli.kanban_authority', '_enforce_seam_on_write_txn'),
+    '_scoped_authority_capability': ('hermes_cli.kanban_authority', '_scoped_authority_capability'),
+    '_scoped_mutation_authority': ('hermes_cli.kanban_authority', '_scoped_mutation_authority'),
+    'can_exit_triage': ('hermes_cli.kanban_authority', 'can_exit_triage'),
+    'clear_authority_providers': ('hermes_cli.kanban_authority', 'clear_authority_providers'),
+    'delegate_authority_operation': ('hermes_cli.kanban_authority', 'delegate_authority_operation'),
+    'ensure_admitted': ('hermes_cli.kanban_authority', 'ensure_admitted'),
+    'provider_status': ('hermes_cli.kanban_authority', 'provider_status'),
+    'register_authority_provider': ('hermes_cli.kanban_authority', 'register_authority_provider'),
+    'require_native_mutation_authority': ('hermes_cli.kanban_authority', 'require_native_mutation_authority'),
+    'resolve_authority_path': ('hermes_cli.kanban_authority', 'resolve_authority_path'),
+    'resolve_selected_authority': ('hermes_cli.kanban_authority', 'resolve_selected_authority'),
+    'resolve_trusted_authority_workspace': ('hermes_cli.kanban_authority', 'resolve_trusted_authority_workspace'),
     'DEFAULT_BUSY_TIMEOUT_MS': ('hermes_cli.kanban_db_connect', 'DEFAULT_BUSY_TIMEOUT_MS'),
     'DEFAULT_LOG_BACKUP_COUNT': ('hermes_cli.kanban_db_dispatch', 'DEFAULT_LOG_BACKUP_COUNT'),
     'DEFAULT_LOG_ROTATE_BYTES': ('hermes_cli.kanban_db_dispatch', 'DEFAULT_LOG_ROTATE_BYTES'),
@@ -4252,6 +4327,10 @@ _PLUGIN_COMPAT_LAZY = {
     'DERIVED_MAX_IN_PROGRESS_FLOOR': ('hermes_cli.kanban_db_dispatch', 'DERIVED_MAX_IN_PROGRESS_FLOOR'),
     'KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS': ('hermes_cli.kanban_db_dispatch', 'KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS'),
     'KanbanDbCorruptError': ('hermes_cli.kanban_db_connect', 'KanbanDbCorruptError'),
+    'WriteGatePreSpawnError': ('hermes_cli.kanban_writegate_binding', 'WriteGatePreSpawnError'),
+    '_abandon_pre_spawn_binding': ('hermes_cli.kanban_writegate_binding', '_abandon_pre_spawn_binding'),
+    '_trusted_worker_session_id': ('hermes_cli.kanban_writegate_binding', '_trusted_worker_session_id'),
+    '_writegate_binding_enabled': ('hermes_cli.kanban_writegate_binding', '_writegate_binding_enabled'),
     'MEMORY_GUARD_MB_PER_WORKER': ('hermes_cli.kanban_db_dispatch', 'MEMORY_GUARD_MB_PER_WORKER'),
     'RepairResult': ('hermes_cli.kanban_db_connect', 'RepairResult'),
     'add_notify_sub': ('hermes_cli.kanban_db_notify', 'add_notify_sub'),
@@ -4274,6 +4353,7 @@ _PLUGIN_COMPAT_LAZY = {
     'heartbeat_worker': ('hermes_cli.kanban_db_dispatch', 'heartbeat_worker'),
     'list_notify_subs': ('hermes_cli.kanban_db_notify', 'list_notify_subs'),
     'purge_stale_done_notify_subs': ('hermes_cli.kanban_db_notify', 'purge_stale_done_notify_subs'),
+    'prepare_worker_launch': ('hermes_cli.kanban_writegate_binding', 'prepare_worker_launch'),
     'reap_worker_zombies': ('hermes_cli.kanban_db_dispatch', 'reap_worker_zombies'),
     'reconcile_orphaned_running': ('hermes_cli.kanban_db_dispatch', 'reconcile_orphaned_running'),
     'remove_notify_sub': ('hermes_cli.kanban_db_notify', 'remove_notify_sub'),

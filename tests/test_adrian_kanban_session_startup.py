@@ -16,6 +16,8 @@ from types import ModuleType
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
+from hermes_cli import kanban_db_connect as kbc
 from gateway import trusted_authorizer_evidence as trusted
 
 
@@ -949,7 +951,7 @@ def test_creation_coordinator_end_to_end_consumes_real_approval_and_handler(
     provider_module = adrian_plugin_modules["provider"]
     database = _db_path(kanban_home, "creation-real-boundary")
     database.parent.mkdir(parents=True, exist_ok=True)
-    with kb.connect_closing(database):
+    with kbc.connect_closing(database):
         pass
     (kanban_home / "config.yaml").write_text(
         "plugins:\n"
@@ -963,7 +965,7 @@ def test_creation_coordinator_end_to_end_consumes_real_approval_and_handler(
     provider = provider_module.AdrianKanbanAuthorityProvider(str(database))
     provider_module.register_provider(provider)
     monkeypatch.setattr(
-        kb, "resolve_selected_authority", lambda: kb.AUTHORITY_ADRIAN_KANBAN
+        ka, "resolve_selected_authority", lambda: ka.AUTHORITY_ADRIAN_KANBAN
     )
     handler_errors = []
 

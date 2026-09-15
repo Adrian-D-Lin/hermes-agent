@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli.archive_safe import (
     archive_root_dirs,
@@ -295,6 +296,7 @@ def import_board(
 ) -> dict[str, Any]:
     """Import an archive as a NEW board (``slug`` overrides the archive's;
     either way it auto-suffixes if taken). Returns a summary dict."""
+    ka.require_native_mutation_authority("kanban_import")
     archive = Path(archive_path).expanduser()
     if not archive.exists():
         raise FileNotFoundError(f"archive not found: {archive}")

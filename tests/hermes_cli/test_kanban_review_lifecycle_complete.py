@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_diagnostics as kd
@@ -26,7 +27,7 @@ from hermes_cli import kanban_diagnostics as kd
 def conn(tmp_path: Path):
     db = kbc.connect(tmp_path / "kanban.db")
     try:
-        with kb._scoped_mutation_authority("dispatcher_orchestrator"):
+        with ka._scoped_mutation_authority("dispatcher_orchestrator"):
             yield db
     finally:
         db.close()

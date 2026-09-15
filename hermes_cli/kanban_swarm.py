@@ -22,6 +22,7 @@ import time
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 
@@ -121,6 +122,7 @@ def create_swarm(
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
+    ka.require_native_mutation_authority("kanban_swarm")
     activation_summary = "Swarm topology planned; root remains the shared blackboard."
     activated = False
     with kb.write_txn(conn):

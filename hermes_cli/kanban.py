@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
@@ -146,6 +147,20 @@ def kanban_command(args: argparse.Namespace) -> int:
             print("usage: hermes kanban <action> [options]\n"
                   "Run 'hermes kanban --help' for the full list of actions.", file=sys.stderr)
         return 0
+
+    # A selected replacement authority owns every CLI/slash operation. Route
+    # through its single boundary before board lookup, native initialization,
+    # or delegated-child fast-fail so there is no accidental native fallback.
+    try:
+        authority = ka.resolve_selected_authority()
+    except Exception:
+        return _print_authority_rejection(
+            "AUTHORITY_RESOLUTION_FAILED",
+            "cli_" + action.replace("-", "_"),
+            "The selected Kanban authority could not be resolved.",
+        )
+    if authority == "adrian-kanban":
+        return _dispatch_selected_authority_cli(args, action)
 
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
@@ -339,7 +354,7 @@ def _dispatch_selected_authority_cli(args: argparse.Namespace, action: str) -> i
         }
 
     try:
-        response = kb.delegate_authority_operation(
+        response = ka.delegate_authority_operation(
             operation, payload=payload, attempt_id=attempt_id
         )
     except Exception:

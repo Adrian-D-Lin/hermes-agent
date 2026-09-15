@@ -2833,12 +2833,40 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._init_session_store()
         self._pending_title: Optional[str] = None
         self._resumed = bool(resume)
-        self.session_id = resume or new_session_id(self.session_start)
+        self.session_id = (
+            resume
+            or self._resolve_preassigned_worker_session_id()
+            or new_session_id(self.session_start)
+        )
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
 
         self._history_file = _hermes_home / ".hermes_history"
         self._last_invalidate: float = 0.0  # throttles UI repaints
         self._init_ui_state()
+
+    def _resolve_preassigned_worker_session_id(self) -> Optional[str]:
+        """Accept a dispatcher identity only when all Kanban markers agree."""
+        candidate = os.environ.get("HERMES_KANBAN_WORKER_SESSION_ID") or ""
+        task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+        run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+        if not candidate or not task_id or not run_id_raw:
+            return None
+        try:
+            run_id = int(run_id_raw)
+            from hermes_cli.kanban_writegate_binding import (
+                _trusted_worker_session_id,
+            )
+
+            trusted = _trusted_worker_session_id(
+                task_id,
+                run_id,
+                profile=os.environ.get("HERMES_KANBAN_PROFILE") or None,
+                workspace=os.environ.get("HERMES_KANBAN_WORKSPACE") or None,
+                board=os.environ.get("HERMES_KANBAN_BOARD") or None,
+            )
+        except Exception:
+            return None
+        return candidate if trusted == candidate else None
 
     def _init_session_store(self):
         """Open the session store early (so /title works before the first message) + opportunistic maintenance."""

@@ -318,6 +318,11 @@ def test_approved_override_into_dev2_materializes_planned_segment_before_movemen
         )
     )
     monkeypatch.setattr(
+        commands_module._CommandBoundary,
+        "_revalidate_repository_reconciliation",
+        lambda self, conn, reconciliation_ref: None,
+    )
+    monkeypatch.setattr(
         workspace._SegmentWorkspaceController,
         "_resolve_integration_head",
         staticmethod(lambda _registration: base_sha),

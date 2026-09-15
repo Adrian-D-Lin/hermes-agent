@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
 from hermes_cli import kanban_db_connect as kbc
 
 from utils import env_int
@@ -185,6 +186,10 @@ def specify_task(
     """Specify one triage task and promote it to ``todo``. Expected failures
     (not in triage, no aux client, API error, malformed reply) surface as
     ``ok=False`` so an ``--all`` sweep continues."""
+    try:
+        ka.require_native_mutation_authority("kanban_specify")
+    except ka.AuthorityAdmissionRejected as exc:
+        return SpecifyOutcome(task_id, False, str(exc))
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)

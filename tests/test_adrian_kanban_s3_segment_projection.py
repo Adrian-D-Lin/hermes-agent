@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from writegate.kanban_approvals import create_kanban_approval_schema
 
 
@@ -366,7 +367,7 @@ def test_preparer_rejects_policy_substitution_whitespace_and_duplicate_dependenc
 
 def _database(tmp_path, monkeypatch, plugin_modules):
     database_path = (tmp_path / "kanban.sqlite3").resolve()
-    with kb.connect_closing(database_path) as conn:
+    with kbc.connect_closing(database_path) as conn:
         plugin_modules["schema"].create_schema(conn)
         create_kanban_approval_schema(conn)
         conn.commit()

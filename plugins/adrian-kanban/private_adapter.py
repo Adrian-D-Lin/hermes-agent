@@ -6,6 +6,10 @@ from types import MappingProxyType
 from typing import Optional, Any
 
 from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_authority as _authority
+from hermes_cli import kanban_db_connect as _kb_connect
+from hermes_cli import kanban_db_dispatch as _kb_dispatch
+from hermes_cli import kanban_db_workspace as _kb_workspace
 from .capability import CapabilityBinding
 from .provider import AdrianKanbanAuthorityProvider, _capability_scope
 
@@ -288,7 +292,7 @@ class _LaunchTaskArgs:
     expected_assignee: str
     board: Optional[str] = None
     ttl_seconds: Optional[int] = None
-    failure_limit: int = _kb.DEFAULT_SPAWN_FAILURE_LIMIT
+    failure_limit: int = _kb_dispatch.DEFAULT_FAILURE_LIMIT
 
     def __post_init__(self) -> None:
         if not _is_nonblank_str(self.task_id):
@@ -428,8 +432,8 @@ class _PrivateNativeAdapter:
         allow_nested: bool = False,
     ) -> Any:
         if operation == "kanban_create":
-            with _kb._scoped_mutation_authority(
-                _kb._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+            with _authority._scoped_mutation_authority(
+                _authority._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
             ):
                 return _kb.create_task(
                     self._conn,
@@ -497,7 +501,7 @@ class _PrivateNativeAdapter:
                 _allow_nested=allow_nested,
             ):
                 return False
-            return _kb.heartbeat_worker(
+            return _kb_dispatch.heartbeat_worker(
                 self._conn,
                 arguments.task_id,
                 note=arguments.note,
@@ -567,7 +571,7 @@ class _PrivateNativeAdapter:
                 binding,
                 allow_multiple_writes=True,
             ):
-                return _kb._launch_admitted_task(
+                return _kb_dispatch._launch_admitted_task(
                     self._conn,
                     arguments.task_id,
                     expected_assignee=arguments.expected_assignee,
@@ -978,7 +982,7 @@ class _PrivateNativeAdapter:
         try:
             with _capability_scope(self._provider, self._conn, capability, binding):
                 try:
-                    with _kb.write_txn(self._conn):
+                    with _kb_connect.write_txn(self._conn):
                         yield self._conn
                 except BaseException:
                     rollback_paths = list(self._rollback_attachment_paths)
@@ -991,7 +995,7 @@ class _PrivateNativeAdapter:
                 self._rollback_attachment_paths = []
                 for task_id in self._deferred_cleanup_task_ids:
                     try:
-                        _kb._cleanup_workspace(self._conn, task_id)
+                        _kb_workspace._cleanup_workspace(self._conn, task_id)
                     except Exception:
                         pass
         finally:

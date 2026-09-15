@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_authority as _authority
 
 from .versioning import PLUGIN_NAME, PLUGIN_VERSION, release_identity
 
@@ -41,7 +41,7 @@ from .versioning import PLUGIN_NAME, PLUGIN_VERSION, release_identity
 # ``from adrian_kanban.seam import AuthorityAdmissionRejected`` without the
 # plugin importing core internals directly. This is a plain alias of the core
 # class.
-AuthorityAdmissionRejected = _kb.AuthorityAdmissionRejected
+AuthorityAdmissionRejected = _authority.AuthorityAdmissionRejected
 
 # The single canonical authority identifier. Kept in lockstep with the core
 # seam's ``AUTHORITY_ADRIAN_KANBAN`` and ``config_defaults``.
@@ -81,7 +81,7 @@ def register_provider(
     it does not own or mutate the core seam. Scoping to ``db_path`` mirrors the
     machine-global DB identity the seam enforces.
     """
-    _kb.register_authority_provider(provider, db_path)
+    _authority.register_authority_provider(provider, db_path)
 
 
 def resolve_authority() -> str:
@@ -89,7 +89,7 @@ def resolve_authority() -> str:
 
     Delegates to the generic, core-owned ``kanban_db.resolve_selected_authority``.
     """
-    return _kb.resolve_selected_authority()
+    return _authority.resolve_selected_authority()
 
 
 def ensure_admitted(operation: str, *, db_path: Optional[str] = None) -> bool:
@@ -102,7 +102,7 @@ def ensure_admitted(operation: str, *, db_path: Optional[str] = None) -> bool:
     consumes a production capability — it only asks the provider whether an
     operation was already admitted.
     """
-    return _kb.ensure_admitted(operation, db_path=db_path)
+    return _authority.ensure_admitted(operation, db_path=db_path)
 
 
 def health_report(db_path: Optional[str] = None) -> dict[str, Any]:
@@ -130,9 +130,9 @@ def health_report(db_path: Optional[str] = None) -> dict[str, Any]:
     if authority == AUTHORITY_ADRIAN_KANBAN:
         # Resolve the configured authoritative path (raises when missing or
         # relative) and query the provider through the public status query.
-        authoritative = _kb.resolve_authority_path()
+        authoritative = _authority.resolve_authority_path()
         info["db_path"] = authoritative
-        status = _kb.provider_status(authoritative)
+        status = _authority.provider_status(authoritative)
         available = status.present and status.healthy
         info["provider_present"] = status.present
         info["provider_healthy"] = status.healthy

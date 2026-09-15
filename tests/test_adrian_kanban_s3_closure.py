@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from writegate.kanban_approvals import create_kanban_approval_schema
 
 
@@ -43,7 +44,7 @@ def _database(tmp_path, monkeypatch, commands_module):
     )
     schema_module = importlib.import_module(f"{commands_module.__package__}.schema")
     database_path = (tmp_path / "kanban.sqlite3").resolve()
-    with kb.connect_closing(database_path) as conn:
+    with kbc.connect_closing(database_path) as conn:
         schema_module.create_schema(conn)
         create_kanban_approval_schema(conn)
         conn.commit()
@@ -388,7 +389,7 @@ def test_public_close_composes_closure_record_from_final_checkpoint_atomically(
         payload=payload,
     )
 
-    assert result["result"] == "ACCEPTED"
+    assert result["result"] == "ACCEPTED", result
     with sqlite3.connect(database_path) as conn:
         row = conn.execute(
             "SELECT result_kind,canonical_payload,accepted_checkpoint_refs,"

@@ -1153,7 +1153,11 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     since those side effects would fire while the outer txn can still roll back.
     """
     _kb._assert_not_delegated_child_mutation()
-    if getattr(conn, "in_transaction", False):
+    nested = bool(getattr(conn, "in_transaction", False))
+    from hermes_cli.kanban_authority import _enforce_seam_on_write_txn
+
+    _enforce_seam_on_write_txn(conn, nested=nested)
+    if nested:
         if not allow_nested:
             raise RuntimeError(
                 "write_txn: already inside a transaction. Nested composition "

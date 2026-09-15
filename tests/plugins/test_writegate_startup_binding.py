@@ -457,7 +457,7 @@ def test_confirm_binding_accepts_trusted_active_segment_container(
     """A multi-repository segment root is not itself a Git worktree, but the
     selected Kanban authority may certify that exact host-owned cwd as an
     active system-derived workspace."""
-    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_authority as kb
     from tools.terminal_tool import record_session_cwd
 
     segment_root = (tmp_path / "worktrees" / "initiative-1" / "S1").resolve()

@@ -54,7 +54,8 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS, PLUGIN_SECTIONS_END, PLUGIN_SECTIONS_START,
     SYSTEM_PROMPT_SECTION_POSITIONS, _EVENT_EMIT_DEPTH_CAP, _EVENT_PENDING_CAP,
     _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
-    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
+    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, _PRE_USER_TURN_TIMEOUT_BLOCK_MESSAGE,
+    PluginDispatchMixin, PluginSystemPromptSection,
     RenderedPluginSystemPromptSection, _EventSubscription, format_system_prompt_sections,
     is_valid_system_prompt_section_id,
 )
@@ -108,7 +109,7 @@ _install_plugin_debug_handler()
 VALID_HOOKS: Set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
-    "transform_llm_output", "pre_llm_call", "post_llm_call",
+    "transform_llm_output", "pre_llm_call", "post_llm_call", "pre_user_turn",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.
     "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
@@ -200,7 +201,10 @@ VALID_HOOKS: Set[str] = {
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "transform_api_error_classification",
+    "pre_user_turn",
+}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()
@@ -1094,7 +1098,7 @@ for _row in _SCOPED_PROVIDER_REGISTRARS:
 del _row
 
 
-def _resolve_hook_callback_timeout() -> float:
+def _resolve_hook_callback_timeout(hook_name: Optional[str] = None) -> float:
     """Effective hook-callback timeout from ``plugins.hook_callback_timeout`` (default 30s; ``<= 0``
     disables the threaded path; clamped to ``_MAX_HOOK_CALLBACK_TIMEOUT_SECS``)."""
     default = _HOOK_CALLBACK_TIMEOUT_SECS
@@ -1102,20 +1106,32 @@ def _resolve_hook_callback_timeout() -> float:
         from hermes_cli.config import load_config_readonly
         plugins_cfg = (load_config_readonly() or {}).get("plugins")
         if not isinstance(plugins_cfg, dict) or plugins_cfg.get("hook_callback_timeout") is None:
-            return default
-        timeout = float(plugins_cfg["hook_callback_timeout"])
+            timeout = default
+        else:
+            timeout = float(plugins_cfg["hook_callback_timeout"])
     except (TypeError, ValueError):
         logger.warning("plugins.hook_callback_timeout is not a number; using default %gs", default)
-        return default
+        timeout = default
     except Exception:
-        return default
+        timeout = default
     if timeout < 0:
         logger.warning("plugins.hook_callback_timeout=%g is negative; using default %gs", timeout, default)
-        return default
+        timeout = default
     if timeout > _MAX_HOOK_CALLBACK_TIMEOUT_SECS:
         logger.warning("plugins.hook_callback_timeout=%g exceeds max %gs; clamping", timeout,
                        _MAX_HOOK_CALLBACK_TIMEOUT_SECS)
-        return _MAX_HOOK_CALLBACK_TIMEOUT_SECS
+        timeout = _MAX_HOOK_CALLBACK_TIMEOUT_SECS
+    if hook_name == "pre_user_turn" and timeout > 0:
+        try:
+            from tools.approval_context import _get_approval_timeout
+
+            approval_timeout = float(_get_approval_timeout())
+        except Exception:
+            approval_timeout = 300.0
+        return min(
+            _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
+            max(timeout, approval_timeout + 30.0),
+        )
     return timeout
 
 

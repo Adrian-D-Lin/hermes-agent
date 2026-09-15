@@ -31,6 +31,11 @@ In dotted notation, `kanban.mutation_authority` must resolve to
 The gateway configuration must also contain:
 
 ```yaml
+plugins:
+  enabled:
+    - adrian-kanban
+  disabled:
+    - kanban
 kanban:
   mutation_authority: adrian-kanban
   controlled_worktree_root: /home/progenitor/AI-worktrees
@@ -39,13 +44,23 @@ kanban:
       repository_root: <absolute-primary-clone>
 ```
 
+Preserve any unrelated entries already present in `plugins.enabled` and
+`plugins.disabled`; the lists above state only the two required Tracker
+entries.  `kanban` is the superseded native Hermes Kanban product surface and
+must remain disabled, while `adrian-kanban` is the enabled Initiative Tracker.
+The Desktop's separately bundled native Kanban extension is also off by
+default and must not be manually enabled.  The retained
+`hermes_cli.kanban_db*` modules are not a second board: they are the shared
+task/run, comment, attachment, dispatch, transaction, and workspace substrate
+used by the Initiative Tracker itself.
+
 Each active Hermes Project with a Tracker `board_slug` must have one absolute
 `primary_path` that resolves to exactly one registered repository. Do not infer
 project/repository membership from CWD, chat, historical card text, or filesystem
 discovery.
 
 Gate: configuration and project-to-primary-repository mapping validate without
-ambiguity.
+ambiguity; the native Kanban dashboard/API and Desktop extension are inactive.
 
 ## 3. Open the stopped maintenance window
 

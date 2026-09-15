@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_db_connect as _kb_connect
 
 from .capability import CapabilityBinding
 from .contracts import template_for
@@ -132,7 +133,7 @@ class _LifecycleDispatcher:
         if not _is_nonblank_str(profile):
             raise _DispatcherRejected("execution profile must be a nonblank string")
         lock_path = _profile_lock_path(Path(self._provider.database_path), profile)
-        with _kb._dispatch_tick_lock(lock_path) as held:
+        with _kb_connect._dispatch_tick_lock(lock_path) as held:
             if not held:
                 raise _DispatcherRejected("dispatch lock is busy")
             return self._dispatch_locked(attempt)

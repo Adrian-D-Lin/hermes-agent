@@ -134,7 +134,7 @@ def _default_workspace_advancement_confirmer(
     )
     digest = hashlib.sha256(f"{session_id}\n{canonical}".encode("utf-8")).hexdigest()
 
-    from tools.approval import request_write_gate_approval
+    from tools.approval_writegate import request_write_gate_approval
 
     result = request_write_gate_approval(
         request_id=f"coordination-advancement-{digest}",

@@ -28,6 +28,7 @@ from __future__ import annotations
 import threading
 
 import tools.approval as approval_mod
+import tools.approval_writegate as writegate_approval
 
 
 def _gate_all(monkeypatch, *, gateway=True):
@@ -81,7 +82,7 @@ def _run_request(session_key, request_id, command="write_gate_exception",
     done = threading.Event()
 
     def _worker():
-        result_holder["r"] = approval_mod.request_write_gate_approval(
+        result_holder["r"] = writegate_approval.request_write_gate_approval(
             request_id=request_id, command=command,
             description=description, session_key=session_key,
         )
@@ -187,7 +188,7 @@ def test_gateway_without_notify_denies(monkeypatch):
 
     # No session registered → no notify callback → the gateway path must fail
     # closed (deny) and must not reach the invisible CLI prompt.
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception", session_key="sess-nobody",
     )

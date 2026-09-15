@@ -1,6 +1,7 @@
 name: adrian-kanban
 description: >-
-  Complete Adrian-specific mutation authority for the shared Kanban board.
+  Complete Adrian-specific Initiative Tracker and mutation authority, backed
+  by Hermes task/run persistence primitives.
   When selected, it replaces all 18 public Kanban operations and supplies the
   verified-input pre-tool hook. Native selection leaves it inert.
 version: 0.4.2

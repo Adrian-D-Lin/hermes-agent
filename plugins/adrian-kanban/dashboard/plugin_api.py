@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import JSONResponse
 
 from gateway.trusted_authorizer_evidence import mint_tailscale_authorizer_for_peer
-from hermes_cli import kanban_db, projects_db
+from hermes_cli import kanban_authority, kanban_db, projects_db
 
 if __package__:
     from ..versioning import release_identity
@@ -59,7 +59,7 @@ def _unavailable_envelope(attempt_id: str, operation: str) -> dict:
 
 def _delegate(operation: str, payload: dict, attempt_id: str):
     try:
-        envelope = kanban_db.delegate_authority_operation(
+        envelope = kanban_authority.delegate_authority_operation(
             operation,
             attempt_id=attempt_id,
             payload=payload,
@@ -88,7 +88,7 @@ def _respond(envelope, attempt_id: str, operation: str):
 @router.get("/handshake")
 def handshake():
     try:
-        authority = kanban_db.resolve_selected_authority()
+        authority = kanban_authority.resolve_selected_authority()
     except Exception:
         authority = None
     return {
@@ -240,7 +240,7 @@ async def command(operation: str, request: Request):
     fields["override_now"] = now
 
     try:
-        envelope = kanban_db.delegate_authority_operation(operation, **fields)
+        envelope = kanban_authority.delegate_authority_operation(operation, **fields)
     except Exception:
         envelope = None
     return _respond(envelope, attempt_id, operation)
@@ -258,7 +258,7 @@ def _ws_upgrade_authorized(ws: WebSocket) -> bool:
 
 
 def _read_notification_page(cursor: int) -> dict:
-    db_path = Path(kanban_db.resolve_authority_path()).resolve()
+    db_path = Path(kanban_authority.resolve_authority_path()).resolve()
     conn = sqlite3.connect(
         db_path.as_uri() + "?mode=ro",
         uri=True,
@@ -274,7 +274,7 @@ def _read_notification_page(cursor: int) -> dict:
 @router.websocket("/events")
 async def dashboard_events(websocket: WebSocket) -> None:
     try:
-        authority = kanban_db.resolve_selected_authority()
+        authority = kanban_authority.resolve_selected_authority()
     except Exception:
         await websocket.close(code=1008)
         return

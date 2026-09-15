@@ -43,6 +43,9 @@ from types import ModuleType
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -173,7 +176,7 @@ def test_native_authority_resolves_native(kanban_home: Path):
     returns ``'native'``.
     Out-of-scope: selected-plugin rejection (see seam tests).
     """
-    assert kb.resolve_selected_authority() == "native"
+    assert ka.resolve_selected_authority() == "native"
 
 
 def test_native_authority_preserves_native_mutation(kanban_home: Path):
@@ -184,7 +187,7 @@ def test_native_authority_preserves_native_mutation(kanban_home: Path):
     Fixture: fresh board + connection. Expected: ``create_task`` returns an id.
     Out-of-scope: selected-plugin rejection (see seam tests).
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="seed")
         assert tid.startswith("t_")
 
@@ -205,9 +208,9 @@ def test_native_mutation_rejected_when_plugin_authority_selected(adrian_authorit
     authority. No row is written.
     Out-of-scope: the provider-present delegation path.
     """
-    from hermes_cli.kanban_db import AuthorityAdmissionRejected
+    from hermes_cli.kanban_authority import AuthorityAdmissionRejected
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with pytest.raises(AuthorityAdmissionRejected) as excinfo:
             with kb.write_txn(conn):
                 conn.execute(
@@ -229,7 +232,7 @@ def test_dispatch_rejected_when_plugin_authority_selected(adrian_authority: Path
     Expected: ``AuthorityAdmissionRejected`` mentioning the selected authority.
     Out-of-scope: the provider-present dispatch path.
     """
-    from hermes_cli.kanban_db import AuthorityAdmissionRejected
+    from hermes_cli.kanban_authority import AuthorityAdmissionRejected
 
     # Seed a ready task while native is still selected; the behavior under
     # test is the later dispatch boundary, not task creation.
@@ -239,7 +242,7 @@ def test_dispatch_rejected_when_plugin_authority_selected(adrian_authority: Path
         "  mutation_authority: native\n",
         encoding="utf-8",
     )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.create_task(conn, title="ready-task")
         config_path.write_text(
             "kanban:\n"
@@ -247,7 +250,7 @@ def test_dispatch_rejected_when_plugin_authority_selected(adrian_authority: Path
             encoding="utf-8",
         )
         with pytest.raises(AuthorityAdmissionRejected) as excinfo:
-            kb.dispatch_once(conn)
+            kbd.dispatch_once(conn)
         assert "adrian-kanban" in str(excinfo.value)
 
 
@@ -260,9 +263,9 @@ def test_native_board_write_rejected_when_plugin_selected(adrian_authority: Path
     Expected: any native write raises the authority diagnostic.
     Out-of-scope: the provider-present path.
     """
-    from hermes_cli.kanban_db import AuthorityAdmissionRejected
+    from hermes_cli.kanban_authority import AuthorityAdmissionRejected
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with pytest.raises(AuthorityAdmissionRejected):
             with kb.write_txn(conn):
                 conn.execute(
@@ -281,7 +284,7 @@ def test_unhealthy_provider_fails_closed(kanban_home: Path):
     Expected: native mutation raises ``AuthorityAdmissionRejected``.
     Out-of-scope: the healthy delegation path.
     """
-    from hermes_cli.kanban_db import AuthorityAdmissionRejected
+    from hermes_cli.kanban_authority import AuthorityAdmissionRejected
 
     # Select the authority via config on a second home so the default stays native.
     home = kanban_home
@@ -301,9 +304,9 @@ def test_unhealthy_provider_fails_closed(kanban_home: Path):
         def admit_operation(self, operation: str) -> bool:
             return False
 
-    kb.register_authority_provider(_UnhealthyProvider(), db_path)
+    ka.register_authority_provider(_UnhealthyProvider(), db_path)
     try:
-        with kb.connect() as conn:
+        with kbc.connect() as conn:
             with pytest.raises(AuthorityAdmissionRejected):
                 with kb.write_txn(conn):
                     conn.execute(
@@ -311,7 +314,7 @@ def test_unhealthy_provider_fails_closed(kanban_home: Path):
                         "VALUES ('t_unhealthy', 'u', 'ready', 0)"
                     )
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +334,7 @@ def test_test_only_provider_delegates_admitted_operation(kanban_home: Path):
     raises for an un-admitted one; no production capability is created.
     Out-of-scope: production capability creation/validation/binding.
     """
-    from hermes_cli.kanban_db import AuthorityAdmissionRejected
+    from hermes_cli.kanban_authority import AuthorityAdmissionRejected
 
     home = kanban_home
     db_path = str(kb.kanban_db_path().resolve())
@@ -350,13 +353,13 @@ def test_test_only_provider_delegates_admitted_operation(kanban_home: Path):
         def admit_operation(self, operation: str) -> bool:
             return operation == "admitted-synthetic"
 
-    kb.register_authority_provider(_TestProvider(), db_path)
+    ka.register_authority_provider(_TestProvider(), db_path)
     try:
-        assert kb.ensure_admitted("admitted-synthetic", db_path=db_path) is True
+        assert ka.ensure_admitted("admitted-synthetic", db_path=db_path) is True
         with pytest.raises(AuthorityAdmissionRejected):
-            kb.ensure_admitted("not-admitted", db_path=db_path)
+            ka.ensure_admitted("not-admitted", db_path=db_path)
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
 
 
 # ---------------------------------------------------------------------------
@@ -393,12 +396,12 @@ def test_selected_authority_resolves_only_provider_certified_workspace(
         def resolve_trusted_workspace_root(self, candidate):
             return str(trusted) if Path(candidate) == trusted else None
 
-    kb.register_authority_provider(_Provider(), db_path)
+    ka.register_authority_provider(_Provider(), db_path)
     try:
-        assert kb.resolve_trusted_authority_workspace(str(trusted)) == str(trusted)
-        assert kb.resolve_trusted_authority_workspace(str(untrusted)) is None
+        assert ka.resolve_trusted_authority_workspace(str(trusted)) == str(trusted)
+        assert ka.resolve_trusted_authority_workspace(str(untrusted)) is None
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
 
 
 def test_unified_card_initiative_required_task_nullable(
@@ -721,8 +724,8 @@ def test_all_processes_resolve_single_absolute_db_path(
     authority_db = (kanban_home.parent / "machine-global" / "kanban.db").resolve()
     homes = [kanban_home.parent / "profile-a", kanban_home.parent / "profile-b"]
     script = (
-        "import json; from hermes_cli import kanban_db as kb; "
-        "print(json.dumps(kb.resolve_authority_path()))"
+        "import json; from hermes_cli import kanban_authority as ka; "
+        "print(json.dumps(ka.resolve_authority_path()))"
     )
     resolved: list[str] = []
     for home in homes:
@@ -756,14 +759,14 @@ def test_plugin_authority_rejects_missing_database_path(
     Path: unhappy. Selecting the replacement authority without the explicit
     machine-global identity fails closed; it cannot inherit a native board.
     """
-    from hermes_cli.kanban_db import AuthorityAdmissionRejected
+    from hermes_cli.kanban_authority import AuthorityAdmissionRejected
 
     (kanban_home / "config.yaml").write_text(
         "kanban:\n  mutation_authority: adrian-kanban\n",
         encoding="utf-8",
     )
     with pytest.raises(AuthorityAdmissionRejected, match="database_path"):
-        kb.resolve_authority_path()
+        ka.resolve_authority_path()
 
 
 def test_plugin_authority_rejects_relative_database_path(
@@ -774,7 +777,7 @@ def test_plugin_authority_rejects_relative_database_path(
     Path: fringe. A relative value is rejected before normalization rather
     than silently becoming profile-local through the current working folder.
     """
-    from hermes_cli.kanban_db import AuthorityAdmissionRejected
+    from hermes_cli.kanban_authority import AuthorityAdmissionRejected
 
     (kanban_home / "config.yaml").write_text(
         "kanban:\n"
@@ -783,7 +786,7 @@ def test_plugin_authority_rejects_relative_database_path(
         encoding="utf-8",
     )
     with pytest.raises(AuthorityAdmissionRejected, match="absolute"):
-        kb.resolve_authority_path()
+        ka.resolve_authority_path()
 
 
 def test_provider_registration_isolated_by_database_path(kanban_home: Path):
@@ -793,7 +796,7 @@ def test_provider_registration_isolated_by_database_path(kanban_home: Path):
     database B. Expected: public status reports the distinction and admission
     on B fails closed.
     """
-    from hermes_cli.kanban_db import AuthorityAdmissionRejected
+    from hermes_cli.kanban_authority import AuthorityAdmissionRejected
 
     class _Provider:
         name = "path-a-only"
@@ -806,18 +809,18 @@ def test_provider_registration_isolated_by_database_path(kanban_home: Path):
 
     path_a = str((kanban_home.parent / "a" / "kanban.db").resolve())
     path_b = str((kanban_home.parent / "b" / "kanban.db").resolve())
-    kb.register_authority_provider(_Provider(), path_a)
+    ka.register_authority_provider(_Provider(), path_a)
     try:
-        status_a = kb.provider_status(path_a)
-        status_b = kb.provider_status(path_b)
+        status_a = ka.provider_status(path_a)
+        status_b = ka.provider_status(path_b)
         assert status_a.present is True
         assert status_a.healthy is True
         assert status_a.name == "path-a-only"
         assert status_b.present is False
         with pytest.raises(AuthorityAdmissionRejected):
-            kb.ensure_admitted("synthetic", db_path=path_b)
+            ka.ensure_admitted("synthetic", db_path=path_b)
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
 
 
 def test_store_and_health_report_authoritative_path(
@@ -853,14 +856,14 @@ def test_store_and_health_report_authoritative_path(
         f"  database_path: {authority_db.as_posix()}\n",
         encoding="utf-8",
     )
-    kb.register_authority_provider(_Provider(), str(authority_db))
+    ka.register_authority_provider(_Provider(), str(authority_db))
     try:
         report = health_report()
         assert Path(report["db_path"]) == authority_db
         assert report["provider_present"] is True
         assert report["provider_healthy"] is True
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
 
 
 # ---------------------------------------------------------------------------
@@ -985,10 +988,10 @@ def test_admitted_write_transaction_rolls_back_on_crash(
     token = object()
     binding = object()
     provider = _Provider()
-    kb.register_authority_provider(provider, str(authority_db))
+    ka.register_authority_provider(provider, str(authority_db))
     try:
         with pytest.raises(RuntimeError, match="simulated crash"):
-            with kb._scoped_authority_capability(
+            with ka._scoped_authority_capability(
                 conn, token, binding, db_path=str(authority_db)
             ):
                 with kb.write_txn(conn):
@@ -1001,7 +1004,7 @@ def test_admitted_write_transaction_rolls_back_on_crash(
         assert conn.in_transaction is False
         assert provider.consumed is True
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -1167,7 +1170,7 @@ def test_core_seam_is_generic_not_plugin_bound(kanban_home: Path):
     ``register_authority_provider`` exist on ``kanban_db``.
     Out-of-scope: plugin-side registration details.
     """
-    assert hasattr(kb, "AuthorityAdmissionRejected")
-    assert hasattr(kb, "register_authority_provider")
-    assert hasattr(kb, "resolve_selected_authority")
-    assert hasattr(kb, "ensure_admitted")
+    assert hasattr(ka, "AuthorityAdmissionRejected")
+    assert hasattr(ka, "register_authority_provider")
+    assert hasattr(ka, "resolve_selected_authority")
+    assert hasattr(ka, "ensure_admitted")

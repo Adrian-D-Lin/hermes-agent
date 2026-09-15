@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +43,7 @@ def migration_modules():
 
 def _database(tmp_path: Path, modules, tasks=("task-a", "task-b")) -> Path:
     database_path = (tmp_path / "kanban.sqlite3").resolve()
-    with kb.connect_closing(database_path) as conn:
+    with kbc.connect_closing(database_path) as conn:
         modules["schema"].create_schema(conn)
         for index, task_id in enumerate(tasks, start=1):
             conn.execute(

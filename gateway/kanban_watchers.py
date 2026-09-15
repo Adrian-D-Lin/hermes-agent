@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli import kanban_authority as _kanban_authority
+
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,
@@ -87,8 +89,8 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
         try:
-            _kb.require_native_mutation_authority("native_gateway_notifications")
-        except _kb.AuthorityAdmissionRejected as exc:
+            _kanban_authority.require_native_mutation_authority("native_gateway_notifications")
+        except _kanban_authority.AuthorityAdmissionRejected as exc:
             logger.info("kanban notifier: disabled by selected authority: %s", exc)
             return
 
@@ -262,6 +264,13 @@ class GatewayKanbanWatchersMixin:
         failure never stops the next. Shutdown: ``self._running`` is checked
         between ticks and the in-flight ``to_thread`` returns on its own.
         """
+        from hermes_cli import kanban_db as _kb
+
+        try:
+            _kanban_authority.require_native_mutation_authority("native_gateway_dispatch")
+        except _kanban_authority.AuthorityAdmissionRejected as exc:
+            logger.info("kanban dispatcher: disabled by selected authority: %s", exc)
+            return
         boot = self._kanban_dispatcher_boot()
         if boot is None:
             return

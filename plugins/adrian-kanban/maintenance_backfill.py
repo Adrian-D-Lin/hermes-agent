@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from hermes_cli import kanban_db
+from hermes_cli import kanban_authority
 
 from . import _trusted_repository_registry_getter
 from .coordination_backfill import (
@@ -34,12 +34,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if kanban_db.resolve_selected_authority() != "adrian-kanban":
+        if kanban_authority.resolve_selected_authority() != "adrian-kanban":
             raise CoordinationBackfillError(
                 "kanban.mutation_authority must be adrian-kanban"
             )
         result = run_coordination_backfill(
-            kanban_db.resolve_authority_path(),
+            kanban_authority.resolve_authority_path(),
             _trusted_repository_registry_getter(),
             load_projects(),
             apply=args.apply,

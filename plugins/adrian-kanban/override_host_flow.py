@@ -3,7 +3,7 @@ import json
 import sqlite3
 import time
 
-from tools.approval import request_write_gate_approval
+from tools.approval_writegate import request_write_gate_approval
 from gateway.trusted_authorizer_evidence import mint_current_tailscale_authorizer
 from writegate.kanban_approvals import KanbanInitiativeApprovalHost
 

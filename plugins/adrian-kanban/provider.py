@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_authority as _authority
 
 from .capability import CapabilityBinding, CapabilityRegistry, CapabilityRejected
 from .versioning import PLUGIN_NAME, PLUGIN_VERSION, PROTOCOL_VERSION
@@ -170,7 +171,7 @@ def _capability_scope(
         raise CapabilityRejected("provider is unhealthy")
     if type(allow_multiple_writes) is not bool:
         raise CapabilityRejected("allow_multiple_writes must be a bool")
-    with _kb._scoped_authority_capability(
+    with _authority._scoped_authority_capability(
         conn,
         capability,
         context,
@@ -183,7 +184,7 @@ def _capability_scope(
 def register_provider(provider) -> None:
     if type(provider) is not AdrianKanbanAuthorityProvider:
         raise CapabilityRejected("provider type mismatch")
-    _kb.register_authority_provider(provider, provider.database_path)
+    _authority.register_authority_provider(provider, provider.database_path)
 
 
 __all__ = [

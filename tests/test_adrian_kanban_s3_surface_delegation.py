@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
 from tests.test_adrian_kanban_s1 import adrian_plugin_modules, kanban_home  # noqa: F401
 
 
@@ -46,13 +46,13 @@ def test_selected_authority_delegates_exact_request_to_bound_command_service(
     provider.bind_command_boundary(Boundary())
     provider_module.register_provider(provider)
     try:
-        result = kb.delegate_authority_operation(
+        result = ka.delegate_authority_operation(
             "kanban_list",
             attempt_id="cli-attempt-1",
             payload={"board": "orchestrator"},
         )
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
 
     assert result["result"] == "ACCEPTED"
     assert calls == [
@@ -69,10 +69,10 @@ def test_selected_authority_delegates_exact_request_to_bound_command_service(
 def test_selected_authority_without_provider_fails_closed(kanban_home):
     database_path = (kanban_home.parent / "shared" / "kanban.sqlite3").resolve()
     _select_plugin(kanban_home, database_path)
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
 
-    with pytest.raises(kb.AuthorityAdmissionRejected, match="no configured provider"):
-        kb.delegate_authority_operation("kanban_list", payload={})
+    with pytest.raises(ka.AuthorityAdmissionRejected, match="no configured provider"):
+        ka.delegate_authority_operation("kanban_list", payload={})
 
 
 def test_provider_without_bound_command_service_fails_closed(
@@ -87,11 +87,11 @@ def test_provider_without_bound_command_service_fails_closed(
     provider_module.register_provider(provider)
     try:
         with pytest.raises(
-            kb.AuthorityAdmissionRejected, match="command boundary is unavailable"
+            ka.AuthorityAdmissionRejected, match="command boundary is unavailable"
         ):
-            kb.delegate_authority_operation("kanban_list", payload={})
+            ka.delegate_authority_operation("kanban_list", payload={})
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
 
 
 def test_malformed_command_service_response_fails_closed(
@@ -112,11 +112,11 @@ def test_malformed_command_service_response_fails_closed(
     provider_module.register_provider(provider)
     try:
         with pytest.raises(
-            kb.AuthorityAdmissionRejected, match="invalid command response"
+            ka.AuthorityAdmissionRejected, match="invalid command response"
         ):
-            kb.delegate_authority_operation("kanban_list", payload={})
+            ka.delegate_authority_operation("kanban_list", payload={})
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
 
 
 def test_provider_boundary_binding_rejects_invalid_or_repeated_binding(

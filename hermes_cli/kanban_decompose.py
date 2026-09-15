@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
 from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
@@ -301,6 +302,10 @@ def decompose_task(
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
     as ``ok=False``."""
+    try:
+        ka.require_native_mutation_authority("kanban_decompose")
+    except ka.AuthorityAdmissionRejected as exc:
+        return DecomposeOutcome(task_id, False, str(exc))
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)

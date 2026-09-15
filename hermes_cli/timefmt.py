@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time as _time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -22,17 +22,34 @@ EPOCH_MAX = 4_200_000_000.0
 def coerce_epoch(value: Any, *, session_id: Optional[str] = None, field: str = "timestamp") -> Optional[float]:
     """A stored timestamp cell as float epoch seconds, or ``None`` when it cannot be trusted.
 
-    Numbers, numeric strings and ``datetime`` are accepted; anything else, non-finite values and
-    values outside ``EPOCH_MIN..EPOCH_MAX`` return ``None`` after a WARNING naming the session so
-    the corrupt row can be found. ``None``/``""`` mean "unset" and stay silent. Every reader that
-    renders a row timestamp goes through here (a bad row degrades to one ``?`` cell, never a dead
-    command) and every writer uses it to refuse persisting a new bad row.
+    Numbers, numeric strings, ``datetime`` values, and legacy ISO-8601 strings
+    are accepted. Anything else, non-finite values and values outside
+    ``EPOCH_MIN..EPOCH_MAX`` return ``None`` after a WARNING naming the session
+    so the corrupt row can be found. ``None``/``""`` mean "unset" and stay
+    silent. Every reader that renders a row timestamp goes through here (a bad
+    row degrades to one ``?`` cell, never a dead command) and every writer uses
+    it to refuse persisting a new bad row.
     """
     if value is None or value == "":
         return None
     try:
-        ts = float(value.timestamp()) if isinstance(value, datetime) else float(value)
-    except (TypeError, ValueError):
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                ts = float(value)
+            except ValueError:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            else:
+                parsed = None
+        else:
+            ts = float(value)
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            ts = float(parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
         ts = math.nan
     if not (EPOCH_MIN <= ts <= EPOCH_MAX):  # also False for nan
         logger.warning("Ignoring corrupt %s %r%s", field, value, f" on session {session_id}" if session_id else "")
@@ -42,7 +59,10 @@ def coerce_epoch(value: Any, *, session_id: Optional[str] = None, field: str = "
 
 def relative_time(ts, *, session_id: Optional[str] = None) -> str:
     """Format a timestamp as relative time (e.g., '2h ago', 'yesterday'); ``?`` when unset or corrupt."""
-    if not ts or (ts := coerce_epoch(ts, session_id=session_id, field="last_active")) is None:
+    if not ts:
+        return "?"
+    seconds = coerce_epoch(ts, session_id=session_id, field="last_active")
+    if seconds is None:
         return "?"
     delta = _time.time() - seconds
     if delta < 60:

@@ -33,6 +33,7 @@ from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, split_runtime_boundary, stage_surface_switch_note,
 )
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
+from agent.turn_admission import resolve_pre_user_turn
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
@@ -1445,6 +1446,29 @@ def _run_conversation_turn(
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
             user_message, persist_user_message
         )
+
+    # Admission is the turn's first policy boundary. It must run before
+    # compression, prompt construction, credential refresh, or model I/O.
+    admission = resolve_pre_user_turn(
+        agent,
+        user_message,
+        conversation_history,
+        task_id,
+        persist_user_message,
+        getattr(agent, "model", None),
+        getattr(agent, "platform", None),
+    )
+    if admission is not None:
+        action = admission.get("action")
+        if action in {"respond", "fail"}:
+            result = admission["result"]
+            response = result.get("final_response")
+            if stream_callback is not None and isinstance(response, str) and response:
+                stream_callback(response)
+            return result
+        if action == "rewrite":
+            user_message = admission["model_message"]
+            persist_user_message = admission["persist_message"]
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.

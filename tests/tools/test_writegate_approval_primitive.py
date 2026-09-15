@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 
 import tools.approval as approval_mod
+import tools.approval_writegate as writegate_approval
 
 
 # ── Headless / no-human fast path ────────────────────────────────────────────
@@ -39,7 +40,7 @@ def test_headless_single_query_denies_immediately(monkeypatch):
     monkeypatch.setattr(
         approval_mod, "_is_gateway_approval_context", lambda: False
     )
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )
@@ -59,7 +60,7 @@ def test_cron_context_denies(monkeypatch):
     monkeypatch.setattr(
         approval_mod, "_is_gateway_approval_context", lambda: False
     )
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )
@@ -76,7 +77,7 @@ def test_unattended_platform_denies(monkeypatch):
     monkeypatch.setattr(
         approval_mod, "_is_gateway_approval_context", lambda: False
     )
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )
@@ -114,7 +115,7 @@ def test_cli_once_approved(monkeypatch):
     monkeypatch.setattr(
         approval_mod, "prompt_dangerous_approval", _stub
     )
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )
@@ -148,7 +149,7 @@ def test_cli_denied(monkeypatch):
         approval_mod, "prompt_dangerous_approval",
         lambda *a, **k: "deny"
     )
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )
@@ -180,7 +181,7 @@ def test_cli_timeout_fails_closed(monkeypatch):
         approval_mod, "prompt_dangerous_approval",
         lambda *a, **k: "timeout"
     )
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )
@@ -212,7 +213,7 @@ def test_cli_transport_failure_fails_closed(monkeypatch):
         raise RuntimeError("surface unavailable")
 
     monkeypatch.setattr(approval_mod, "prompt_dangerous_approval", _boom)
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )
@@ -258,7 +259,7 @@ def test_gateway_once_approved(monkeypatch):
     with monkeypatch.context() as m:
         import threading
         m.setitem(approval_mod._gateway_notify_cbs, "sess-1", _notify_cb)
-        result = approval_mod.request_write_gate_approval(
+        result = writegate_approval.request_write_gate_approval(
             request_id="wg-1", command="write_gate_exception",
             description="Write-Gate exception", session_key="sess-1",
         )
@@ -300,7 +301,7 @@ def test_gateway_denied(monkeypatch):
 
     with monkeypatch.context() as m:
         m.setitem(approval_mod._gateway_notify_cbs, "sess-1", lambda d: None)
-        result = approval_mod.request_write_gate_approval(
+        result = writegate_approval.request_write_gate_approval(
             request_id="wg-1", command="write_gate_exception",
             description="Write-Gate exception", session_key="sess-1",
         )
@@ -337,7 +338,7 @@ def test_gateway_notify_failed_denies(monkeypatch):
 
     with monkeypatch.context() as m:
         m.setitem(approval_mod._gateway_notify_cbs, "sess-1", lambda d: None)
-        result = approval_mod.request_write_gate_approval(
+        result = writegate_approval.request_write_gate_approval(
             request_id="wg-1", command="write_gate_exception",
             description="Write-Gate exception", session_key="sess-1",
         )
@@ -369,7 +370,7 @@ def test_selected_transport_once_approved(monkeypatch):
         return {"selected": True, "choice": "once", "failure": None}
 
     monkeypatch.setattr(approval_mod, "_present_with_selected_transport", _present)
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )
@@ -398,7 +399,7 @@ def test_selected_transport_failure_denies(monkeypatch):
         return {"selected": True, "choice": None, "failure": "error"}
 
     monkeypatch.setattr(approval_mod, "_present_with_selected_transport", _present)
-    result = approval_mod.request_write_gate_approval(
+    result = writegate_approval.request_write_gate_approval(
         request_id="wg-1", command="write_gate_exception",
         description="Write-Gate exception",
     )

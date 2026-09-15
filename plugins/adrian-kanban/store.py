@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_authority as _authority
 
 from . import schema as _schema
 from .validation import (
@@ -57,7 +57,7 @@ class AdmittedStore:
         # closed) by the resolver, and store initialization creates the
         # parent/database for disposable use.
         self.db_path = Path(
-            _kb.resolve_authority_path(override=database_path)
+            _authority.resolve_authority_path(override=database_path)
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))

@@ -20,7 +20,7 @@ def _args(*tokens: str) -> argparse.Namespace:
 def _select_plugin(monkeypatch) -> None:
     monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
     monkeypatch.setattr(
-        cli.kb, "resolve_selected_authority", lambda: "adrian-kanban"
+        cli.ka, "resolve_selected_authority", lambda: "adrian-kanban"
     )
     monkeypatch.setattr(
         cli.kb,
@@ -83,7 +83,7 @@ def test_plugin_cli_list_delegates_exact_supported_filters_without_native_init(
         calls.append((operation, fields))
         return _accepted(operation, fields)
 
-    monkeypatch.setattr(cli.kb, "delegate_authority_operation", delegate)
+    monkeypatch.setattr(cli.ka, "delegate_authority_operation", delegate)
 
     result = cli.kanban_command(
         _args(
@@ -137,7 +137,7 @@ def test_plugin_cli_read_actions_delegate_to_the_shared_boundary(
         calls.append((actual_operation, fields))
         return _accepted(actual_operation, fields)
 
-    monkeypatch.setattr(cli.kb, "delegate_authority_operation", delegate)
+    monkeypatch.setattr(cli.ka, "delegate_authority_operation", delegate)
 
     assert cli.kanban_command(_args(*tokens)) == 0
 
@@ -166,7 +166,7 @@ def test_plugin_cli_unavailable_actions_reject_through_boundary_without_fallback
         calls.append((operation, fields))
         return _rejected(operation, fields)
 
-    monkeypatch.setattr(cli.kb, "delegate_authority_operation", delegate)
+    monkeypatch.setattr(cli.ka, "delegate_authority_operation", delegate)
 
     assert cli.kanban_command(_args(*tokens)) == 1
 
@@ -185,7 +185,7 @@ def test_plugin_slash_uses_the_same_authority_adapter(monkeypatch):
         calls.append((operation, fields))
         return _accepted(operation, fields)
 
-    monkeypatch.setattr(cli.kb, "delegate_authority_operation", delegate)
+    monkeypatch.setattr(cli.ka, "delegate_authority_operation", delegate)
 
     result = json.loads(cli.run_slash("list --json"))
 
@@ -203,7 +203,7 @@ def test_plugin_cli_does_not_silently_drop_unsupported_read_filters(
         calls.append((operation, fields))
         return _rejected(operation, fields)
 
-    monkeypatch.setattr(cli.kb, "delegate_authority_operation", delegate)
+    monkeypatch.setattr(cli.ka, "delegate_authority_operation", delegate)
 
     assert cli.kanban_command(_args("list", "--session", "session-9")) == 1
 
@@ -221,7 +221,7 @@ def test_plugin_cli_does_not_silently_drop_show_run_filters(monkeypatch, capsys)
         calls.append((operation, fields))
         return _rejected(operation, fields)
 
-    monkeypatch.setattr(cli.kb, "delegate_authority_operation", delegate)
+    monkeypatch.setattr(cli.ka, "delegate_authority_operation", delegate)
 
     assert (
         cli.kanban_command(
@@ -252,7 +252,7 @@ def test_plugin_authority_precedes_delegated_child_fast_fail(monkeypatch, capsys
         calls.append((operation, fields))
         return _rejected(operation, fields)
 
-    monkeypatch.setattr(cli.kb, "delegate_authority_operation", delegate)
+    monkeypatch.setattr(cli.ka, "delegate_authority_operation", delegate)
 
     assert cli.kanban_command(_args("complete", "task-11")) == 1
     assert len(calls) == 1
@@ -261,7 +261,7 @@ def test_plugin_authority_precedes_delegated_child_fast_fail(monkeypatch, capsys
 
 def test_authority_resolution_failure_never_falls_back_to_native(monkeypatch, capsys):
     monkeypatch.setattr(
-        cli.kb,
+        cli.ka,
         "resolve_selected_authority",
         lambda: (_ for _ in ()).throw(RuntimeError("bad authority config")),
     )
@@ -278,7 +278,7 @@ def test_authority_resolution_failure_never_falls_back_to_native(monkeypatch, ca
 
 def test_plugin_discovery_failure_is_rendered_fail_closed(monkeypatch, capsys):
     monkeypatch.setattr(
-        cli.kb, "resolve_selected_authority", lambda: "adrian-kanban"
+        cli.ka, "resolve_selected_authority", lambda: "adrian-kanban"
     )
     monkeypatch.setattr(
         cli.kb,

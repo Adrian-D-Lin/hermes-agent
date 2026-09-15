@@ -2,10 +2,10 @@
 
 Covers the two halves of the brief §3 / Canon §3d invariant:
 
-* :func:`kanban_db.prepare_worker_launch` — dispatcher-side: derive one worker
+* :func:`kanban_writegate_binding.prepare_worker_launch` — dispatcher-side: derive one worker
   session id, persist it on the exact ``task_runs`` row, create + verify the
   central active binding, and return the captured id.
-* :func:`kanban_db._trusted_worker_session_id` — CLI-side: honor the
+* :func:`kanban_writegate_binding._trusted_worker_session_id` — CLI-side: honor the
   preassigned id only when every trusted marker agrees (run id, task id,
   profile, workspace, board, and central binding lineage); fail closed
   otherwise.
@@ -25,6 +25,9 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_writegate_binding as kwb
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 # The ``writegate`` package is a repo-root host package, importable without
@@ -82,7 +85,7 @@ def _writegate_registry(tmp_path):
 
 
 def _patch_registry(monkeypatch, reg):
-    monkeypatch.setattr(kb, "_writegate_binding_enabled", lambda: True)
+    monkeypatch.setattr(kwb, "_writegate_binding_enabled", lambda: True)
     reg_proxy = type("R", (), {"get_registry": staticmethod(lambda: reg)})()
     monkeypatch.setattr(kb, "registry", reg_proxy, raising=False)
 
@@ -92,12 +95,12 @@ def _setup(kanban_home, tmp_path, monkeypatch, *, profile="builder-tester",
     """Claim + preassign; return (conn, claimed, run_id, workspace, worker_id, reg)."""
     reg = _writegate_registry(tmp_path)
     _patch_registry(monkeypatch, reg)
-    conn = kb.connect()
+    conn = kbc.connect()
     workspace = str(tmp_path / workspace_name)
     (tmp_path / workspace_name).mkdir()
     task = _make_task(conn, kb, assignee=profile, workspace_path=workspace)
     claimed, run_id = _claim(conn, task)
-    worker_id = kb.prepare_worker_launch(conn, claimed, workspace, board="default")
+    worker_id = kwb.prepare_worker_launch(conn, claimed, workspace, board="default")
     conn.commit()
     return conn, claimed, run_id, workspace, worker_id, reg
 
@@ -107,14 +110,14 @@ def _setup(kanban_home, tmp_path, monkeypatch, *, profile="builder-tester",
 def test_prepare_worker_launch_persists_run_and_binding(kanban_home, tmp_path, monkeypatch):
     reg = _writegate_registry(tmp_path)
     _patch_registry(monkeypatch, reg)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task = _make_task(conn, kb, workspace_path=str(tmp_path / "wt"))
         (tmp_path / "wt").mkdir()
         claimed, run_id = _claim(conn, task)
 
         workspace = str(tmp_path / "wt")
-        worker_id = kb.prepare_worker_launch(conn, claimed, workspace, board="default")
+        worker_id = kwb.prepare_worker_launch(conn, claimed, workspace, board="default")
         assert worker_id  # a non-empty id was returned
 
         # The run row carries the preassigned id.
@@ -142,7 +145,7 @@ def test_prepare_worker_launch_is_visible_to_fresh_connection(
     """The run-row preassignment is durable before the worker can spawn."""
     reg = _writegate_registry(tmp_path)
     _patch_registry(monkeypatch, reg)
-    conn = kb.connect()
+    conn = kbc.connect()
     fresh = None
     try:
         workspace = str(tmp_path / "wt")
@@ -150,13 +153,13 @@ def test_prepare_worker_launch_is_visible_to_fresh_connection(
         task = _make_task(conn, kb, workspace_path=workspace)
         claimed, run_id = _claim(conn, task)
 
-        worker_id = kb.prepare_worker_launch(
+        worker_id = kwb.prepare_worker_launch(
             conn, claimed, workspace, board="default"
         )
 
         # Do not commit on ``conn`` here. A separate connection models the
         # worker process reading the run row immediately after Popen.
-        fresh = kb.connect()
+        fresh = kbc.connect()
         row = fresh.execute(
             "SELECT worker_session_id FROM task_runs "
             "WHERE id = ? AND task_id = ?",
@@ -182,7 +185,7 @@ def test_dispatch_resolves_one_board_for_binding_spawn_and_trusted_lookup(
 
     kb.create_board("orchestrator")
     kb.set_current_board("orchestrator")
-    conn = kb.connect(board="orchestrator")
+    conn = kbc.connect(board="orchestrator")
     workspace = str(tmp_path / "wt")
     (tmp_path / "wt").mkdir()
     captured = {}
@@ -202,7 +205,7 @@ def test_dispatch_resolves_one_board_for_binding_spawn_and_trusted_lookup(
         task = _make_task(
             conn, kb, assignee="builder-tester", workspace_path=workspace
         )
-        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board=None)
+        result = kbd.dispatch_once(conn, spawn_fn=fake_spawn, board=None)
         assert result.spawned
 
         current = kb.get_task(conn, task.id)
@@ -215,7 +218,7 @@ def test_dispatch_resolves_one_board_for_binding_spawn_and_trusted_lookup(
         binding = reg.get_active_binding(worker_id)
         assert binding is not None
         assert binding.board == captured["board"]
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             task.id,
             run_id,
             profile="builder-tester",
@@ -229,11 +232,11 @@ def test_dispatch_resolves_one_board_for_binding_spawn_and_trusted_lookup(
 def test_prepare_worker_launch_returns_empty_without_run(kanban_home, tmp_path, monkeypatch):
     reg = _writegate_registry(tmp_path)
     _patch_registry(monkeypatch, reg)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task = _make_task(conn, kb)
         # No run row -> nothing to bind to.
-        assert kb.prepare_worker_launch(conn, task, str(tmp_path / "wt")) == ""
+        assert kwb.prepare_worker_launch(conn, task, str(tmp_path / "wt")) == ""
     finally:
         conn.close()
 
@@ -243,7 +246,7 @@ def test_prepare_worker_launch_returns_empty_without_run(kanban_home, tmp_path, 
 def test_trusted_worker_session_id_honors_agreeing_markers(kanban_home, tmp_path, monkeypatch):
     conn, claimed, run_id, workspace, worker_id, _ = _setup(kanban_home, tmp_path, monkeypatch)
     try:
-        honored = kb._trusted_worker_session_id(
+        honored = kwb._trusted_worker_session_id(
             claimed.id, run_id,
             profile="builder-tester", workspace=workspace, board="default",
         )
@@ -255,7 +258,7 @@ def test_trusted_worker_session_id_honors_agreeing_markers(kanban_home, tmp_path
 def test_trusted_worker_session_id_rejects_wrong_task(kanban_home, tmp_path, monkeypatch):
     conn, claimed, run_id, workspace, worker_id, _ = _setup(kanban_home, tmp_path, monkeypatch)
     try:
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             "t_other", run_id,
             profile="builder-tester", workspace=workspace, board="default",
         ) is None
@@ -266,7 +269,7 @@ def test_trusted_worker_session_id_rejects_wrong_task(kanban_home, tmp_path, mon
 def test_trusted_worker_session_id_rejects_wrong_run(kanban_home, tmp_path, monkeypatch):
     conn, claimed, run_id, workspace, worker_id, _ = _setup(kanban_home, tmp_path, monkeypatch)
     try:
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             claimed.id, run_id + 999,
             profile="builder-tester", workspace=workspace, board="default",
         ) is None
@@ -277,7 +280,7 @@ def test_trusted_worker_session_id_rejects_wrong_run(kanban_home, tmp_path, monk
 def test_trusted_worker_session_id_rejects_wrong_profile(kanban_home, tmp_path, monkeypatch):
     conn, claimed, run_id, workspace, worker_id, _ = _setup(kanban_home, tmp_path, monkeypatch)
     try:
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             claimed.id, run_id,
             profile="independent-reviewer", workspace=workspace, board="default",
         ) is None
@@ -288,7 +291,7 @@ def test_trusted_worker_session_id_rejects_wrong_profile(kanban_home, tmp_path, 
 def test_trusted_worker_session_id_rejects_wrong_workspace(kanban_home, tmp_path, monkeypatch):
     conn, claimed, run_id, workspace, worker_id, _ = _setup(kanban_home, tmp_path, monkeypatch)
     try:
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             claimed.id, run_id,
             profile="builder-tester",
             workspace=str(tmp_path / "some_other_wt"),
@@ -301,7 +304,7 @@ def test_trusted_worker_session_id_rejects_wrong_workspace(kanban_home, tmp_path
 def test_trusted_worker_session_id_rejects_wrong_board(kanban_home, tmp_path, monkeypatch):
     conn, claimed, run_id, workspace, worker_id, _ = _setup(kanban_home, tmp_path, monkeypatch)
     try:
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             claimed.id, run_id,
             profile="builder-tester", workspace=workspace, board="archive",
         ) is None
@@ -318,7 +321,7 @@ def test_trusted_worker_session_id_rejects_null_persisted_id(kanban_home, tmp_pa
             (run_id, claimed.id),
         )
         conn.commit()
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             claimed.id, run_id,
             profile="builder-tester", workspace=workspace, board="default",
         ) is None
@@ -330,7 +333,7 @@ def test_trusted_worker_session_id_rejects_abandoned_binding(kanban_home, tmp_pa
     conn, claimed, run_id, workspace, worker_id, reg = _setup(kanban_home, tmp_path, monkeypatch)
     try:
         reg.mark_binding_abandoned(worker_id)
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             claimed.id, run_id,
             profile="builder-tester", workspace=workspace, board="default",
         ) is None
@@ -342,14 +345,14 @@ def test_trusted_worker_session_id_none_without_binding_enabled(kanban_home, tmp
     """When WriteGate binding is disabled, no central binding exists, so the
     trusted lookup fails closed (the worker keeps its own generated id).
     """
-    monkeypatch.setattr(kb, "_writegate_binding_enabled", lambda: False)
-    conn = kb.connect()
+    monkeypatch.setattr(kwb, "_writegate_binding_enabled", lambda: False)
+    conn = kbc.connect()
     try:
         task = _make_task(conn, kb)
         (tmp_path / "wt").mkdir()
         claimed, run_id = _claim(conn, task)
         # No binding created (WriteGate disabled) -> fail closed.
-        assert kb._trusted_worker_session_id(
+        assert kwb._trusted_worker_session_id(
             claimed.id, run_id,
             profile="builder-tester", workspace=str(tmp_path / "wt"), board="default",
         ) is None

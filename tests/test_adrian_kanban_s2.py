@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_authority as ka
+from hermes_cli import kanban_db_dispatch as kbd
 from gateway import trusted_authorizer_evidence as trusted
 from writegate.kanban_approvals import (
     APPROVAL_TYPE,
@@ -592,7 +594,7 @@ def test_h03_scoped_capability_composes_outer_write_and_nested_savepoint(
     provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
     binding = _binding(cap_mod)
     capability = provider._mint_after_admission(binding)
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     provider_mod.register_provider(provider)
 
     try:
@@ -604,13 +606,13 @@ def test_h03_scoped_capability_composes_outer_write_and_nested_savepoint(
 
         assert provider.is_consumed(capability) is True
         assert conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 2
-        with pytest.raises(kb.AuthorityAdmissionRejected):
+        with pytest.raises(ka.AuthorityAdmissionRejected):
             with provider_mod._capability_scope(
                 provider, conn, capability, binding
             ):
                 pass
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -625,16 +627,16 @@ def test_u04_healthy_selected_provider_without_scope_still_fails_closed(
     conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
     _select_plugin_authority(tmp_path, monkeypatch, database_path)
     provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     provider_mod.register_provider(provider)
 
     try:
-        with pytest.raises(kb.AuthorityAdmissionRejected, match="fails closed"):
+        with pytest.raises(ka.AuthorityAdmissionRejected, match="fails closed"):
             with kb.write_txn(conn):
                 conn.execute("INSERT INTO probe VALUES (1)")
         assert conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 0
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -652,7 +654,7 @@ def test_f01_rollback_keeps_capability_spent_and_fresh_admission_can_retry(
     provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
     binding = _binding(cap_mod)
     spent = provider._mint_after_admission(binding)
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     provider_mod.register_provider(provider)
 
     try:
@@ -672,7 +674,7 @@ def test_f01_rollback_keeps_capability_spent_and_fresh_admission_can_retry(
         assert provider.is_consumed(fresh) is True
         assert conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 1
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -693,16 +695,16 @@ def test_u06_scope_rejects_different_connection_without_consuming_capability(
     provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
     binding = _binding(cap_mod)
     capability = provider._mint_after_admission(binding)
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     provider_mod.register_provider(provider)
 
     try:
-        with pytest.raises(kb.AuthorityAdmissionRejected):
+        with pytest.raises(ka.AuthorityAdmissionRejected):
             with provider_mod._capability_scope(provider, other, capability, binding):
                 pass
         assert provider.is_consumed(capability) is False
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
         other.close()
 
@@ -732,7 +734,7 @@ def test_h03_private_adapter_executes_one_typed_native_mutation(
         workspace_id=None,
     )
     capability = provider._mint_after_admission(binding)
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     provider_mod.register_provider(provider)
 
     try:
@@ -753,7 +755,7 @@ def test_h03_private_adapter_executes_one_typed_native_mutation(
         ).fetchone()
         assert tuple(row) == ("task-1", "orchestrator", "raw evidence")
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -770,7 +772,7 @@ def test_u07_private_adapter_rejects_operation_and_target_mismatch_before_scope(
     conn.row_factory = sqlite3.Row
     conn.executescript(kb.SCHEMA_SQL)
     provider = provider_mod.AdrianKanbanAuthorityProvider(str(database_path))
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     provider_mod.register_provider(provider)
 
     try:
@@ -805,7 +807,7 @@ def test_u07_private_adapter_rejects_operation_and_target_mismatch_before_scope(
             )
         assert provider.is_consumed(target_capability) is False
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -829,7 +831,7 @@ def test_private_adapter_failure_after_native_txn_consumes_without_retry(
         workspace_id=None,
     )
     capability = provider._mint_after_admission(binding)
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     provider_mod.register_provider(provider)
 
     try:
@@ -845,7 +847,7 @@ def test_private_adapter_failure_after_native_txn_consumes_without_retry(
         assert provider.is_consumed(capability) is True
         assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 0
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -2186,7 +2188,12 @@ def test_segment_materialization_coordinator_resumes_only_failed_member(
     monkeypatch.setattr(
         workspace_mod._SegmentWorkspaceController,
         "_resolve_integration_head",
-        staticmethod(lambda _reg: first_base),
+        staticmethod(
+            lambda registration: {
+                "repo-1": first_base,
+                "repo-2": second_base,
+            }[registration.repository_identity]
+        ),
     )
 
     def injected_failure(self, member):
@@ -4203,7 +4210,7 @@ def _staged_dispatch_database(provider_modules, tmp_path, monkeypatch):
     provider = provider_modules["provider"].AdrianKanbanAuthorityProvider(
         str(database_path)
     )
-    kb.clear_authority_providers()
+    ka.clear_authority_providers()
     provider_modules["provider"].register_provider(provider)
     return conn, provider
 
@@ -4403,7 +4410,7 @@ def test_h11_segment_dispatch_derives_exact_shared_root_and_workspace_health(
         assert spawned[0][0].workspace_kind == "dir"
         assert Path(spawned[0][0].workspace_path) == segment_root
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4430,7 +4437,7 @@ def test_provider_certifies_only_exact_active_derived_segment_root(
         )
         assert provider.resolve_trusted_workspace_root(str(segment_root)) is None
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4457,7 +4464,7 @@ def test_u09_segment_dispatch_rejects_task_path_not_equal_to_derived_segment_roo
                 workspace_registry=registry,
             ).dispatch(_dispatch_attempt(provider_modules, record))
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4558,7 +4565,7 @@ def test_u09_segment_dispatch_rejects_unready_or_contested_derived_workspace(
         )[0]
         assert spawned == []
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4619,7 +4626,7 @@ def test_h11_dispatcher_launches_only_policy_selected_task_and_preserves_native_
         )
         assert run["worker_session_id"] == spawned[0][3]
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4655,7 +4662,7 @@ def test_u09_dispatcher_rejection_makes_no_native_claim_or_launch_state(
         assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
         assert spawned == []
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4701,7 +4708,7 @@ def test_f04_dispatcher_profile_lane_counts_only_active_lifecycle_contracts(
             "SELECT status FROM tasks WHERE id = 'task:second'"
         ).fetchone()[0] == "ready"
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4777,7 +4784,7 @@ def test_f04_concurrent_same_profile_dispatch_has_one_winner(
         assert [tuple(row) for row in states] == [("ready", 1), ("running", 1)]
         assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 1
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4874,7 +4881,7 @@ def test_f04_different_profiles_are_not_globally_serialized(
             "('task:profile-a', 'task:profile-b')"
         ).fetchone()[0] == 2
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4902,7 +4909,7 @@ def test_u09_dispatcher_rejects_unassigned_task_before_capability_mint(
         ).fetchone()[0] == "ready"
         assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 
@@ -4920,8 +4927,8 @@ def test_u04_raw_native_dispatch_remains_closed_under_plugin_authority(
         attach_contract=False,
     )
     try:
-        with pytest.raises(kb.AuthorityAdmissionRejected, match="fails closed"):
-            kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 9191)
+        with pytest.raises(ka.AuthorityAdmissionRejected, match="fails closed"):
+            kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 9191)
         row = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id = 'legacy-ready'"
         ).fetchone()
@@ -4929,7 +4936,7 @@ def test_u04_raw_native_dispatch_remains_closed_under_plugin_authority(
         assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
         assert provider.is_healthy() is True
     finally:
-        kb.clear_authority_providers()
+        ka.clear_authority_providers()
         conn.close()
 
 

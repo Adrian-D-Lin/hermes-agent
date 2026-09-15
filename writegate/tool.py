@@ -556,7 +556,7 @@ def _present_and_get_decision(
         "decision_at": "",
     }
     try:
-        from tools.approval import request_write_gate_approval
+        from tools.approval_writegate import request_write_gate_approval
         session_id = presentation.get("session_id", "")
         requested_change = (
             presentation.get("stated_outcome")

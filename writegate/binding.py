@@ -358,10 +358,10 @@ def resolve_trusted_worktree(
     # remaining trusted source is the Kanban authority resolver, which may
     # certify that exact host-owned cwd as an active system-derived workspace.
     try:
-        from hermes_cli import kanban_db
+        from hermes_cli import kanban_authority
     except Exception:
         return None
-    resolver = getattr(kanban_db, "resolve_trusted_authority_workspace", None)
+    resolver = getattr(kanban_authority, "resolve_trusted_authority_workspace", None)
     if not callable(resolver):
         return None
     try:

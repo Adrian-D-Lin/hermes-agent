@@ -19,6 +19,7 @@ from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
+from hermes_cli import kanban_authority as ka
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
@@ -100,6 +101,84 @@ def _check_kanban_mode() -> bool:
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock): hidden from task workers."""
     return _visible(to_env_worker=False)
+
+
+def _connect(board: Optional[str] = None):
+    """Legacy triage-tool connection helper retained for compatibility."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    return kb, kbc.connect(board=board)
+
+
+def _configured_orchestrator_profile() -> str:
+    try:
+        value = (
+            ((load_config() or {}).get("kanban") or {})
+            .get("orchestrator_profile", "")
+            .strip()
+        )
+        return value or "default"
+    except Exception:
+        return "default"
+
+
+def _is_dispatcher_orchestrator() -> bool:
+    """Verify the live dispatcher claim, not a caller-supplied profile label."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if (
+        not task_id
+        or not run_id_raw
+        or not claim_lock
+        or _is_delegated_child_context()
+        or not _is_dispatcher_owned_worker()
+    ):
+        return False
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        run_id = int(run_id_raw)
+        kb, conn = _connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
+        try:
+            task = kb.get_task(conn, task_id)
+            run = conn.execute(
+                "SELECT task_id, status, claim_lock, claim_expires "
+                "FROM task_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if (
+            task is None
+            or not task.assignee
+            or task.status != "running"
+            or task.current_run_id != run_id
+            or task.claim_lock != claim_lock
+            or task.claim_expires is None
+            or task.claim_expires < int(time.time())
+            or run is None
+            or run["task_id"] != task_id
+            or run["status"] != "running"
+            or run["claim_lock"] != claim_lock
+            or run["claim_expires"] != task.claim_expires
+        ):
+            return False
+        return normalize_profile_name(task.assignee) == normalize_profile_name(
+            _configured_orchestrator_profile()
+        )
+    except Exception:
+        return False
+
+
+def _require_dispatcher_orchestrator(tool_name: str) -> Optional[str]:
+    if not _is_dispatcher_orchestrator():
+        return tool_error(
+            f"{tool_name} requires the dispatcher-owned configured Kanban "
+            "orchestrator task; use the authenticated dashboard to accept a proposal."
+        )
+    return None
 
 
 # --- Shared helpers: validation failures raise _Reject; _kanban_handler renders it ---
@@ -998,6 +1077,86 @@ def _handle_link(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
         return _ok(parent_id=parent_id, child_id=child_id)
+
+
+def _handle_specify(args: dict, **kw) -> str:
+    """Compatibility handler for the retired native triage acceptance tool."""
+    from hermes_cli import kanban_db as kb
+
+    try:
+        ka.require_native_mutation_authority("kanban_specify")
+    except ka.AuthorityAdmissionRejected as exc:
+        return tool_error(f"kanban_specify: {exc}")
+    guard = _require_dispatcher_orchestrator("kanban_specify")
+    if guard:
+        return guard
+    task_id = args.get("task_id")
+    if not task_id:
+        return tool_error("task_id is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        conn.close()
+        from hermes_cli import kanban_specify
+
+        with kb.scoped_current_board(board or kb.get_current_board()):
+            with ka._scoped_mutation_authority(
+                ka._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+            ):
+                outcome = kanban_specify.specify_task(
+                    str(task_id),
+                    author=os.environ.get("HERMES_PROFILE") or "default",
+                )
+        return _ok(
+            task_id=outcome.task_id,
+            specified=bool(outcome.ok),
+            reason=outcome.reason,
+            new_title=outcome.new_title,
+        )
+    except Exception as exc:
+        logger.exception("kanban_specify failed")
+        return tool_error(f"kanban_specify: {exc}")
+
+
+def _handle_decompose(args: dict, **kw) -> str:
+    """Compatibility handler for the retired native triage fan-out tool."""
+    from hermes_cli import kanban_db as kb
+
+    try:
+        ka.require_native_mutation_authority("kanban_decompose")
+    except ka.AuthorityAdmissionRejected as exc:
+        return tool_error(f"kanban_decompose: {exc}")
+    guard = _require_dispatcher_orchestrator("kanban_decompose")
+    if guard:
+        return guard
+    task_id = args.get("task_id")
+    if not task_id:
+        return tool_error("task_id is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        conn.close()
+        from hermes_cli import kanban_decompose
+
+        with kb.scoped_current_board(board or kb.get_current_board()):
+            with ka._scoped_mutation_authority(
+                ka._MUTATION_AUTHORITY_DISPATCHER_ORCHESTRATOR
+            ):
+                outcome = kanban_decompose.decompose_task(
+                    str(task_id),
+                    author=os.environ.get("HERMES_PROFILE") or "default",
+                )
+        return _ok(
+            task_id=outcome.task_id,
+            decomposed=bool(outcome.ok),
+            reason=outcome.reason,
+            fanout=bool(outcome.fanout),
+            child_ids=outcome.child_ids or [],
+            new_title=outcome.new_title,
+        )
+    except Exception as exc:
+        logger.exception("kanban_decompose failed")
+        return tool_error(f"kanban_decompose: {exc}")
 
 
 # --- Registration (order preserved: it is the order tools appear in the schema) ---

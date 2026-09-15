@@ -95,7 +95,7 @@ def test_handshake_reports_one_release_identity_and_selected_authority(
     dashboard_module, client, monkeypatch
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )
@@ -120,7 +120,7 @@ def test_board_projection_delegates_to_kanban_list(dashboard_module, client, mon
         return _accepted(operation, fields, {"initiatives": [], "tasks": []})
 
     monkeypatch.setattr(
-        dashboard_module.kanban_db, "delegate_authority_operation", delegate
+        dashboard_module.kanban_authority, "delegate_authority_operation", delegate
     )
 
     response = client.get(
@@ -231,7 +231,7 @@ def test_dashboard_read_routes_delegate_exact_projection(
         return _accepted(actual_operation, fields)
 
     monkeypatch.setattr(
-        dashboard_module.kanban_db, "delegate_authority_operation", delegate
+        dashboard_module.kanban_authority, "delegate_authority_operation", delegate
     )
 
     response = client.get(f"/api/plugins/adrian-kanban{path}")
@@ -259,7 +259,7 @@ def test_dashboard_command_forwards_exact_boundary_fields_once(
         return _accepted(operation, fields, {"task_id": "task-5"})
 
     monkeypatch.setattr(
-        dashboard_module.kanban_db, "delegate_authority_operation", delegate
+        dashboard_module.kanban_authority, "delegate_authority_operation", delegate
     )
     monkeypatch.setattr(
         dashboard_module, "mint_tailscale_authorizer_for_peer", mint
@@ -306,7 +306,7 @@ def test_dashboard_command_rejects_non_tailscale_ingress_before_boundary(
         ),
     )
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "delegate_authority_operation",
         lambda *_args, **_kwargs: pytest.fail("untrusted request reached boundary"),
     )
@@ -344,7 +344,7 @@ def test_dashboard_command_rejection_preserves_full_boundary_envelope(
         "not_evaluated_checks": [],
     }
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "delegate_authority_operation",
         lambda *_args, **_kwargs: rejection,
     )
@@ -362,7 +362,7 @@ def test_dashboard_boundary_failure_is_fail_closed_without_native_fallback(
     dashboard_module, client, monkeypatch
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "delegate_authority_operation",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
     )
@@ -395,7 +395,7 @@ def test_dashboard_command_boundary_exception_is_fail_closed(
     dashboard_module, client, monkeypatch
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "delegate_authority_operation",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
     )
@@ -470,7 +470,7 @@ def test_dashboard_event_stream_requires_canonical_websocket_auth(
     dashboard_module, monkeypatch
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )
@@ -491,7 +491,7 @@ def test_dashboard_event_stream_fails_closed_when_authority_resolution_fails(
     dashboard_module, monkeypatch
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: (_ for _ in ()).throw(RuntimeError("configuration unavailable")),
     )
@@ -511,7 +511,7 @@ def test_dashboard_event_stream_rejects_invalid_cursor(
     dashboard_module, monkeypatch, cursor
 ):
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )
@@ -534,12 +534,12 @@ def test_dashboard_event_stream_projects_plugin_commits(
     database_path = tmp_path / "events.db"
     _seed_notification_event(database_path, adrian_plugin_modules["schema"])
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_selected_authority",
         lambda: "adrian-kanban",
     )
     monkeypatch.setattr(
-        dashboard_module.kanban_db,
+        dashboard_module.kanban_authority,
         "resolve_authority_path",
         lambda: str(database_path),
     )

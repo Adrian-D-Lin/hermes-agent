@@ -41,16 +41,23 @@ logger = logging.getLogger("hermes_cli.plugins")
 _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "post_tool_call", "transform_terminal_output", "transform_tool_result", "transform_llm_output",
     "pre_llm_call", "post_llm_call", "pre_api_request", "post_api_request", "api_request_error",
-    "pre_verify", "on_session_start", "on_session_end",
+    "pre_verify", "on_session_start", "on_session_end", "pre_user_turn",
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool).
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+# Policy hooks: timeout / still-running must fail closed.
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call", "pre_user_turn"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
+_PRE_USER_TURN_TIMEOUT_BLOCK_MESSAGE = "pre_user_turn plugin callback timed out or is still running"
+
+
+def _timeout_fail_closed_directive(hook_name: str) -> Dict[str, str]:
+    if hook_name == "pre_user_turn":
+        return {"action": "fail_closed", "response": _PRE_USER_TURN_TIMEOUT_BLOCK_MESSAGE}
+    return {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}
 
 # System-prompt sections are tightly bounded: they become high-trust prompt bytes charged every turn.
 SYSTEM_PROMPT_SECTION_POSITIONS = frozenset({"after_memory"})
@@ -184,7 +191,12 @@ class PluginDispatchMixin:
         if hook_name != "gateway_platform_event":
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         results: List[Any] = []
-        timeout = _resolve_hook_callback_timeout()
+        try:
+            timeout = _resolve_hook_callback_timeout(hook_name)
+        except TypeError:
+            # Compatibility with integrations that replace the legacy
+            # zero-argument resolver.
+            timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._hooks.get(hook_name, []):
@@ -193,7 +205,7 @@ class PluginDispatchMixin:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
                         if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                            results.append(_timeout_fail_closed_directive(hook_name))
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
@@ -202,6 +214,8 @@ class PluginDispatchMixin:
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
+                if fail_closed:
+                    results.append(_timeout_fail_closed_directive(hook_name))
         return results
 
     def _run_hook_callback_bounded(

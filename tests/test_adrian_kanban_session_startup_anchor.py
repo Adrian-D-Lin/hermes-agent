@@ -819,7 +819,7 @@ def test_default_advancement_confirmer_uses_deterministic_once_only_request(
     modules, monkeypatch
 ):
     calls = []
-    import tools.approval as approval
+    import tools.approval_writegate as approval
 
     monkeypatch.setattr(
         approval,

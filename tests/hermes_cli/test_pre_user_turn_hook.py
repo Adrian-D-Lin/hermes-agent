@@ -99,7 +99,7 @@ def test_pre_user_timeout_exceeds_bounded_host_approval(monkeypatch):
         "hermes_cli.config.load_config_readonly",
         lambda: {"plugins": {"hook_callback_timeout": 12}},
     )
-    monkeypatch.setattr("tools.approval._get_approval_timeout", lambda: 90)
+    monkeypatch.setattr("tools.approval_context._get_approval_timeout", lambda: 90)
 
     assert plugins_module._resolve_hook_callback_timeout("post_tool_call") == 12
     assert plugins_module._resolve_hook_callback_timeout("pre_user_turn") == 120
@@ -110,7 +110,7 @@ def test_explicit_zero_disables_pre_user_timeout_wrapper(monkeypatch):
         "hermes_cli.config.load_config_readonly",
         lambda: {"plugins": {"hook_callback_timeout": 0}},
     )
-    monkeypatch.setattr("tools.approval._get_approval_timeout", lambda: 300)
+    monkeypatch.setattr("tools.approval_context._get_approval_timeout", lambda: 300)
 
     assert plugins_module._resolve_hook_callback_timeout("pre_user_turn") == 0
 
@@ -120,7 +120,7 @@ def test_pre_user_timeout_is_clamped_to_existing_maximum(monkeypatch):
         "hermes_cli.config.load_config_readonly",
         lambda: {"plugins": {"hook_callback_timeout": 20}},
     )
-    monkeypatch.setattr("tools.approval._get_approval_timeout", lambda: 700)
+    monkeypatch.setattr("tools.approval_context._get_approval_timeout", lambda: 700)
 
     assert plugins_module._resolve_hook_callback_timeout("pre_user_turn") == 600
 
