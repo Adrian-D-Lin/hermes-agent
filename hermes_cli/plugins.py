@@ -131,6 +131,9 @@ VALID_HOOKS: Set[str] = {
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
     # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.
+    # session_resume_payload: reconnect observer. Kwargs: session_id, method, result. Return
+    # {"id": nonblank string, "text": nonblank string} to add a client-only resume notice.
+    "session_resume_payload",
     "pre_gateway_dispatch",
     # agent_loop_stopped: an agent turn was interrupted mid-run (/stop, or the running-agent
     # fast-path of /new; see gateway/run.py::_interrupt_and_clear_session). Kwargs: session_key,
@@ -202,6 +205,7 @@ VALID_HOOKS: Set[str] = {
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "session_resume_payload",
     "transform_api_error_classification",
     "pre_user_turn",
 }

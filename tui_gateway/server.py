@@ -794,6 +794,41 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     return rid, method, params if params is not None else {}
 
 
+def _add_session_resume_notices(method: str, params: dict, result: dict) -> None:
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        candidates = (result.get("session_key"), result.get("resumed"), params.get("session_id"))
+        session_id = next(
+            (value.strip() for value in candidates if isinstance(value, str) and value.strip()),
+            "",
+        )
+        if not session_id:
+            return
+        raw_notices = invoke_hook(
+            "session_resume_payload", session_id=session_id, method=method, result=result
+        )
+        notices = []
+        seen_ids = set()
+        for item in raw_notices:
+            if not isinstance(item, dict):
+                continue
+            notice_id = item.get("id")
+            text = item.get("text")
+            if not isinstance(notice_id, str) or not isinstance(text, str):
+                continue
+            notice_id = notice_id.strip()
+            text = text.strip()
+            if not notice_id or not text or notice_id in seen_ids:
+                continue
+            seen_ids.add(notice_id)
+            notices.append({"id": notice_id, "text": text})
+    except Exception:
+        return
+    if notices:
+        result["resume_notices"] = notices
+
+
 def handle_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
@@ -818,6 +853,8 @@ def handle_request(req: dict) -> dict | None:
     if contract is not None and isinstance(response, dict) and isinstance(response.get("result"), dict):
         _contracts.check_params_accepted(contract, params)
         _contracts.check_result(contract, response["result"])
+        if method in {"session.resume", "session.activate"}:
+            _add_session_resume_notices(method, params, response["result"])
     return response
 
 
