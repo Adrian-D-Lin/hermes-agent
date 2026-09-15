@@ -228,6 +228,7 @@ class CoordinationMaterializer:
                     required_base_sha=required_base_sha,
                     observed_head=observed_head,
                     member_state="materialized",
+                    registration=registration,
                 )
                 verification = self._executor.verify(ws_member)
                 if (
@@ -260,6 +261,7 @@ class CoordinationMaterializer:
                 required_base_sha=required_base_sha,
                 observed_head=observed_head,
                 member_state="planned",
+                registration=registration,
             )
 
             # Stable operation identity.
@@ -481,6 +483,7 @@ class CoordinationMaterializer:
             required_base_sha=member["required_base_sha"],
             observed_head=member["observed_head"],
             member_state=member["member_state"],
+            registration=registration,
         )
 
     def _owned_transaction(self, callback) -> Any:

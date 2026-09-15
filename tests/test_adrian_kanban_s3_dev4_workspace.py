@@ -39,6 +39,18 @@ def _workspace_case(commands_module, tmp_path, monkeypatch):
     path, provider = _database(tmp_path, monkeypatch, commands_module)
     card_id = _seed_initiative(path, "DEV4")
     repository, base_sha = _repository_with_origin_main(tmp_path / "git")
+    # The shared helper leaves origin as a local path; restore the canonical
+    # GitHub identity declared by the registration below, with a local
+    # insteadOf rewrite so offline fetch/push stays on the bare remote.
+    canonical_origin = "https://github.com/Adrian-D-Lin/GRC.git"
+    bare_remote = (tmp_path / "git" / "origin.git").resolve()
+    _git(
+        repository,
+        "config",
+        f"url.{bare_remote}.insteadOf",
+        canonical_origin,
+    )
+    _git(repository, "remote", "set-url", "origin", canonical_origin)
     controlled_root = (tmp_path / "segment-workspaces").resolve()
     workspace = importlib.import_module(f"{commands_module.__package__}.workspace")
     registry = workspace._TrustedRepositoryRegistry(

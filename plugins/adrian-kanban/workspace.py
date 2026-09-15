@@ -161,6 +161,12 @@ class _WorkspaceMember:
     required_base_sha: Optional[str]
     observed_head: Optional[str]
     member_state: str
+    # Immutable trusted repository registration derived from the member's
+    # _TrustedRepositoryRegistry at every production construction point.
+    # The registry stays authoritative for identity and branch; the
+    # executor consumes it through _GitWorkspaceExecutor.registration_for,
+    # which fails closed on a repository-root disagreement.
+    registration: _RepositoryRegistration
 
     def __post_init__(self):
         _validate_nonblank_str(self.workspace_id, "workspace_id")
@@ -187,6 +193,29 @@ class _WorkspaceMember:
                 raise _WorkspaceRejected(
                     f"{self.member_state} member requires non-null observed_head"
                 )
+        if not isinstance(self.registration, _RepositoryRegistration):
+            raise _WorkspaceRejected(
+                "registration must be _RepositoryRegistration"
+            )
+        if self.registration.repository_identity != self.repository_identity:
+            raise _WorkspaceRejected(
+                "registration repository_identity mismatch: member identity does "
+                "not match its trusted repository registration"
+            )
+        if Path(self.repository_root).resolve() != Path(
+            self.registration.repository_root
+        ).resolve():
+            raise _WorkspaceRejected(
+                "repository root mismatch: member root does not match "
+                "the trusted repository registration"
+            )
+        if Path(self.controlled_worktree_root).resolve() != Path(
+            self.registration.controlled_worktree_root
+        ).resolve():
+            raise _WorkspaceRejected(
+                "controlled worktree root mismatch: member root does not match "
+                "the trusted repository registration"
+            )
 
 
 def _common_segment_root(
@@ -453,6 +482,7 @@ class _SegmentWorkspaceController:
                     required_base_sha=required_base_sha,
                     observed_head=observed_head,
                     member_state=member_state,
+                    registration=reg,
                 )
             )
 
@@ -545,6 +575,8 @@ class _MergeVerification:
     target_path: str
     source_head: str
     merge_head: Optional[str]
+    # Legacy field name: holds the resolved integration-branch head, not
+    # necessarily ``main``.
     remote_main_head: str
     merge_commit: bool
     source_contained: bool
@@ -577,6 +609,62 @@ class _GitWorkspaceExecutor:
         if timeout <= 0:
             raise _WorkspaceRejected("timeout must be positive")
         self._timeout = timeout
+
+    def registration_for(self, member: _WorkspaceMember) -> _RepositoryRegistration:
+        """Return the member's trusted repository registration.
+
+        ``_WorkspaceMember.__post_init__`` already validates the
+        registration type, identity, repository root, and controlled root;
+        this executor stays registry-free and performs only the exact
+        member-type check.
+        """
+        if not isinstance(member, _WorkspaceMember):
+            raise _WorkspaceRejected("invalid member type")
+        return member.registration
+
+    def _cached_integration_head(self, registration: _RepositoryRegistration) -> Optional[str]:
+        """Read the cached remote-tracking ref for the integration branch.
+
+        No network access: a missing cached ref returns ``None``. This is only
+        used by the local materialize boundary; every remote-dependent
+        boundary goes through :meth:`_remote_integration_head`.
+        """
+        try:
+            sha = self._git(
+                registration.repository_root,
+                "rev-parse",
+                registration.remote_tracking_ref,
+            )
+        except _WorkspaceRejected:
+            return None
+        if not sha:
+            return None
+        try:
+            _validate_sha(sha, "cached integration head")
+        except _WorkspaceRejected:
+            return None
+        return sha
+
+    def _remote_integration_head(self, registration: _RepositoryRegistration) -> str:
+        """Resolve the remote integration-branch head through the trusted
+        :class:`RepositoryBindingResolver`, the single authority for
+        remote-dependent integration-head boundaries.
+
+        This is a strict online operation: a connectivity failure or
+        missing head is a hard failure, and a cached offline fallback is
+        never accepted.
+        """
+        try:
+            result = RepositoryBindingResolver(
+                registration
+            ).resolve_integration_head(allow_offline=False)
+        except RepositoryBindingError as exc:
+            raise _WorkspaceRejected(
+                f"failed to resolve remote integration head for "
+                f"{registration.remote_label}: {exc}"
+            ) from exc
+        _validate_sha(result.head_sha, "remote integration head")
+        return result.head_sha
 
     def _run(self, argv: list, cwd: str) -> subprocess.CompletedProcess:
         try:
@@ -727,9 +815,18 @@ class _GitWorkspaceExecutor:
         if required_base_sha is None:
             raise _WorkspaceRejected("required_base_sha is null")
 
-        stdout = self._git(repository_root, "rev-parse", "origin/main", allowed_returncodes=(0,))
-        if stdout != required_base_sha:
-            raise _WorkspaceRejected(f"origin/main does not match required base sha")
+        registration = self.registration_for(member)
+        cached_head = self._cached_integration_head(registration)
+        if cached_head is None:
+            raise _WorkspaceRejected(
+                f"cached {registration.remote_label} tracking ref is missing; "
+                "local materialize requires the pinned base to be cached"
+            )
+        if cached_head != required_base_sha:
+            raise _WorkspaceRejected(
+                f"cached {registration.remote_label} does not match "
+                "required base sha"
+            )
 
         self._git(repository_root, "check-ref-format", "--branch", branch, allowed_returncodes=(0,))
 
@@ -767,20 +864,6 @@ class _GitWorkspaceExecutor:
             raise _WorkspaceRejected(f"materialized target not ready: {verification.failures}")
         return verification
 
-
-    def _remote_main_head(self, repository_root):
-        out = self._git(repository_root, 'ls-remote', '--heads', 'origin', 'refs/heads/main')
-        lines = [l for l in out.splitlines() if l.strip()]
-        if len(lines) != 1:
-            raise _WorkspaceRejected("expected exactly one line from ls-remote")
-        parts = lines[0].split()
-        if len(parts) != 2:
-            raise _WorkspaceRejected("malformed ls-remote output")
-        sha, ref = parts
-        if ref != 'refs/heads/main':
-            raise _WorkspaceRejected("unexpected ref in ls-remote output")
-        _validate_sha(sha, "ls-remote sha")
-        return sha
 
     def _tracked_clean(self, cwd):
         out = self._git(cwd, 'status', '--porcelain', '--untracked-files=no')
@@ -826,8 +909,9 @@ class _GitWorkspaceExecutor:
             raise _WorkspaceRejected("local head unavailable after verification")
         _validate_sha(local_head, "local_head")
 
+        registration = self.registration_for(member)
         try:
-            self._git(member.repository_root, "fetch", "--no-tags", "origin")
+            remote_head = self._remote_integration_head(registration)
         except _WorkspaceRejected:
             return _MemberFreshness(
                 repository_identity=member.repository_identity,
@@ -841,30 +925,7 @@ class _GitWorkspaceExecutor:
                 local_is_ancestor_of_remote=False,
                 remote_is_ancestor_of_local=False,
                 ready=False,
-                failures=("fetch_failed",),
-            )
-
-        try:
-            remote_head = self._git(
-                member.repository_root,
-                "rev-parse",
-                "refs/remotes/origin/main",
-            )
-            _validate_sha(remote_head, "remote_head")
-        except _WorkspaceRejected:
-            return _MemberFreshness(
-                repository_identity=member.repository_identity,
-                target_path=member.target_path,
-                recorded_head=recorded_head,
-                local_head=local_head,
-                remote_head=None,
-                branch_matches=verification.branch_matches,
-                clean_including_untracked=False,
-                recorded_is_ancestor_of_local=False,
-                local_is_ancestor_of_remote=False,
-                remote_is_ancestor_of_local=False,
-                ready=False,
-                failures=("remote_ref_missing",),
+                failures=("remote_head_unavailable",),
             )
 
         try:
@@ -971,12 +1032,9 @@ class _GitWorkspaceExecutor:
         if status_output.strip() != "":
             raise _WorkspaceRejected("worktree not clean including untracked")
 
-        remote_head = self._git(
-            member.repository_root,
-            "rev-parse",
-            "refs/remotes/origin/main",
+        remote_head = self._remote_integration_head(
+            self.registration_for(member)
         )
-        _validate_sha(remote_head, "remote_head")
         if remote_head != expected_remote_head:
             raise _WorkspaceRejected("remote head mismatch")
 
@@ -1011,17 +1069,31 @@ class _GitWorkspaceExecutor:
         _validate_sha(expected_main_sha, "expected_main_sha")
         _validate_sha(expected_source_head, "expected_source_head")
 
-        member_verification = self.verify(member)
+        registration = self.registration_for(member)
+        checkout = Path(registration.repository_root)
+
+        # Resolve the remote integration head first.  A remote that cannot be
+        # resolved is a hard failure: the fail-closed boundary raises instead
+        # of fabricating a nullable merge-evidence state.
+        remote_main = self._remote_integration_head(registration)
+
+        source_verification = self.verify(member)
 
         failures = []
-        if not member_verification.ready or member_verification.observed_head != expected_source_head:
+        if not source_verification.ready or source_verification.observed_head != expected_source_head:
             failures.append('source_mismatch')
 
-        branch = self._git(member.repository_root, 'symbolic-ref', '--quiet', '--short', 'HEAD').strip()
-        if branch != 'main':
+        # The merge boundary operates in the canonical integration checkout
+        # (the repository root pinned to the configured integration branch),
+        # never in the member's segment worktree.
+        try:
+            branch = self._git(str(checkout), "symbolic-ref", "--quiet", "--short", "HEAD").strip()
+        except _WorkspaceRejected:
+            branch = None
+        if branch != registration.integration_branch:
             failures.append('main_branch_mismatch')
 
-        if not self._tracked_clean(member.repository_root):
+        if not self._tracked_clean(str(checkout)):
             failures.append('main_dirty')
 
         if failures:
@@ -1030,7 +1102,7 @@ class _GitWorkspaceExecutor:
                 target_path=member.target_path,
                 source_head=expected_source_head,
                 merge_head=None,
-                remote_main_head=self._remote_main_head(member.repository_root),
+                remote_main_head=remote_main,
                 merge_commit=False,
                 source_contained=False,
                 remote_contained=False,
@@ -1038,9 +1110,9 @@ class _GitWorkspaceExecutor:
                 failures=tuple(failures),
             )
 
-        local_head = self._git(member.repository_root, 'rev-parse', 'HEAD').strip()
-        remote_main = self._remote_main_head(member.repository_root)
-
+        # Pre-merge check: the canonical integration checkout still equals
+        # the expected base, so the requested source merge is absent.
+        local_head = self._git(str(checkout), 'rev-parse', 'HEAD').strip()
         if local_head == expected_main_sha:
             if remote_main == expected_main_sha:
                 return _MergeVerification(
@@ -1070,8 +1142,8 @@ class _GitWorkspaceExecutor:
                 )
 
         try:
-            parent1 = self._git(member.repository_root, 'rev-parse', 'HEAD^1').strip()
-            parent2 = self._git(member.repository_root, 'rev-parse', 'HEAD^2').strip()
+            parent1 = self._git(str(checkout), 'rev-parse', 'HEAD^1').strip()
+            parent2 = self._git(str(checkout), 'rev-parse', 'HEAD^2').strip()
         except _WorkspaceRejected:
             return _MergeVerification(
                 repository_identity=member.repository_identity,
@@ -1085,8 +1157,7 @@ class _GitWorkspaceExecutor:
                 ready=False,
                 failures=('unsafe_main_state',),
             )
-
-        qualifying = (parent1 == expected_main_sha and parent2 == expected_source_head and self._is_ancestor(member.repository_root, expected_source_head, local_head))
+        qualifying = (parent1 == expected_main_sha and parent2 == expected_source_head and self._is_ancestor(str(checkout), expected_source_head, local_head))
 
         if not qualifying:
             return _MergeVerification(
@@ -1153,10 +1224,19 @@ class _GitWorkspaceExecutor:
             return verification
 
         if 'remote_diverged' in verification.failures:
-            raise _WorkspaceRejected("origin/main has diverged")
+            raise _WorkspaceRejected(
+                f"{self.registration_for(member).remote_label} has diverged"
+            )
 
         if 'publish_pending' in verification.failures:
-            proc = self._run(['git', 'push', 'origin', f"{verification.merge_head}:refs/heads/main"], member.repository_root)
+            registration = self.registration_for(member)
+            proc = self._run(
+                [
+                    'git', 'push', 'origin',
+                    f"{verification.merge_head}:{registration.remote_branch_ref}",
+                ],
+                member.repository_root,
+            )
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or '').strip()[:200]
                 raise _WorkspaceRejected(f"push failed: {err}")
@@ -1166,8 +1246,16 @@ class _GitWorkspaceExecutor:
             raise _WorkspaceRejected("final verification failed after push")
 
         if 'merge_absent' in verification.failures:
+            registration = self.registration_for(member)
+            checkout = str(registration.repository_root)
             msg = f"Merge {member.workspace_id}/{member.repository_identity}"
-            proc = self._run(['git', 'merge', '--no-ff', '--no-edit', '-m', msg, expected_source_head], member.repository_root)
+            proc = self._run(
+                [
+                    'git', 'merge', '--no-ff', '--no-edit', '-m', msg,
+                    expected_source_head,
+                ],
+                checkout,
+            )
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or '').strip()[:200]
                 raise _WorkspaceRejected(f"merge failed: {err}")
@@ -1176,7 +1264,14 @@ class _GitWorkspaceExecutor:
             if reverified.ready:
                 return reverified
             if 'publish_pending' in reverified.failures:
-                proc = self._run(['git', 'push', 'origin', f"{reverified.merge_head}:refs/heads/main"], member.repository_root)
+                registration = self.registration_for(member)
+                proc = self._run(
+                    [
+                        'git', 'push', 'origin',
+                        f"{reverified.merge_head}:{registration.remote_branch_ref}",
+                    ],
+                    member.repository_root,
+                )
                 if proc.returncode != 0:
                     err = (proc.stderr or proc.stdout or '').strip()[:200]
                     raise _WorkspaceRejected(f"push failed: {err}")
@@ -2004,6 +2099,7 @@ def _load_segment_workspace(conn, registry, *, initiative_id, segment_id):
                 required_base_sha=base_sha,
                 observed_head=obs_head,
                 member_state=mstate,
+                registration=reg,
             )
         )
     members_tuple = tuple(members)

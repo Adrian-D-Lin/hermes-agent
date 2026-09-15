@@ -1023,6 +1023,7 @@ class InitiativeArchiveController:
                         required_base_sha=row["required_base_sha"],
                         observed_head=row["observed_head"],
                         member_state=row["member_state"],
+                        registration=registration,
                     )
                 )
             except (ValueError, _WorkspaceRejected) as exc:

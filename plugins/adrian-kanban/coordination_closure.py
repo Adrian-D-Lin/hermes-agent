@@ -157,6 +157,7 @@ class CoordinationClosureController:
                     required_base_sha=required_base_sha,
                     observed_head=observed_head,
                     member_state=member_state,
+                    registration=registration,
                 )
             except (ValueError, _WorkspaceRejected) as exc:
                 raise CoordinationClosureError(

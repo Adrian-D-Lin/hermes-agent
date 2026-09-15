@@ -1220,7 +1220,7 @@ def _git(cwd, *args):
     return result.stdout.strip()
 
 
-def _disposable_repository(tmp_path):
+def _disposable_repository(tmp_path, *, github_repository="Adrian-D-Lin/GRC"):
     repository = tmp_path / "repository"
     remote = tmp_path / "origin.git"
     subprocess.run(
@@ -1236,15 +1236,19 @@ def _disposable_repository(tmp_path):
     (repository / "README.md").write_text("base\n", encoding="utf-8")
     _git(repository, "add", "README.md")
     _git(repository, "commit", "-m", "base")
-    _git(repository, "remote", "add", "origin", str(remote))
+    # origin keeps the canonical GitHub URL the registry registration expects;
+    # a repository-local insteadOf rewrite transparently targets the local
+    # bare remote so fetch/push work offline.
+    _git(repository, "remote", "add", "origin", f"https://github.com/{github_repository}.git")
+    _git(repository, "config", f"url.{remote.resolve().as_uri()}/.insteadOf", f"https://github.com/{github_repository}.git")
     _git(repository, "push", "-u", "origin", "main")
-    return repository.resolve(), _git(repository, "rev-parse", "HEAD")
+    return repository.resolve(), _git(repository, "rev-parse", "HEAD"), remote.resolve()
 
 
 def _workspace_plan(provider_modules, tmp_path):
     workspace_mod = provider_modules["workspace"]
     conn = _journal_connection(provider_modules["schema"])
-    repository, base_sha = _disposable_repository(tmp_path)
+    repository, base_sha, _ = _disposable_repository(tmp_path)
     conn.execute(
         "UPDATE segment_workspace_members SET required_base_sha = ? "
         "WHERE workspace_id = ? AND repository_identity = ?",
@@ -1334,8 +1338,8 @@ def test_workspace_plan_exposes_one_segment_root_above_all_repository_members(
 ):
     workspace_mod = provider_modules["workspace"]
     conn = _journal_connection(provider_modules["schema"])
-    first_repo, first_base = _disposable_repository(tmp_path / "first-source")
-    second_repo, second_base = _disposable_repository(tmp_path / "second-source")
+    first_repo, first_base, _ = _disposable_repository(tmp_path / "first-source")
+    second_repo, second_base, _ = _disposable_repository(tmp_path / "second-source")
     shared_root = (tmp_path / "worktrees").resolve()
     conn.execute(
         "UPDATE segment_workspace_members SET required_base_sha = ? "
@@ -1403,6 +1407,13 @@ def test_segment_root_uses_projected_path_when_ids_require_percent_encoding(
         required_base_sha=None,
         observed_head=None,
         member_state="planned",
+        registration=workspace_mod._RepositoryRegistration(
+            repository_identity="repo-1",
+            repository_root=str(tmp_path.resolve()),
+            controlled_worktree_root=shared_root,
+            github_repository="Adrian-D-Lin/GRC",
+            integration_branch="main",
+        ),
     )
 
     root = workspace_mod._common_segment_root(
@@ -1419,7 +1430,7 @@ def test_workspace_plan_rejects_escape_missing_registry_and_binding_mismatch(
 ):
     workspace_mod = provider_modules["workspace"]
     conn = _journal_connection(provider_modules["schema"])
-    repository, _ = _disposable_repository(tmp_path)
+    repository, _, _ = _disposable_repository(tmp_path)
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
@@ -1502,7 +1513,7 @@ def test_workspace_materialization_rejects_stale_origin_main(
     conn, repository, _, plan = _workspace_plan(provider_modules, tmp_path)
     member = replace(plan.members[0], required_base_sha="d" * 40)
 
-    with pytest.raises(workspace_mod._WorkspaceRejected, match="origin/main"):
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="does not match"):
         workspace_mod._GitWorkspaceExecutor().materialize(member)
     assert not Path(member.target_path).exists()
     assert _git(repository, "status", "--porcelain") == ""
@@ -1689,7 +1700,7 @@ def test_workspace_fast_forward_rechecks_exact_heads_and_untracked_cleanliness(
 def test_workspace_plan_rejects_symlink_escape(provider_modules, tmp_path):
     workspace_mod = provider_modules["workspace"]
     conn = _journal_connection(provider_modules["schema"])
-    repository, _ = _disposable_repository(tmp_path)
+    repository, _, _ = _disposable_repository(tmp_path)
     controlled_root = repository / ".segment-worktrees"
     controlled_root.mkdir()
     outside = tmp_path / "outside"
@@ -1728,7 +1739,7 @@ def test_workspace_plan_rejects_inactive_or_memberless_workspace(
 ):
     workspace_mod = provider_modules["workspace"]
     conn = _journal_connection(provider_modules["schema"])
-    repository, _ = _disposable_repository(tmp_path)
+    repository, _, _ = _disposable_repository(tmp_path)
     registry = workspace_mod._TrustedRepositoryRegistry(
         (
             workspace_mod._RepositoryRegistration(
@@ -2156,8 +2167,8 @@ def test_segment_materialization_coordinator_resumes_only_failed_member(
     """A multi-repository retry preserves completed members and resumes the gap."""
     workspace_mod = provider_modules["workspace"]
     conn = _journal_connection(provider_modules["schema"])
-    first_repo, first_base = _disposable_repository(tmp_path / "first")
-    second_repo, second_base = _disposable_repository(tmp_path / "second")
+    first_repo, first_base, _ = _disposable_repository(tmp_path / "first")
+    second_repo, second_base, _ = _disposable_repository(tmp_path / "second")
     shared_root = str((tmp_path / "worktrees").resolve())
     conn.execute(
         "UPDATE segment_workspace_members SET required_base_sha = NULL "
@@ -2290,7 +2301,7 @@ def test_workspace_merge_creates_merge_commit_and_proves_remote_containment(
     assert merged.remote_contained is True
     assert merged.merge_head not in (base_sha, source_head)
     assert len(_git(repository, "rev-list", "--parents", "-n", "1", merged.merge_head).split()) == 3
-    remote = Path(_git(repository, "remote", "get-url", "origin"))
+    remote = tmp_path / "origin.git"
     assert _git(remote, "rev-parse", "refs/heads/main") == merged.remote_main_head
     assert merged.merge_head == merged.remote_main_head
     conn.close()
@@ -2350,7 +2361,7 @@ def test_workspace_merge_rejects_remote_divergence_before_local_effect(
     executor = workspace_mod._GitWorkspaceExecutor()
     executor.materialize(member)
     source_head = _commit_workspace_feature(member)
-    remote = Path(_git(repository, "remote", "get-url", "origin"))
+    remote = tmp_path / "origin.git"
     other = tmp_path / "remote-writer"
     subprocess.run(["git", "clone", str(remote), str(other)], check=True, capture_output=True)
     _git(other, "config", "user.name", "Remote Writer")
@@ -2361,7 +2372,7 @@ def test_workspace_merge_rejects_remote_divergence_before_local_effect(
     _git(other, "commit", "-m", "remote advance")
     _git(other, "push", "origin", "main")
 
-    with pytest.raises(workspace_mod._WorkspaceRejected, match="origin/main"):
+    with pytest.raises(workspace_mod._WorkspaceRejected, match="origin/main has diverged"):
         executor.merge_to_origin_main(
             member,
             expected_main_sha=base_sha,
@@ -2676,8 +2687,8 @@ def test_workspace_retirement_rejects_dirty_retained_evidence_without_db_change(
 def _two_repository_workspace_plan(provider_modules, tmp_path):
     workspace_mod = provider_modules["workspace"]
     conn = _journal_connection(provider_modules["schema"])
-    repository_one, base_one = _disposable_repository(tmp_path / "one")
-    repository_two, base_two = _disposable_repository(tmp_path / "two")
+    repository_one, base_one, _ = _disposable_repository(tmp_path / "one")
+    repository_two, base_two, _ = _disposable_repository(tmp_path / "two")
     shared_root = tmp_path / "worktrees"
     conn.execute(
         "UPDATE segment_workspace_members SET required_base_sha = ? "
