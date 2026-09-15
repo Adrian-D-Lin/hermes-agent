@@ -31,14 +31,14 @@ def _provider_modules() -> dict[str, Any]:
     root = Path(__file__).parents[1] / "plugins" / "adrian-kanban"
     name = "compat_slice_workspace"
     if name in sys.modules:
-        return {m: sys.modules[f"{name}.{m}"] for m in ("workspace", "schema", "journal")}
+        return {m: sys.modules[f"{name}.{m}"] for m in ("workspace", "schema", "journal", "phase_delivery")}
     spec = importlib.util.spec_from_file_location(
         name, root / "__init__.py", submodule_search_locations=[str(root)])
     assert spec is not None and spec.loader is not None
     package = importlib.util.module_from_spec(spec)
     sys.modules[name] = package
     spec.loader.exec_module(package)
-    return {m: importlib.import_module(f"{name}.{m}") for m in ("workspace", "schema", "journal")}
+    return {m: importlib.import_module(f"{name}.{m}") for m in ("workspace", "schema", "journal", "phase_delivery")}
 
 @pytest.fixture(scope="module")
 def provider_modules():
@@ -188,6 +188,9 @@ def test_merge_on_develop_diagnoses_with_remote_label(provider_modules, tmp_path
     merge_head = _git(repository, "rev-parse", INTEGRATION_BRANCH)
     assert _git(repository, "rev-parse", f"refs/remotes/origin/{INTEGRATION_BRANCH}") == merge_head
     assert _git(repository, "rev-parse", "main") != merge_head
+    delivery_mod = provider_modules["phase_delivery"]
+    assert delivery_mod._verify_remote_integration_contains(
+        executor, member, source_head) == merge_head
     other = tmp_path / "remote-writer"
     subprocess.run(["git", "clone", str(remote), str(other)], check=True, capture_output=True)
     _git(other, "config", "user.name", "Remote Writer")

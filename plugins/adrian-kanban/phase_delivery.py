@@ -149,21 +149,29 @@ def _verify_remote_branch_head(
     return remote_head
 
 
-def _verify_remote_main_contains(
+def _verify_remote_integration_contains(
     executor: _GitWorkspaceExecutor,
     member: _WorkspaceMember,
     delivered_head: str,
 ) -> str:
-    _fetch(executor, member)
-    remote_main = executor._git(
-        member.repository_root, "rev-parse", "refs/remotes/origin/main"
-    )
-    if not executor._is_ancestor(member.repository_root, delivered_head, remote_main):
+    registration = executor.registration_for(member)
+    try:
+        integration_head = executor._remote_integration_head(registration)
+    except _WorkspaceRejected as exc:
+        raise PhaseDeliveryError(
+            f"member {member.repository_identity}: failed to resolve remote "
+            f"integration branch head {registration.remote_label!r}: {exc}; "
+            "verify the remote is reachable and retry"
+        ) from exc
+    if not executor._is_ancestor(
+        member.repository_root, delivered_head, integration_head
+    ):
         raise PhaseDeliveryError(
             f"member {member.repository_identity}: retired segment head "
-            f"{delivered_head} is not contained by remote main {remote_main}"
+            f"{delivered_head} is not contained by the configured integration "
+            f"branch head {integration_head} ({registration.remote_label})"
         )
-    return remote_main
+    return integration_head
 
 
 def _commit_is_delivered(
@@ -200,8 +208,8 @@ def verify_transition_delivery(
     The accepted phase result remains the completeness oracle.  This verifier
     adds the repository proof that the resulting files are on the assigned
     branch at an immutable, remotely published commit.  DEV4 consumes the
-    stronger sealed proof that the retired segment head is contained by remote
-    main.
+    stronger sealed proof that the retired segment head is contained by the
+    configured integration branch.
     """
     if type(conn) is not sqlite3.Connection:
         raise PhaseDeliveryError("conn must be a sqlite3.Connection")
@@ -248,8 +256,8 @@ def verify_transition_delivery(
                 raise PhaseDeliveryError(
                     f"member {member.repository_identity}: retired delivery head is invalid"
                 )
-            remote_head = _verify_remote_main_contains(git, member, delivered_head)
-            remote_ref = "refs/remotes/origin/main"
+            remote_head = _verify_remote_integration_contains(git, member, delivered_head)
+            remote_ref = member.registration.remote_tracking_ref
         else:
             if member.member_state != "materialized":
                 raise PhaseDeliveryError(

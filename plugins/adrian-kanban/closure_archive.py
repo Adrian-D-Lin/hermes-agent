@@ -16,6 +16,7 @@ from .coordination_workspace import (
     CoordinationWorkspaceError,
     CoordinationWorkspaceStore,
 )
+from .repository_binding import RepositoryBindingError, RepositoryBindingResolver
 from .workspace import (
     _RepositoryRegistration,
     _TrustedRepositoryRegistry,
@@ -333,17 +334,24 @@ class _GitArchiveExecutor:
             ) from exc
         return target
 
-    def _remote_main(self, repository_root: str) -> str:
-        self._git(repository_root, "fetch", "--no-tags", "origin")
-        return self._require_sha(
-            self._git(repository_root, "rev-parse", "refs/remotes/origin/main"),
-            "origin/main",
-        )
+    def _remote_integration_head(self, registration: _RepositoryRegistration) -> str:
+        """Strict online head of the configured integration branch."""
+        try:
+            result = RepositoryBindingResolver(registration).resolve_integration_head(
+                allow_offline=False
+            )
+        except (RepositoryBindingError, subprocess.TimeoutExpired) as exc:
+            raise ClosureArchiveError(
+                f"failed to resolve the configured integration branch head "
+                f"{registration.remote_label!r}: {exc}; verify the remote is "
+                "reachable and retry"
+            ) from exc
+        return self._require_sha(result.head_sha, registration.remote_label)
 
     def _remote_archive_manifest(
         self, plan: _ArchivePlan, expected: bytes
     ) -> Optional[dict[str, Any]]:
-        remote = self._remote_main(plan.primary_registration.repository_root)
+        remote = self._remote_integration_head(plan.primary_registration)
         spec = f"{remote}:{plan.archive_relative_path}/manifest.json"
         result = self._run(
             ["git", "show", spec],
@@ -374,7 +382,7 @@ class _GitArchiveExecutor:
             "archive_relative_path": plan.archive_relative_path,
         }
 
-    def _ensure_worktree(self, plan: _ArchivePlan, remote_main: str) -> None:
+    def _ensure_worktree(self, plan: _ArchivePlan, integration_head: str) -> None:
         target = Path(plan.archive_worktree_path)
         controlled = Path(plan.primary_registration.controlled_worktree_root)
         try:
@@ -423,7 +431,7 @@ class _GitArchiveExecutor:
                 "-b",
                 plan.archive_branch,
                 str(target),
-                remote_main,
+                integration_head,
             ]
         else:
             raise ClosureArchiveError("failed to inspect archive branch")
@@ -567,8 +575,8 @@ class _GitArchiveExecutor:
             remote_existing["file_count"] = len(entries)
             return remote_existing
 
-        remote_main = self._remote_main(plan.primary_registration.repository_root)
-        self._ensure_worktree(plan, remote_main)
+        integration_head = self._remote_integration_head(plan.primary_registration)
+        self._ensure_worktree(plan, integration_head)
         archive_root = self._contained_path(
             Path(plan.archive_worktree_path), plan.archive_relative_path
         )
@@ -632,7 +640,7 @@ class _GitArchiveExecutor:
             self._git(worktree, "rev-parse", "HEAD"), "archive source head"
         )
 
-        current_remote = self._remote_main(plan.primary_registration.repository_root)
+        current_remote = self._remote_integration_head(plan.primary_registration)
         ancestor = self._run(
             ["git", "merge-base", "--is-ancestor", current_remote, source_head],
             worktree,
@@ -644,9 +652,14 @@ class _GitArchiveExecutor:
                 self._git(worktree, "rev-parse", "HEAD"), "rebased archive head"
             )
         elif ancestor.returncode != 0:
-            raise ClosureArchiveError("failed to compare archive and remote main")
+            raise ClosureArchiveError("failed to compare archive and remote head")
 
-        self._git(worktree, "push", "origin", "HEAD:refs/heads/main")
+        self._git(
+            worktree,
+            "push",
+            "origin",
+            f"HEAD:{plan.primary_registration.remote_branch_ref}",
+        )
         observed = self._remote_archive_manifest(plan, manifest_bytes)
         if observed is None:
             raise ClosureArchiveError("archive manifest absent after push")
@@ -658,7 +671,7 @@ class _GitArchiveExecutor:
     def verify_archive(
         self, plan: _ArchivePlan, evidence: dict[str, Any]
     ) -> dict[str, Any]:
-        remote = self._remote_main(plan.primary_registration.repository_root)
+        remote = self._remote_integration_head(plan.primary_registration)
         result = self._run(
             [
                 "git",
@@ -718,7 +731,7 @@ class _GitArchiveExecutor:
             raise ClosureArchiveError("archive worktree still exists after retirement")
 
     def retire_member(self, member: _WorkspaceMember) -> None:
-        remote = self._remote_main(member.repository_root)
+        remote = self._remote_integration_head(member.registration)
         contained = self._run(
             [
                 "git",
@@ -732,7 +745,8 @@ class _GitArchiveExecutor:
         )
         if contained.returncode != 0:
             raise ClosureArchiveError(
-                f"remote main does not contain {member.repository_identity!r} source"
+                f"configured integration branch {member.registration.remote_label!r} "
+                f"does not contain {member.repository_identity!r} source"
             )
         target = Path(member.target_path)
         if not target.exists():

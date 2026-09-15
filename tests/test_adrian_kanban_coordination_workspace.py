@@ -2278,12 +2278,26 @@ def test_git_archive_executor_exports_changed_files_pushes_and_then_retires(
     (seed / "keep.txt").write_text("base\n", encoding="utf-8")
     _git(seed, "add", ".")
     _git(seed, "commit", "-m", "base")
-    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "checkout", "-b", "develop")
+    _git(seed, "remote", "add", "origin", "git@github.com:Adrian-D-Lin/GRC.git")
+    _git(seed, "config", f"url.{remote.resolve().as_uri()}/.insteadOf", "git@github.com:Adrian-D-Lin/GRC.git")
     _git(seed, "push", "-u", "origin", "main")
-    _git(tmp_path, "clone", "-b", "main", str(remote), str(repository_root))
+    _git(seed, "push", "-u", "origin", "develop")
+    main_head_before = _git(seed, "rev-parse", "refs/remotes/origin/main")
+    _git(tmp_path, "clone", "-b", "develop", str(remote), str(repository_root))
+    _git(
+        repository_root,
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:Adrian-D-Lin/GRC.git",
+    )
     _git(repository_root, "config", "user.name", "Archive Test")
     _git(repository_root, "config", "user.email", "archive@example.invalid")
-    base = _git(repository_root, "rev-parse", "HEAD").strip()
+    _git(repository_root, "config", f"url.{remote.resolve().as_uri()}/.insteadOf", "git@github.com:Adrian-D-Lin/GRC.git")
+    _git(repository_root, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    _git(repository_root, "fetch", "origin")
+    base = _git(repository_root, "rev-parse", "develop").strip()
 
     coordination_path = controlled_root / "init-1" / "coordination" / "repo-1"
     coordination_path.parent.mkdir(parents=True)
@@ -2305,8 +2319,9 @@ def test_git_archive_executor_exports_changed_files_pushes_and_then_retires(
     _git(coordination_path, "add", "-A")
     _git(coordination_path, "commit", "-m", "initiative source")
     source = _git(coordination_path, "rev-parse", "HEAD").strip()
+    _git(repository_root, "checkout", "develop")
     _git(repository_root, "merge", "--no-ff", "--no-edit", source)
-    _git(repository_root, "push", "origin", "main")
+    _git(repository_root, "push", "origin", "develop")
 
     conn = _connect(tmp_path / "archive-real.db", schema)
     store = coordination.CoordinationWorkspaceStore(conn)
@@ -2339,7 +2354,7 @@ def test_git_archive_executor_exports_changed_files_pushes_and_then_retires(
                 str(repository_root.resolve()),
                 str(controlled_root.resolve()),
                 github_repository="Adrian-D-Lin/GRC",
-                integration_branch="main",
+                integration_branch="develop",
             ),
         )
     )
@@ -2366,20 +2381,20 @@ def test_git_archive_executor_exports_changed_files_pushes_and_then_retires(
             _git(
                 repository_root,
                 "show",
-                "origin/main:5-archive/init-1/tracker.json",
+                "origin/develop:5-archive/init-1/tracker.json",
             )
         )
         assert tracker["initiative_id"] == "init-1"
         assert _git(
             repository_root,
             "show",
-            "origin/main:5-archive/init-1/repositories/repo-1/decision.md",
+            "origin/develop:5-archive/init-1/repositories/repo-1/decision.md",
         ).startswith("# Decision")
         manifest = json.loads(
             _git(
                 repository_root,
                 "show",
-                "origin/main:5-archive/init-1/manifest.json",
+                "origin/develop:5-archive/init-1/manifest.json",
             )
         )
         assert manifest["dispositions"] == [
@@ -2394,6 +2409,8 @@ def test_git_archive_executor_exports_changed_files_pushes_and_then_retires(
             item["original_path"] == "decision.md"
             for item in manifest["files"]
         )
+        _git(repository_root, "fetch", "origin", "main")
+        assert _git(repository_root, "rev-parse", "refs/remotes/origin/main") == main_head_before
     finally:
         conn.close()
 
