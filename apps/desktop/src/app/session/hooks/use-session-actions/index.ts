@@ -270,6 +270,50 @@ function reconcileAuthoritativeChatMessages(
   return preserveLocalAssistantErrors(withPendingTurn, previousMessages)
 }
 
+export function appendSessionResumeNotices(
+  messages: ChatMessage[],
+  notices: SessionResumeResult['resume_notices']
+): ChatMessage[] {
+  if (!Array.isArray(notices) || notices.length === 0) {
+    return messages
+  }
+
+  const existingIds = new Set(messages.map(m => m.id))
+  const seenNoticeIds = new Set<string>()
+  const newNotices: ChatMessage[] = []
+
+  for (const notice of notices) {
+    if (!notice || typeof notice !== 'object') {continue}
+
+    const rawId = notice.id
+    const rawText = notice.text
+
+    if (typeof rawId !== 'string' || typeof rawText !== 'string') {continue}
+
+    const trimmedId = rawId.trim()
+    const trimmedText = rawText.trim()
+
+    if (!trimmedId || !trimmedText) {continue}
+
+    const noticeId = `session-resume-notice:${trimmedId}`
+
+    if (existingIds.has(noticeId) || seenNoticeIds.has(noticeId)) {continue}
+
+    seenNoticeIds.add(noticeId)
+    newNotices.push({
+      id: noticeId,
+      role: 'system',
+      parts: [{ type: 'text', text: trimmedText }]
+    })
+  }
+
+  if (newNotices.length === 0) {
+    return messages
+  }
+
+  return [...messages, ...newNotices]
+}
+
 function reconcileAuthoritativeMessages(
   authoritativeMessages: SessionResumeResult['messages'],
   previousMessages: ChatMessage[],
@@ -1426,8 +1470,10 @@ export function useSessionActions({
                   )
                 : null
 
-              const visibleActivatedMessages =
-                pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? activatedMessages
+              const visibleActivatedMessages = appendSessionResumeNotices(
+                pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? activatedMessages,
+                activated.resume_notices
+              )
 
               releaseTranscriptView()
 
@@ -1834,8 +1880,10 @@ export function useSessionActions({
             )
           : null
 
-        const visibleMessagesForView =
-          pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? messagesForView
+        const visibleMessagesForView = appendSessionResumeNotices(
+          pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? messagesForView,
+          resumed.resume_notices
+        )
 
         // The eagerly painted REST page is persisted-display authority: stamp
         // its provenance so the next warm switch to this session paints it

@@ -629,6 +629,11 @@ export interface SessionMessagesResponse {
 }
 
 export interface SessionResumeResult {
+  /**
+   * Client-only reconnect notices. These are ephemeral UI hints (e.g. "Reconnected")
+   * and are NOT transcript rows; they must not be persisted or sent to the backend.
+   */
+  resume_notices?: Array<{ id: string; text: string }>
   /** Present when the backend found a fresh crash-interrupted turn and
    *  scheduled its automatic continuation; the turn arrives as a normal
    *  message.start stream right after this resume. */
