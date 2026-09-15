@@ -186,6 +186,46 @@ the previous gateway bleeding into the next one. Switching changes only the
 foreground view and request route: it does not cancel turns or stop a backend,
 and retained background sockets continue receiving events from running jobs.
 
+### Server-owned Desktop release policy
+
+An authenticated remote gateway can advertise the Adrian Desktop release that
+its clients should run. The server evaluates the build identity embedded in the
+Desktop installer and returns one of `current`, `update_when_idle`, or
+`update_required`. Enforcement blocks session traffic before a WebSocket or
+session request is created; it never starts a local Hermes backend.
+
+Promote a release in two stages. First configure `updates.remote_clients` in
+advisory mode and distribute a Desktop build that contains the release public
+key. Only switch to enforcement after the installer has been staged on the
+gateway and at least one real client has successfully completed the signed
+update path. A client built before this protocol requires one manual bootstrap
+upgrade; subsequent compatible clients can update from the gateway.
+
+Generate the matching server configuration and client trust material after
+building the Windows installer:
+
+```powershell
+npm run client-release:sign --workspace apps/desktop -- `
+  --artifact C:\release\Hermes-0.17.2-win-x64.exe `
+  --private-key C:\secure\adrian-release-ed25519.pem `
+  --key-id adrian-release-1 `
+  --minimum-sequence 2026091501 `
+  --output C:\release\client-release-manifest.json
+```
+
+The output is created exclusively and contains:
+
+- `server_config`: copy beneath `updates.remote_clients`, changing `mode` from
+  `advisory` to `enforce` only at the enforcement stage;
+- `client_trust`: place in `client-release-trust.json` before building the
+  Desktop installer;
+- the absolute artifact path, SHA-256 digest, and Ed25519 signature used for
+  authenticated gateway download and local verification.
+
+The private key is read from the supplied path and is never written into the
+manifest or application tree. Keep the previous installer and server config as
+the rollback pair until the new release completes its production soak.
+
 ### Verification
 
 Run before opening a PR (lint may surface pre-existing warnings but must exit cleanly):
