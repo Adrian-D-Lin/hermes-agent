@@ -38,6 +38,7 @@ const MAX_USER_ATTACHMENT_REF_CHARS = 64 * 1024
  *  Trailing-edge throttle keeps the journal off the hot path — a crash costs at
  *  most this much of the newest tail. */
 const PERSIST_THROTTLE_MS = 400
+const SESSION_RESUME_NOTICE_PREFIX = 'session-resume-notice:'
 
 // A renderer can accumulate one entry per session over its lifetime. Sweep the
 // bounded v2 namespace once on first journal access; never scan it on the
@@ -558,7 +559,10 @@ function isLiveProjectionRow(message: ChatMessage): boolean {
 /** Visible tail of the running turn: the streaming assistant row (plus any
  *  interim rows sealed after it) back to the user prompt that started it. */
 function recoverableTail(messages: ChatMessage[], streamId: null | string): ChatMessage[] {
-  const visible = messages.filter(message => !message.hidden)
+  const visible = messages.filter(
+    message => !message.hidden && !message.id.startsWith(SESSION_RESUME_NOTICE_PREFIX)
+  )
+
   let assistantIndex = -1
 
   if (streamId) {

@@ -152,6 +152,29 @@ describe('persistInFlightTurnState', () => {
     expect(entry?.messages.map(m => m.role)).toEqual(['user', 'assistant'])
   })
 
+  it('does not persist client-only session resume notices in the running-turn journal', () => {
+    persistInFlightTurnState(
+      journalState({
+        messages: [
+          user('u1', 'do the thing'),
+          assistant('assistant-stream-1', 'partial answer', { pending: true }),
+          {
+            id: 'session-resume-notice:adrian-kanban/session-startup',
+            role: 'system',
+            parts: [{ type: 'text', text: 'Choose an initiative' }]
+          }
+        ]
+      })
+    )
+
+    vi.advanceTimersByTime(400)
+
+    expect(readInFlightTurnJournal('stored-1')?.messages.map(message => message.id)).toEqual([
+      'u1',
+      'assistant-stream-1'
+    ])
+  })
+
   it('coalesces rapid updates into one write carrying the latest state', () => {
     persistInFlightTurnState(journalState())
     persistInFlightTurnState(
