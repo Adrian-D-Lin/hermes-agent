@@ -152,6 +152,25 @@ def test_register_wires_one_complete_plugin_authority_runtime(
     assert delegated["operation"] == "not-a-kanban-operation"
     assert delegated["failed_checks"][0]["code"] == "UNRECOGNIZED_OPERATION"
 
+    from writegate import registry as writegate_registry
+    boundary = provider.command_boundary
+    segment_preparer = boundary._segment_manifest_preparer
+    phase_preparer = boundary._phase_result_preparer
+    assert (
+        segment_preparer._registry_getter is writegate_registry.get_registry
+    ), "registration must not replace the WriteGate registry getter"
+    assert (
+        phase_preparer._registry_getter is writegate_registry.get_registry
+    ), "registration must not replace the WriteGate registry getter"
+    assert (
+        segment_preparer._trusted_registry_getter
+        is package._trusted_repository_registry_getter
+    )
+    assert (
+        phase_preparer._trusted_registry_getter
+        is package._trusted_repository_registry_getter
+    )
+
 
 def test_repeated_registration_reuses_one_provider_instance(
     package, monkeypatch, tmp_path

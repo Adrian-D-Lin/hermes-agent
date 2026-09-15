@@ -13,6 +13,7 @@ from .task_inputs import (
     TaskInputPreparationContext,
     prepare_task_input_manifest,
 )
+from .workspace import _TrustedRepositoryRegistry
 
 _GIT_TIMEOUT_SECONDS = 30
 
@@ -81,13 +82,19 @@ class GitSegmentManifestPreparer:
         self,
         trusted_repository_ids_getter: Callable[[], frozenset[str]],
         registry_getter: Callable[[], Any] | None = None,
+        trusted_registry_getter: Callable[[], Any] | None = None,
     ) -> None:
         if not callable(trusted_repository_ids_getter):
             raise TypeError("trusted_repository_ids_getter must be callable")
         if registry_getter is not None and not callable(registry_getter):
             raise TypeError("registry_getter must be callable or None")
+        if trusted_registry_getter is not None and not callable(
+            trusted_registry_getter
+        ):
+            raise TypeError("trusted_registry_getter must be callable or None")
         self._trusted_repository_ids_getter = trusted_repository_ids_getter
         self._registry_getter = registry_getter or _writegate.get_registry
+        self._trusted_registry_getter = trusted_registry_getter
 
     def __call__(
         self,
@@ -123,7 +130,9 @@ class GitSegmentManifestPreparer:
             resolved = Path(worktree_path).expanduser().resolve()
             if not resolved.is_dir():
                 raise ValueError("worktree_path is not a directory")
-            return read_published_blob(str(resolved), commit, path)
+            return read_published_blob(
+                str(resolved), self._trusted_registry(), commit, path
+            )
 
         return prepare_segment_manifest(
             update,
@@ -131,6 +140,23 @@ class GitSegmentManifestPreparer:
             self._trusted_repository_ids_getter(),
             expected_initiative_id=initiative_id,
         )
+
+    def _trusted_registry(self) -> _TrustedRepositoryRegistry:
+        if self._trusted_registry_getter is None:
+            raise ValueError(
+                "no trusted repository registry available; "
+                "re-anchor the session first"
+            )
+        try:
+            trusted_registry = self._trusted_registry_getter()
+        except Exception:
+            trusted_registry = None
+        if not isinstance(trusted_registry, _TrustedRepositoryRegistry):
+            raise ValueError(
+                "no trusted repository registry available; "
+                "re-anchor the session first"
+            )
+        return trusted_registry
 
 
 def _sanitize_path(path: str) -> str:

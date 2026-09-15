@@ -1333,8 +1333,16 @@ def test_d1_command_checks_real_git_and_preserves_approval_on_failure(
     git(root, "add", ".")
     git(root, "commit", "-m", "draft")
     sha = git(root, "rev-parse", "HEAD")
-    git(root, "remote", "add", "origin", str(remote))
+    git(root, "remote", "add", "origin", "https://github.com/Adrian-D-Lin/GRC.git")
+    git(
+        root,
+        "config",
+        f"url.{remote.resolve()}.insteadOf",
+        "https://github.com/Adrian-D-Lin/GRC.git",
+    )
     git(root, "push", "origin", "main")
+    git(root, "branch", "integration")
+    git(root, "push", "origin", "integration")
     payload = _phase_scope_payload()
     payload["update"]["result"]["draft_ref"]["commit"] = sha
     if failure == "unpublished":
@@ -1349,6 +1357,18 @@ def test_d1_command_checks_real_git_and_preserves_approval_on_failure(
     elif failure == "stale_prior":
         payload["update"]["result"]["prior_d2_result_ref"] = "nonexistent"
     module = importlib.import_module(f"{commands_module.__package__}.phase_preparer")
+    workspace = importlib.import_module(f"{commands_module.__package__}.workspace")
+    trusted = workspace._TrustedRepositoryRegistry(
+        (
+            workspace._RepositoryRegistration(
+                repository_identity="repo-1",
+                repository_root=str(root),
+                controlled_worktree_root=str(root / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="integration",
+            ),
+        )
+    )
     calls = []
 
     def binding(session):
@@ -1361,7 +1381,8 @@ def test_d1_command_checks_real_git_and_preserves_approval_on_failure(
         return SimpleNamespace(worktree_path=str(root))
 
     preparer = module.GitPhaseResultPreparer(
-        lambda: SimpleNamespace(get_active_binding=binding)
+        lambda: SimpleNamespace(get_active_binding=binding),
+        trusted_registry_getter=lambda: trusted,
     )
     if failure == "missing_preparer":
         preparer = None

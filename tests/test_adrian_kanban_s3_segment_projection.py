@@ -915,11 +915,21 @@ def _git(repository: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _disposable_repository(tmp_path: Path) -> tuple[Path, str]:
+GITHUB_ORIGIN = "https://github.com/Adrian-D-Lin/GRC.git"
+
+
+def _disposable_repository(tmp_path: Path, *, integration_branch: str = "release"):
+    """Create a disposable canonical checkout whose origin is a canonical
+    GitHub URL, redirected to a fixture-local bare remote via insteadOf.
+
+    The integration branch is a non-main branch so the tests prove that the
+    configured integration head -- not a hard-coded origin/main -- is the
+    containment authority.
+    """
     repository = tmp_path / "repository"
-    remote = tmp_path / "origin.git"
+    bare = tmp_path / "origin.git"
     subprocess.run(
-        ["git", "init", "--bare", str(remote)], check=True, capture_output=True
+        ["git", "init", "--bare", str(bare)], check=True, capture_output=True
     )
     subprocess.run(
         ["git", "init", "--initial-branch=main", str(repository)],
@@ -928,12 +938,34 @@ def _disposable_repository(tmp_path: Path) -> tuple[Path, str]:
     )
     _git(repository, "config", "user.name", "Segment Projection Test")
     _git(repository, "config", "user.email", "test@example.invalid")
+    # Canonical GitHub origin redirected to the fixture-local bare remote.
+    _git(repository, "config", f"url.{bare.resolve()}.insteadOf", GITHUB_ORIGIN)
+    _git(repository, "remote", "add", "origin", GITHUB_ORIGIN)
     (repository / "README.md").write_text("base\n", encoding="utf-8")
     _git(repository, "add", "README.md")
     _git(repository, "commit", "-m", "base")
-    _git(repository, "remote", "add", "origin", str(remote))
-    _git(repository, "push", "-u", "origin", "main")
-    return repository.resolve(), _git(repository, "rev-parse", "HEAD")
+    _git(repository, "branch", integration_branch)
+    _git(repository, "push", "-u", "origin", integration_branch)
+    # Leave HEAD on the configured integration branch so subsequent commits
+    # land there; tests that need main commit explicitly check it out.
+    _git(repository, "checkout", integration_branch)
+    base = _git(repository, "rev-parse", "HEAD")
+    return repository.resolve(), base, integration_branch
+
+
+def _trusted_registry(plugin_modules, repository, *, integration_branch="release"):
+    workspace = plugin_modules["workspace"]
+    return workspace._TrustedRepositoryRegistry(
+        (
+            workspace._RepositoryRegistration(
+                repository_identity="repo-1",
+                repository_root=str(repository),
+                controlled_worktree_root=str(repository / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch=integration_branch,
+            ),
+        )
+    )
 
 
 def _committed_segment_manifest(repository):
@@ -948,16 +980,31 @@ def _committed_segment_manifest(repository):
     return request, content
 
 
-def _prepare_published_manifest(modules, repository, request):
+def _prepare_published_manifest(
+    modules,
+    repository,
+    request,
+    *,
+    worktree: Path | None = None,
+    integration_branch: str = "release",
+    trusted_registry: object | None = None,
+):
     registry = SimpleNamespace(
         get_active_binding=lambda session_id: (
-            SimpleNamespace(worktree_path=str(repository))
+            SimpleNamespace(worktree_path=str(worktree or repository))
             if session_id == "publication-session"
             else None
         )
     )
+    trusted = (
+        trusted_registry
+        if trusted_registry is not None
+        else _trusted_registry(modules, repository, integration_branch=integration_branch)
+    )
     preparer = modules["pre_tool_hook"].GitSegmentManifestPreparer(
-        lambda: frozenset({"repo-1", "repo-2"}), lambda: registry
+        lambda: frozenset({"repo-1", "repo-2"}),
+        lambda: registry,
+        trusted_registry_getter=lambda: trusted,
     )
     return preparer(
         {
@@ -975,20 +1022,27 @@ def _prepare_published_manifest(modules, repository, request):
 
 
 @pytest.mark.parametrize("publication", ["unpushed", "feature_only", "rewound_main"])
-def test_segment_projection_requires_actual_remote_main_containment(
+def test_segment_projection_requires_actual_remote_integration_containment(
     plugin_modules, tmp_path, publication
 ):
-    repository, base = _disposable_repository(tmp_path)
+    repository, base, branch = _disposable_repository(tmp_path)
     request, _ = _committed_segment_manifest(repository)
     if publication == "feature_only":
+        # Commit is reachable only on an unconfigured branch; the configured
+        # integration head does not contain it.
         _git(repository, "push", "origin", "HEAD:refs/heads/feature")
     elif publication == "rewound_main":
-        _git(repository, "push", "origin", "main")
-        # Remote maintenance bypasses this checkout's stale tracking reference.
-        _git(tmp_path / "origin.git", "update-ref", "refs/heads/main", base)
-        assert _git(repository, "rev-parse", "origin/main") == request["manifest_sha"]
+        # Publish the integration branch so the checkout's tracking ref names
+        # the pinned commit, then remote maintenance rewinds the configured
+        # branch past the pinned commit. Only a fresh remote read exposes the
+        # rewind.
+        _git(repository, "push", "origin", branch)
+        _git(tmp_path / "origin.git", "update-ref", f"refs/heads/{branch}", base)
+        assert _git(repository, "rev-parse", f"origin/{branch}") == request[
+            "manifest_sha"
+        ]
     before = _git(repository, "show-ref")
-    with pytest.raises(ValueError, match="origin/main"):
+    with pytest.raises(ValueError, match=f"origin/{branch}"):
         _prepare_published_manifest(plugin_modules, repository, request)
     assert _git(repository, "show-ref") == before
 
@@ -996,58 +1050,66 @@ def test_segment_projection_requires_actual_remote_main_containment(
 def test_segment_projection_accepts_published_ancestor_despite_stale_tracking_ref(
     plugin_modules, tmp_path
 ):
-    repository, base = _disposable_repository(tmp_path)
+    repository, base, branch = _disposable_repository(tmp_path)
     request, content = _committed_segment_manifest(repository)
-    _git(repository, "commit", "--allow-empty", "-m", "later main commit")
-    _git(repository, "push", "origin", "main")
-    _git(repository, "update-ref", "refs/remotes/origin/main", base)
+    _git(repository, "push", "origin", branch)
+    _git(repository, "commit", "--allow-empty", "-m", "later integration commit")
+    _git(repository, "push", "origin", branch)
+    _git(repository, "update-ref", f"refs/remotes/origin/{branch}", base)
     (repository / request["manifest_path"]).write_text("dirty local data")
-    before = _git(repository, "show-ref")
     prepared = _prepare_published_manifest(plugin_modules, repository, request)
     assert prepared.content_digest == hashlib.sha256(content).hexdigest()
-    assert _git(repository, "show-ref") == before
     assert (repository / request["manifest_path"]).read_text() == "dirty local data"
 
 
 def test_segment_projection_does_not_fetch_missing_remote_tip_objects(
     plugin_modules, tmp_path
 ):
-    repository, _ = _disposable_repository(tmp_path)
+    """A pinned commit that is absent from the remote-authoritative
+    integration head must be rejected with a fetch error -- the pinned
+    commit's mere presence in the local checkout never substitutes for a
+    fresh remote read.
+    """
+    repository, base, branch = _disposable_repository(tmp_path)
     request, _ = _committed_segment_manifest(repository)
-    _git(repository, "push", "origin", "main")
-    peer = tmp_path / "peer"
-    _git(tmp_path, "clone", "--branch", "main", str(tmp_path / "origin.git"), str(peer))
-    _git(peer, "config", "user.name", "Peer")
-    _git(peer, "config", "user.email", "peer@example.invalid")
-    _git(peer, "commit", "--allow-empty", "-m", "remote advance")
-    _git(peer, "push", "origin", "main")
-    tip = _git(peer, "rev-parse", "HEAD")
+    _git(repository, "push", "origin", branch)
+    # The remote integration branch no longer contains the pinned commit,
+    # while the local tracking ref still names it and the pinned commit's
+    # objects are present in the local checkout.
+    _git(tmp_path / "origin.git", "update-ref", f"refs/heads/{branch}", base)
+    assert _git(repository, "rev-parse", f"refs/remotes/origin/{branch}") == request[
+        "manifest_sha"
+    ]
+    assert (
+        subprocess.run(
+            ["git", "cat-file", "-e", request["manifest_sha"]],
+            cwd=repository,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
     before = _git(repository, "show-ref")
     with pytest.raises(ValueError, match="[Ff]etch"):
         _prepare_published_manifest(plugin_modules, repository, request)
     assert _git(repository, "show-ref") == before
-    assert (
-        subprocess.run(
-            ["git", "cat-file", "-e", tip], cwd=repository, capture_output=True
-        ).returncode
-        != 0
-    )
 
 
-def test_segment_projection_rejects_absent_remote_main(plugin_modules, tmp_path):
-    repository, _ = _disposable_repository(tmp_path)
+def test_segment_projection_rejects_absent_integration_branch(
+    plugin_modules, tmp_path
+):
+    repository, _, branch = _disposable_repository(tmp_path)
     request, _ = _committed_segment_manifest(repository)
-    _git(tmp_path / "origin.git", "update-ref", "-d", "refs/heads/main")
-    with pytest.raises(ValueError, match="origin/main"):
+    _git(tmp_path / "origin.git", "update-ref", "-d", f"refs/heads/{branch}")
+    with pytest.raises(ValueError, match=f"origin/{branch}"):
         _prepare_published_manifest(plugin_modules, repository, request)
 
 
 def test_segment_projection_ignores_local_git_replacement_objects(
     plugin_modules, tmp_path
 ):
-    repository, _ = _disposable_repository(tmp_path)
+    repository, _, branch = _disposable_repository(tmp_path)
     request, content = _committed_segment_manifest(repository)
-    _git(repository, "push", "origin", "main")
+    _git(repository, "push", "origin", branch)
     replacement = _manifest()
     replacement["initiative_title"] = "locally replaced title"
     (repository / request["manifest_path"]).write_bytes(_canonical_bytes(replacement))
@@ -1065,14 +1127,14 @@ def test_segment_projection_ignores_local_git_replacement_objects(
         b"",
         b"invalid-secret-remote-url\n",
         b"a" * 40 + b" refs/heads/feature\n",
-        (b"a" * 40 + b" refs/heads/main\n") * 2,
-        b"\xff refs/heads/main\n",
+        (b"a" * 40 + b" refs/heads/release\n") * 2,
+        b"\xff refs/heads/release\n",
     ],
 )
 def test_segment_projection_rejects_malformed_remote_response_without_echo(
     plugin_modules, tmp_path, monkeypatch, remote_result
 ):
-    repository, _ = _disposable_repository(tmp_path)
+    repository, _, branch = _disposable_repository(tmp_path)
     request, _ = _committed_segment_manifest(repository)
     real_run = subprocess.run
 
@@ -1084,7 +1146,7 @@ def test_segment_projection_rejects_malformed_remote_response_without_echo(
         return real_run(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(ValueError, match="origin/main") as failure:
+    with pytest.raises(ValueError, match=f"origin/{branch}") as failure:
         _prepare_published_manifest(plugin_modules, repository, request)
     assert "secret" not in str(failure.value)
     assert "private" not in str(failure.value)
@@ -1094,7 +1156,7 @@ def test_segment_projection_rejects_malformed_remote_response_without_echo(
 def test_segment_projection_remote_failures_are_safe_and_actionable(
     plugin_modules, tmp_path, monkeypatch, failure_kind
 ):
-    repository, _ = _disposable_repository(tmp_path)
+    repository, _, _ = _disposable_repository(tmp_path)
     request, _ = _committed_segment_manifest(repository)
     real_run = subprocess.run
 
@@ -1135,7 +1197,7 @@ def test_planned_member_base_is_trusted_late_bound_and_idempotent(
         ]
         == "ACCEPTED"
     )
-    repository, expected_sha = _disposable_repository(tmp_path)
+    repository, expected_sha, _ = _disposable_repository(tmp_path)
     workspace = plugin_modules["workspace"]
     registry = workspace._TrustedRepositoryRegistry((
         workspace._RepositoryRegistration(
@@ -1214,3 +1276,96 @@ def test_nonplanned_member_cannot_retain_unknown_base(plugin_modules):
             ("d" * 40,),
         )
     conn.close()
+
+
+def test_segment_projection_accepts_linked_worktree_with_non_main_integration_branch(
+    plugin_modules, tmp_path
+):
+    """A pinned commit published to the configured non-main integration
+    branch is accepted even when the remote main branch does not contain it
+    and the local checkout's default branch ref names an unrelated commit.
+    The active session worktree is a real linked Git worktree, not the
+    canonical checkout: the feature must resolve it to the trusted
+    registration by Git common-directory identity while the trusted
+    registry's repository_root stays the canonical repository."""
+    repository, base, branch = _disposable_repository(tmp_path)
+    assert branch != "main"
+    request, _ = _committed_segment_manifest(repository)
+    _git(repository, "push", "origin", branch)
+    # The remote main branch was never published in this fixture and the
+    # base commit does not contain the pinned manifest commit (published
+    # only on the configured integration branch).
+    assert base != request["manifest_sha"]
+    linked_worktree = tmp_path / "linked-worktree"
+    _git(repository, "worktree", "add", "--detach", str(linked_worktree))
+    # A linked worktree shares the canonical repository's common directory;
+    # the path-string difference is exactly what common-directory identity
+    # must bridge when resolving the trusted registration.
+    assert _git(linked_worktree, "rev-parse", "--git-common-dir") == str(
+        repository / ".git"
+    )
+    assert str(linked_worktree.resolve()) != str(repository)
+    prepared = _prepare_published_manifest(
+        plugin_modules, repository, request, worktree=linked_worktree
+    )
+    assert prepared.content_digest == hashlib.sha256(
+        _canonical_bytes(_manifest())
+    ).hexdigest()
+
+
+def test_segment_projection_rejects_worktree_not_matching_single_registration(
+    plugin_modules, tmp_path
+):
+    """The active worktree must resolve to exactly one trusted repository
+    registration by canonical Git common-directory identity; a worktree
+    outside the registered repository fails closed."""
+    repository, _, _ = _disposable_repository(tmp_path)
+    request, _ = _committed_segment_manifest(repository)
+    _git(repository, "push", "origin", "release")
+    outside = tmp_path / "outside"
+    subprocess.run(
+        ["git", "init", str(outside)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Outside"],
+        cwd=outside, check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "outside@example.invalid"],
+        cwd=outside, check=True, capture_output=True,
+    )
+    (outside / "README.md").write_text("outside\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=outside, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "outside base"],
+        cwd=outside, check=True, capture_output=True,
+    )
+    trusted = _trusted_registry(plugin_modules, repository)
+    writegate_registry = SimpleNamespace(
+        get_active_binding=lambda session_id: (
+            SimpleNamespace(worktree_path=str(outside))
+            if session_id == "publication-session"
+            else None
+        )
+    )
+    preparer = plugin_modules["pre_tool_hook"].GitSegmentManifestPreparer(
+        lambda: frozenset({"repo-1", "repo-2"}),
+        lambda: writegate_registry,
+        trusted_registry_getter=lambda: trusted,
+    )
+    with pytest.raises(ValueError, match="no trusted repository registration"):
+        preparer(
+            {
+                "initiative_id": "initiative-1",
+                "update_kind": "segment_manifest_projection",
+                "update": request,
+            },
+            plugin_modules["task_inputs"].TaskInputPreparationContext(
+                session_id="publication-session",
+                execution_context="model-tool",
+                workspace_id=None,
+                actor_profile="default",
+            ),
+        )

@@ -12,14 +12,24 @@ from .phase_d4_evidence import prepare_d4_result
 from .phase_d4_execution import prepare_d4_execution
 from .task_inputs import TaskInputPreparationContext
 from .published_git import read_published_blob, _git
+from .workspace import _TrustedRepositoryRegistry
 from writegate import registry as _writegate
 
 
 class GitPhaseResultPreparer:
-    def __init__(self, registry_getter: Optional[Callable[[], Any]] = None) -> None:
+    def __init__(
+        self,
+        registry_getter: Optional[Callable[[], Any]] = None,
+        trusted_registry_getter: Optional[Callable[[], Any]] = None,
+    ) -> None:
         if registry_getter is not None and not callable(registry_getter):
             raise TypeError("registry_getter must be callable or None")
+        if trusted_registry_getter is not None and not callable(
+            trusted_registry_getter
+        ):
+            raise TypeError("trusted_registry_getter must be callable or None")
         self._registry_getter = registry_getter or _writegate.get_registry
+        self._trusted_registry_getter = trusted_registry_getter
 
     def __call__(
         self, payload: Any, preparation_context: TaskInputPreparationContext
@@ -60,11 +70,13 @@ class GitPhaseResultPreparer:
             return prepare_d1_result(
                 initiative_id,
                 update,
-                lambda commit, path: read_published_blob(root, commit, path),
+                lambda commit, path: read_published_blob(
+                    root, self._trusted_registry(), commit, path
+                ),
             )
 
         def published_reader(commit, path):
-            return read_published_blob(root, commit, path)
+            return read_published_blob(root, self._trusted_registry(), commit, path)
 
         def immutable_reader(commit, path):
             type_result = _git(root, "cat-file", "-t", commit)
@@ -102,6 +114,23 @@ class GitPhaseResultPreparer:
         return prepare_d2_result(
             initiative_id, update, published_reader, immutable_reader
         )
+
+    def _trusted_registry(self) -> _TrustedRepositoryRegistry:
+        if self._trusted_registry_getter is None:
+            raise ValueError(
+                "no trusted repository registry available; "
+                "re-anchor the session first"
+            )
+        try:
+            trusted_registry = self._trusted_registry_getter()
+        except Exception:
+            trusted_registry = None
+        if not isinstance(trusted_registry, _TrustedRepositoryRegistry):
+            raise ValueError(
+                "no trusted repository registry available; "
+                "re-anchor the session first"
+            )
+        return trusted_registry
 
     def _resolve_root(self, preparation_context: TaskInputPreparationContext) -> str:
         try:

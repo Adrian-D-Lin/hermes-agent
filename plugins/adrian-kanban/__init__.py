@@ -148,7 +148,7 @@ def register(ctx) -> None:
     preparer = GitTaskInputPreparer()
     segment_preparer = GitSegmentManifestPreparer(
         _trusted_repository_ids_getter,
-        registry_getter=_trusted_repository_registry_getter,
+        trusted_registry_getter=_trusted_repository_registry_getter,
     )
     handlers = {
         "kanban_show": _handle_show,
@@ -188,7 +188,7 @@ def register(ctx) -> None:
             task_input_preparer=preparer,
             segment_manifest_preparer=segment_preparer,
             phase_result_preparer=GitPhaseResultPreparer(
-                registry_getter=_trusted_repository_registry_getter
+                trusted_registry_getter=_trusted_repository_registry_getter,
             ),
             workspace_registry=_trusted_repository_registry_getter,
         )

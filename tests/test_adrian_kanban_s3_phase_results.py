@@ -254,13 +254,34 @@ def phase_repository(tmp_path):
     _git(root, "add", ".")
     _git(root, "commit", "-m", "draft")
     draft_commit = _git(root, "rev-parse", "HEAD")
-    _git(root, "remote", "add", "origin", str(remote))
+    _git(root, "remote", "add", "origin", GITHUB_ORIGIN)
+    _git(root, "config", f"url.{remote.resolve()}.insteadOf", GITHUB_ORIGIN)
     _git(root, "push", "origin", "main")
+    _git(root, "branch", "integration")
+    _git(root, "push", "origin", "integration")
     _git(root, "checkout", "-b", "review")
     (root / "2-design/review.md").write_bytes(b"review")
     _git(root, "add", ".")
     _git(root, "commit", "-m", "review")
     return root, draft_commit, _git(root, "rev-parse", "HEAD")
+
+
+GITHUB_ORIGIN = "https://github.com/Adrian-D-Lin/GRC.git"
+
+
+def _trusted_phase_registry(d1, root):
+    workspace = importlib.import_module(f"{d1.__package__}.workspace")
+    return workspace._TrustedRepositoryRegistry(
+        (
+            workspace._RepositoryRegistration(
+                repository_identity="repo-1",
+                repository_root=str(root),
+                controlled_worktree_root=str(root / ".segment-worktrees"),
+                github_repository="Adrian-D-Lin/GRC",
+                integration_branch="integration",
+            ),
+        )
+    )
 
 
 def _phase_preparer(d1, root, binding=None):
@@ -269,8 +290,10 @@ def _phase_preparer(d1, root, binding=None):
     registry = SimpleNamespace(
         get_active_binding=lambda _: binding or SimpleNamespace(worktree_path=str(root))
     )
+    trusted = _trusted_phase_registry(d1, root)
     return module.GitPhaseResultPreparer(
-        lambda: registry
+        lambda: registry,
+        trusted_registry_getter=lambda: trusted,
     ), inputs.TaskInputPreparationContext(
         session_id="session-1", execution_context="test"
     )
@@ -362,7 +385,7 @@ def test_phase_preparer_rejects_unpublished_draft(d1, phase_repository):
     update = _update()
     update["result"]["draft_ref"]["commit"] = review_commit
     preparer, context = _phase_preparer(d1, root)
-    with pytest.raises(ValueError, match="not an ancestor"):
+    with pytest.raises(ValueError, match="origin/integration"):
         preparer(
             {
                 "initiative_id": "initiative-1",
@@ -380,7 +403,8 @@ def test_phase_preparer_missing_binding_cannot_use_payload_cwd(d1, phase_reposit
     update = _update()
     update["result"]["draft_ref"]["commit"] = draft_commit
     preparer = module.GitPhaseResultPreparer(
-        lambda: SimpleNamespace(get_active_binding=lambda _: None)
+        lambda: SimpleNamespace(get_active_binding=lambda _: None),
+        trusted_registry_getter=lambda: _trusted_phase_registry(d1, root),
     )
     with pytest.raises(ValueError, match="no active binding"):
         preparer(
@@ -414,7 +438,7 @@ def test_d4_preparer_requires_the_exact_published_baseline(d1, phase_repository,
         assert type(proof) is module.PreparedD4Result
         assert dataclasses.asdict(proof.baseline) == reference
     else:
-        with pytest.raises(ValueError, match="not an ancestor"):
+        with pytest.raises(ValueError, match="origin/integration"):
             preparer(payload, context)
 
 
