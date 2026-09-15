@@ -826,6 +826,7 @@ CREATE TABLE IF NOT EXISTS adrian_kanban_session_startup_records (
         )
     ),
     creation_draft_json TEXT,
+    onboarding_json TEXT,
     revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -881,4 +882,9 @@ def create_schema(conn: object) -> None:
         conn.execute(
             "ALTER TABLE adrian_kanban_session_startup_records "
             "ADD COLUMN creation_draft_json TEXT"
+        )
+    if "onboarding_json" not in startup_cols:
+        conn.execute(
+            "ALTER TABLE adrian_kanban_session_startup_records "
+            "ADD COLUMN onboarding_json TEXT"
         )

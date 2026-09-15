@@ -71,6 +71,14 @@ SESSION_STARTUP_ACTIVE_STATES = SESSION_STARTUP_STATES[:5]
 
 RELEASE_STATUSES = ("pending", "issued", "observed")
 
+ONBOARDING_STAGES = (
+    "choose_mode",
+    "create_details",
+    "bind_details",
+    "confirm",
+    "blocked_recoverable",
+)
+
 _RELEASE_TRANSITIONS = {
     "pending": {"issued"},
     "issued": {"observed"},
@@ -214,6 +222,47 @@ def validate_session_startup_creation_draft(
 
     return stage, json.dumps(
         creation_draft,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def validate_session_startup_onboarding(
+    onboarding: object,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Validate a project-onboarding substate and return canonical JSON."""
+    if onboarding is None:
+        return None, None
+    if not isinstance(onboarding, dict) or set(onboarding) != {
+        "stage",
+        "draft",
+        "journal",
+    }:
+        raise SessionStartupStateError(
+            "onboarding must have exactly stage, draft, and journal"
+        )
+
+    stage = str(onboarding["stage"]).strip()
+    if stage not in ONBOARDING_STAGES:
+        raise SessionStartupStateError(f"invalid onboarding stage {stage!r}")
+    for field in ("draft", "journal"):
+        if not isinstance(onboarding[field], dict):
+            raise SessionStartupStateError(f"onboarding {field} must be a dict")
+    if stage == "blocked_recoverable":
+        recovery_error = onboarding["journal"].get("recovery_error")
+        if not isinstance(recovery_error, str) or not recovery_error.strip():
+            raise SessionStartupStateError(
+                "blocked_recoverable requires a nonblank recovery_error in journal"
+            )
+
+    canonical = {
+        "stage": stage,
+        "draft": onboarding["draft"],
+        "journal": onboarding["journal"],
+    }
+    return canonical, json.dumps(
+        canonical,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

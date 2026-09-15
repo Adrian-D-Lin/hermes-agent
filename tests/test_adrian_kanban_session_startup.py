@@ -589,9 +589,179 @@ def test_session_startup_schema_is_additive_and_idempotent(
             "updated_at",
             "creation_stage",
             "creation_draft_json",
+            "onboarding_json",
         } <= columns
     finally:
         conn.close()
+
+
+def test_session_startup_onboarding_persists_updates_and_clears(
+    adrian_plugin_modules, kanban_home
+):
+    Store = adrian_plugin_modules["store"].AdmittedStore
+    with Store(database_path=_db_path(kanban_home, "onboarding-happy")) as store:
+        store.create_or_read_session_startup(
+            session_id="session-1",
+            opening_prompt="held prompt",
+            protocol_version="v0.29",
+        )
+        chosen = store.set_session_startup_onboarding(
+            session_id="session-1",
+            expected_revision=0,
+            onboarding={
+                "stage": "  choose_mode  ",
+                "draft": {},
+                "journal": {"events": []},
+            },
+        )
+        confirmed = store.set_session_startup_onboarding(
+            session_id="session-1",
+            expected_revision=chosen["revision"],
+            onboarding={
+                "stage": "confirm",
+                "draft": {"mode": "create"},
+                "journal": {"events": ["mode-chosen"]},
+            },
+        )
+        cleared = store.set_session_startup_onboarding(
+            session_id="session-1",
+            expected_revision=confirmed["revision"],
+            onboarding=None,
+        )
+
+    assert json.loads(chosen["onboarding_json"])["stage"] == "choose_mode"
+    assert json.loads(confirmed["onboarding_json"])["draft"] == {"mode": "create"}
+    assert [chosen["revision"], confirmed["revision"], cleared["revision"]] == [
+        1,
+        2,
+        3,
+    ]
+    assert cleared["onboarding_json"] is None
+    assert cleared["held_opening_prompt"] == "held prompt"
+
+
+@pytest.mark.parametrize(
+    "onboarding",
+    [
+        {"stage": "choose_mode", "draft": {}},
+        {"stage": "choose_mode", "draft": {}, "journal": {}, "extra": True},
+        {"stage": "unknown", "draft": {}, "journal": {}},
+        {"stage": "choose_mode", "draft": "invalid", "journal": {}},
+        {"stage": "choose_mode", "draft": {}, "journal": "invalid"},
+        {"stage": "blocked_recoverable", "draft": {}, "journal": {}},
+        {
+            "stage": "blocked_recoverable",
+            "draft": {},
+            "journal": {"recovery_error": "   "},
+        },
+    ],
+)
+def test_session_startup_onboarding_rejects_invalid_shape_without_mutation(
+    adrian_plugin_modules, kanban_home, onboarding
+):
+    Store = adrian_plugin_modules["store"].AdmittedStore
+    StateError = adrian_plugin_modules["validation"].SessionStartupStateError
+    with Store(database_path=_db_path(kanban_home, "onboarding-invalid")) as store:
+        store.create_or_read_session_startup(
+            session_id="session-1",
+            opening_prompt="held prompt",
+            protocol_version="v0.29",
+        )
+        with pytest.raises(StateError):
+            store.set_session_startup_onboarding(
+                session_id="session-1",
+                expected_revision=0,
+                onboarding=onboarding,
+            )
+        unchanged = store.read_session_startup(session_id="session-1")
+
+    assert unchanged["revision"] == 0
+    assert unchanged["onboarding_json"] is None
+
+
+def test_session_startup_onboarding_enforces_revision_state_and_transition_guard(
+    adrian_plugin_modules, kanban_home
+):
+    Store = adrian_plugin_modules["store"].AdmittedStore
+    validation = adrian_plugin_modules["validation"]
+    with Store(database_path=_db_path(kanban_home, "onboarding-guards")) as store:
+        store.create_or_read_session_startup(
+            session_id="session-1",
+            opening_prompt="held prompt",
+            protocol_version="v0.29",
+        )
+        chosen = store.set_session_startup_onboarding(
+            session_id="session-1",
+            expected_revision=0,
+            onboarding={"stage": "choose_mode", "draft": {}, "journal": {}},
+        )
+        with pytest.raises(validation.SessionStartupRevisionError):
+            store.set_session_startup_onboarding(
+                session_id="session-1",
+                expected_revision=0,
+                onboarding=None,
+            )
+        with pytest.raises(validation.SessionStartupStateError):
+            store.transition_session_startup(
+                session_id="session-1",
+                expected_revision=chosen["revision"],
+                to_state="awaiting_initiative_selection",
+                selected_project_id="project-1",
+            )
+        unchanged = store.read_session_startup(session_id="session-1")
+        cleared = store.set_session_startup_onboarding(
+            session_id="session-1",
+            expected_revision=chosen["revision"],
+            onboarding=None,
+        )
+        selected = store.transition_session_startup(
+            session_id="session-1",
+            expected_revision=cleared["revision"],
+            to_state="awaiting_initiative_selection",
+            selected_project_id="project-1",
+        )
+        with pytest.raises(validation.SessionStartupStateError):
+            store.set_session_startup_onboarding(
+                session_id="session-1",
+                expected_revision=selected["revision"],
+                onboarding={"stage": "choose_mode", "draft": {}, "journal": {}},
+            )
+
+    assert unchanged["revision"] == chosen["revision"]
+    assert unchanged["state"] == "awaiting_project_selection"
+    assert unchanged["onboarding_json"] == chosen["onboarding_json"]
+
+
+def test_session_startup_onboarding_migrates_existing_record(
+    adrian_plugin_modules, kanban_home
+):
+    schema = adrian_plugin_modules["schema"]
+    database = _db_path(kanban_home, "onboarding-migration")
+    database.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(database))
+    try:
+        conn.execute(
+            "CREATE TABLE adrian_kanban_session_startup_records ("
+            "session_id TEXT PRIMARY KEY, protocol_version TEXT NOT NULL, "
+            "state TEXT NOT NULL, held_opening_prompt TEXT NOT NULL, "
+            "revision INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, "
+            "updated_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO adrian_kanban_session_startup_records VALUES "
+            "('session-old', 'v0.28', 'anchored', 'old prompt', 4, 1, 2)"
+        )
+        conn.commit()
+        schema.create_schema(conn)
+        migrated = conn.execute(
+            "SELECT onboarding_json, revision, held_opening_prompt "
+            "FROM adrian_kanban_session_startup_records "
+            "WHERE session_id = 'session-old'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert migrated == (None, 4, "old prompt")
 
 
 def test_session_startup_creation_draft_is_durable_and_compare_and_set(

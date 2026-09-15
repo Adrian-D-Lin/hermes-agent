@@ -37,8 +37,9 @@ from .validation import (
     validate_initiative_identity,
     validate_protocol_version,
     validate_session_id,
-    validate_session_startup_fields,
     validate_session_startup_creation_draft,
+    validate_session_startup_fields,
+    validate_session_startup_onboarding,
     validate_session_startup_state,
     validate_release_status,
     validate_release_transition,
@@ -502,6 +503,75 @@ class AdmittedStore:
             raise
         return dict(row)
 
+    def set_session_startup_onboarding(
+        self,
+        *,
+        session_id: object,
+        expected_revision: int,
+        onboarding: object,
+    ) -> dict:
+        """Compare-and-set the durable project-onboarding substate."""
+        canonical_session = validate_session_id(session_id)
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise SessionStartupRevisionError(
+                "expected_revision must be a non-negative integer"
+            )
+        _onboarding, canonical_json = validate_session_startup_onboarding(
+            onboarding
+        )
+        now = int(time.time())
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            current = self._conn.execute(
+                "SELECT * FROM adrian_kanban_session_startup_records "
+                "WHERE session_id = ?",
+                (canonical_session,),
+            ).fetchone()
+            if current is None:
+                raise SessionStartupRecordMissingError(
+                    f"no session startup record for session_id {canonical_session!r}"
+                )
+            if current["revision"] != expected_revision:
+                raise SessionStartupRevisionError(
+                    f"stale revision: expected {expected_revision}, "
+                    f"current {current['revision']}"
+                )
+            if current["state"] != "awaiting_project_selection":
+                raise SessionStartupStateError(
+                    "onboarding update is permitted only while awaiting "
+                    "project selection"
+                )
+            updated = self._conn.execute(
+                "UPDATE adrian_kanban_session_startup_records SET "
+                "onboarding_json = ?, revision = ?, updated_at = ? "
+                "WHERE session_id = ? AND revision = ?",
+                (
+                    canonical_json,
+                    expected_revision + 1,
+                    now,
+                    canonical_session,
+                    expected_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise SessionStartupRevisionError(
+                    "concurrent modification detected during onboarding update"
+                )
+            row = self._conn.execute(
+                "SELECT * FROM adrian_kanban_session_startup_records "
+                "WHERE session_id = ?",
+                (canonical_session,),
+            ).fetchone()
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return dict(row)
+
     def transition_session_startup(
         self,
         *,
@@ -544,6 +614,14 @@ class AdmittedStore:
                 raise SessionStartupRevisionError(
                     f"stale revision: expected {expected_revision}, "
                     f"current {current['revision']}"
+                )
+            if (
+                current["state"] == "awaiting_project_selection"
+                and current["onboarding_json"] is not None
+            ):
+                raise SessionStartupStateError(
+                    "cannot leave awaiting_project_selection while onboarding "
+                    "is active; clear or complete onboarding first"
                 )
             validate_session_startup_transition(current["state"], target_state)
 
