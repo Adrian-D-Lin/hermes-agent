@@ -305,6 +305,44 @@ class SessionMessagesMixin:
         # holding the lock for seconds (VACUUM, checkpoint) can't kill it.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def append_display_only_message(
+        self, session_id: str, role: str, content: str, *,
+        display_kind: str, display_metadata: Optional[Dict[str, Any]] = None,
+        timestamp: Any = None,
+    ) -> int:
+        """Append durable UI history that must never enter model context.
+
+        Display-only rows use the existing archived-row representation
+        (``active=0, compacted=1``): transcript/display reads retain them while
+        active model-history reads exclude them.  ``observed=1`` also keeps UI
+        scaffolding out of memory-provider ingestion.
+        """
+        if role not in {"user", "assistant", "system"}:
+            raise ValueError("display-only message role must be user, assistant, or system")
+        if not display_kind:
+            raise ValueError("display-only message requires display_kind")
+        msg = {
+            "content": content,
+            "display_kind": display_kind,
+            "display_metadata": display_metadata,
+            "observed": True,
+        }
+        message_timestamp = _coerce_timestamp(timestamp, time.time())
+        params = self._message_row_params(
+            session_id, role, msg, None, message_timestamp, keep_reasoning=False)
+
+        def _do(conn):
+            self._check_transcript_write_guards(conn, session_id, None)
+            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            conn.execute(
+                "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?",
+                (msg_id,),
+            )
+            self._bump_session_counters(conn, session_id, 1, 0, unit=True)
+            return msg_id
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def append_delegation_delivery(self, session_id: str, content: str, metadata: Dict[str, Any]) -> int:
         """Record a detached API result once, between client turns, including replay after rotation.
 

@@ -67,6 +67,56 @@ def test_respond_intercepts_without_mutating_live_history(monkeypatch):
     assert history == [{"role": "assistant", "content": {"nested": ["original"]}}]
 
 
+def test_respond_persists_display_only_response(monkeypatch):
+    calls = []
+
+    class Db:
+        def append_display_only_message(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _name: True)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda *_args, **_kwargs: [
+            {"action": "respond", "response": "Choose an initiative."}
+        ],
+    )
+
+    result = _resolve(_agent(_session_db=Db()))
+
+    assert result["result"]["messages"] == []
+    assert calls == [
+        (
+            ("session-1", "assistant", "Choose an initiative."),
+            {
+                "display_kind": "pre_user_turn_response",
+                "display_metadata": {
+                    "turn_exit_reason": "pre_user_turn_intercepted"
+                },
+            },
+        )
+    ]
+
+
+def test_display_only_persistence_failure_does_not_block_response(monkeypatch):
+    class Db:
+        def append_display_only_message(self, *_args, **_kwargs):
+            raise OSError("disk temporarily unavailable")
+
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _name: True)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda *_args, **_kwargs: [
+            {"action": "respond", "response": "Choose an initiative."}
+        ],
+    )
+
+    result = _resolve(_agent(_session_db=Db()))
+
+    assert result["action"] == "respond"
+    assert result["result"]["final_response"] == "Choose an initiative."
+
+
 def test_rewrite_preserves_separate_model_and_persisted_messages(monkeypatch):
     monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _name: True)
     monkeypatch.setattr(

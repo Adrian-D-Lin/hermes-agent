@@ -12,6 +12,29 @@ _DEFAULT_FAIL_CLOSED_RESPONSE = (
     "Turn blocked because pre-user-turn admission could not be completed."
 )
 
+_PRE_USER_TURN_DISPLAY_KIND = "pre_user_turn_response"
+
+
+def _persist_intercepted_response(agent: Any, response: str) -> None:
+    """Keep hook-owned UI responses durable without feeding them to the model."""
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    writer = getattr(db, "append_display_only_message", None)
+    if not session_id or not callable(writer):
+        return
+    try:
+        writer(
+            session_id,
+            "assistant",
+            response,
+            display_kind=_PRE_USER_TURN_DISPLAY_KIND,
+            display_metadata={"turn_exit_reason": "pre_user_turn_intercepted"},
+        )
+    except Exception:
+        # The response still streams when persistence is unavailable; do not
+        # turn a presentation recovery safeguard into an admission outage.
+        logger.warning("pre-user-turn response persistence failed", exc_info=True)
+
 
 def _deep_copy_history(
     conversation_history: Optional[List[Dict[str, Any]]],
@@ -68,12 +91,14 @@ def _fail_closed(
     final_response: Optional[str] = None,
 ) -> Dict[str, Any]:
     _clear_staged_input_if_matching(agent, expected_persist_content)
+    response = final_response or _DEFAULT_FAIL_CLOSED_RESPONSE
+    _persist_intercepted_response(agent, response)
     return {
         "action": "fail",
         "result": _build_intercepted_result(
             agent,
             history_copy,
-            final_response=final_response,
+            final_response=response,
             completed=False,
             failed=True,
         ),
@@ -151,6 +176,7 @@ def resolve_pre_user_turn(
         if not isinstance(response, str) or not response.strip():
             logger.warning("pre_user_turn respond missing valid response; failing closed")
             return _fail_closed(agent, history_copy, expected_persist_content)
+        _persist_intercepted_response(agent, response)
         _clear_staged_input_if_matching(agent, expected_persist_content)
         return {
             "action": "respond",

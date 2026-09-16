@@ -64,6 +64,30 @@ def _row_ids(db, sid, **kwargs):
 
 
 class TestIncludeCompacted:
+    def test_display_only_message_is_durable_but_model_invisible(self, db):
+        sid = "display-only"
+        db.create_session(sid, source="desktop")
+
+        row_id = db.append_display_only_message(
+            sid,
+            "assistant",
+            "Choose an initiative.",
+            display_kind="pre_user_turn_response",
+            display_metadata={"turn_exit_reason": "pre_user_turn_intercepted"},
+        )
+
+        assert db.get_messages_as_conversation(sid) == []
+        model_history, display_history = db.get_resume_conversations(sid)
+        assert model_history == []
+        assert [row["content"] for row in display_history] == ["Choose an initiative."]
+        assert display_history[0]["display_kind"] == "pre_user_turn_response"
+
+        stored = db.get_messages(sid, include_compacted=True)
+        assert stored[0]["id"] == row_id
+        assert stored[0]["active"] == 0
+        assert stored[0]["compacted"] == 1
+        assert stored[0]["observed"] == 1
+
     def test_default_returns_only_active_rows(self, db):
         """Regression guard: the default read must not change behaviour."""
         sid = "s1"
