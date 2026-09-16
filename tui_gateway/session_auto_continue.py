@@ -310,6 +310,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     kwargs: dict = {"queued_prompt_generation": queue_generation}
+    if queued_transport is not None:
+        kwargs["authorizing_transport"] = queued_transport
     if queued.get("image_paths"):
         kwargs["image_paths"] = queued["image_paths"]
     # The compute-host frame has no author field, so only the inline runner receives it.

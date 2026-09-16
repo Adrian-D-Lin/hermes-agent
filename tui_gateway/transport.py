@@ -48,6 +48,10 @@ class Transport(Protocol):
 _current_transport: contextvars.ContextVar[Optional[Transport]] = contextvars.ContextVar(
     "hermes_gateway_transport", default=None
 )
+_UNBOUND_AUTHORIZING_TRANSPORT = object()
+_current_authorizing_transport: contextvars.ContextVar[object] = contextvars.ContextVar(
+    "hermes_gateway_authorizing_transport", default=_UNBOUND_AUTHORIZING_TRANSPORT
+)
 
 
 def current_transport() -> Optional[Transport]:
@@ -61,6 +65,29 @@ def bind_transport(transport: Optional[Transport]):
 
 def reset_transport(token) -> None:
     _current_transport.reset(token)
+
+
+def current_authorizing_transport() -> Optional[Transport]:
+    """Return the exact peer that commissioned the current user turn.
+
+    Session output may use a :class:`FanoutTransport`, but authorization must
+    remain tied to the request-local transport that submitted the prompt.
+    Internal/automatic turns deliberately leave this unset.
+    """
+    transport = _current_authorizing_transport.get()
+    return None if transport is _UNBOUND_AUTHORIZING_TRANSPORT else transport
+
+
+def authorizing_transport_is_bound() -> bool:
+    return _current_authorizing_transport.get() is not _UNBOUND_AUTHORIZING_TRANSPORT
+
+
+def bind_authorizing_transport(transport: Optional[Transport]):
+    return _current_authorizing_transport.set(transport)
+
+
+def reset_authorizing_transport(token) -> None:
+    _current_authorizing_transport.reset(token)
 
 
 def _raise_unless_peer_gone(exc: Exception, what: str) -> None:

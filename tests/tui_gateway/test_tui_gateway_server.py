@@ -7545,6 +7545,52 @@ def test_run_prompt_submit_binds_exact_steer_authority_and_resets_contextvars(
         server._sessions.pop("sid-owner", None)
 
 
+def test_run_prompt_submit_binds_exact_authorizing_transport_and_resets_contextvar(
+    monkeypatch, tmp_path
+):
+    from tui_gateway.transport import (
+        bind_authorizing_transport,
+        current_authorizing_transport,
+        reset_authorizing_transport,
+    )
+
+    class _Transport:
+        def write(self, _obj):
+            return True
+
+        def close(self):
+            return None
+
+    observed = {}
+    output_transport = _Transport()
+    submitting_transport = _Transport()
+    previous_authority = _Transport()
+
+    class _CapturingAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            observed["authorizing_transport"] = current_authorizing_transport()
+            return super().run_conversation(prompt, **kwargs)
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    session = _session(
+        session_key="session-authority",
+        agent=_CapturingAgent([]),
+        running=True,
+        transport=output_transport,
+    )
+    token = bind_authorizing_transport(previous_authority)
+    try:
+        server._run_prompt_submit(
+            "rid-authority", "sid-authority", session, "commission",
+            authorizing_transport=submitting_transport,
+        )
+
+        assert observed["authorizing_transport"] is submitting_transport
+        assert current_authorizing_transport() is previous_authority
+    finally:
+        reset_authorizing_transport(token)
+
+
 class _RecordingAgent:
     model = "test-model"
     provider = "test-provider"

@@ -293,9 +293,21 @@ class TrustedAuthorizerEvidence:
 
 
 def mint_current_tailscale_authorizer(*, request_id, issued_at, ttl_seconds):
-    from tui_gateway.transport import FanoutTransport, current_transport
+    from tui_gateway.transport import (
+        FanoutTransport,
+        authorizing_transport_is_bound,
+        current_authorizing_transport,
+        current_transport,
+    )
 
-    transport = current_transport()
+    # A user turn retains the exact submitting peer separately from its output
+    # transport. The latter can be a session-wide fanout and is not proof of
+    # which attached client commissioned the mutation.
+    transport = (
+        current_authorizing_transport()
+        if authorizing_transport_is_bound()
+        else current_transport()
+    )
     peer = getattr(transport, "_authenticated_tailscale_peer", None)
     if isinstance(transport, FanoutTransport):
         peers = [

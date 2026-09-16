@@ -3,7 +3,13 @@ import json
 from types import SimpleNamespace
 
 from gateway import trusted_authorizer_evidence as trusted
-from tui_gateway.transport import FanoutTransport, bind_transport, reset_transport
+from tui_gateway.transport import (
+    FanoutTransport,
+    bind_authorizing_transport,
+    bind_transport,
+    reset_authorizing_transport,
+    reset_transport,
+)
 from tui_gateway.ws import WSTransport
 from tui_gateway import ws as ws_module
 
@@ -188,6 +194,82 @@ def test_fanout_rejects_unauthenticated_or_mixed_identity_peers(monkeypatch):
                     raise AssertionError("ambiguous fanout unexpectedly minted authority")
             finally:
                 reset_transport(token)
+    finally:
+        loop.close()
+
+
+def test_exact_authorizing_peer_is_not_diluted_by_output_fanout(monkeypatch):
+    monkeypatch.setattr(
+        trusted.subprocess,
+        "run",
+        lambda command, **_kwargs: _whois_result(address=command[-1]),
+    )
+    loop = asyncio.new_event_loop()
+    try:
+        peer = trusted._authenticate_tailscale_peer(
+            "100.115.246.102",
+            connection_id="ws-authorizing",
+            authenticated_at=1_000,
+        )
+        authorizing = WSTransport(
+            SimpleNamespace(), loop,
+            peer="100.115.246.102:54321",
+            authenticated_tailscale_peer=peer,
+        )
+        unauthenticated_viewer = WSTransport(SimpleNamespace(), loop)
+        output_token = bind_transport(FanoutTransport(authorizing, unauthenticated_viewer))
+        authority_token = bind_authorizing_transport(authorizing)
+        try:
+            evidence = trusted.mint_current_tailscale_authorizer(
+                request_id="turn-exact-peer",
+                issued_at=1_001,
+                ttl_seconds=60,
+            )
+        finally:
+            reset_authorizing_transport(authority_token)
+            reset_transport(output_token)
+    finally:
+        loop.close()
+
+    payload = json.loads(evidence._canonical_for_writegate())
+    assert payload["connection_id"] == "ws-authorizing"
+    assert payload["peer_identity"] == "adrian@example.com"
+
+
+def test_explicitly_authorityless_turn_cannot_borrow_output_transport(monkeypatch):
+    monkeypatch.setattr(
+        trusted.subprocess,
+        "run",
+        lambda command, **_kwargs: _whois_result(address=command[-1]),
+    )
+    peer = trusted._authenticate_tailscale_peer(
+        "100.115.246.102",
+        connection_id="ws-viewer-only",
+        authenticated_at=1_000,
+    )
+    loop = asyncio.new_event_loop()
+    try:
+        viewer = WSTransport(
+            SimpleNamespace(), loop,
+            peer="100.115.246.102:54321",
+            authenticated_tailscale_peer=peer,
+        )
+        output_token = bind_transport(viewer)
+        authority_token = bind_authorizing_transport(None)
+        try:
+            try:
+                trusted.mint_current_tailscale_authorizer(
+                    request_id="automatic-turn",
+                    issued_at=1_001,
+                    ttl_seconds=60,
+                )
+            except ValueError as exc:
+                assert "authenticated Tailscale transport" in str(exc)
+            else:
+                raise AssertionError("authorityless turn borrowed its output transport")
+        finally:
+            reset_authorizing_transport(authority_token)
+            reset_transport(output_token)
     finally:
         loop.close()
 

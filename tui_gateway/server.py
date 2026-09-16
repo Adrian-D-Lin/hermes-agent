@@ -37,8 +37,10 @@ from tui_gateway import git_probe
 from tui_gateway._env import env_float, env_int
 from tui_gateway.turn_marker import clear_turn_marker, read_turn_marker, record_turn_start  # noqa: F401
 from tui_gateway.contracts import registry as _contracts
-from tui_gateway.transport import (FanoutTransport, StdioTransport, Transport, bind_transport,
-                                   current_transport, reset_transport)
+from tui_gateway.transport import (FanoutTransport, StdioTransport, Transport,
+                                   bind_authorizing_transport, bind_transport,
+                                   current_transport, reset_authorizing_transport,
+                                   reset_transport)
 
 logger = logging.getLogger(__name__)
 
