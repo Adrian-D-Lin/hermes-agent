@@ -90,8 +90,8 @@ test('readClientReleaseMetadata normalizes the checked-in Desktop release identi
   const metadata = readClientReleaseMetadata(new URL('../client-release.json', import.meta.url))
 
   assert.deepEqual(metadata, {
-    release: '0.21.3-adrian.1',
-    releaseSequence: 2026091501,
+    release: '0.21.3-adrian.3',
+    releaseSequence: 2026091601,
     protocolEpoch: 1,
     bundleVersion: '1'
   })
