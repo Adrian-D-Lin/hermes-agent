@@ -108,6 +108,22 @@ def _require_positive_int_str(value: Any, name: str) -> int:
     return int(value)
 
 
+def _has_dirty_freshness(result: Dict[str, Any]) -> bool:
+    """Return whether freshness deliberately deferred a head-evidence update.
+
+    Dirty work is permitted inside an already anchored phase, but freshness
+    must not seal a newer head while uncommitted files remain.  In that case
+    its result is the verified workspace view for this turn; asking the
+    materializer to compare the live head with the deliberately stale sealed
+    head would immediately undo that policy.
+    """
+    actions = result.get("freshness_actions")
+    return isinstance(actions, list) and any(
+        isinstance(action, dict) and action.get("action") == "dirty_observed"
+        for action in actions
+    )
+
+
 def _default_workspace_advancement_confirmer(
     session_id: str,
     advancements: Tuple[Dict[str, Any], ...],
@@ -281,12 +297,17 @@ class SessionStartupAnchorResolver:
             )
             materializer = self._get_materializer(conn)
             if workspace.get("lifecycle_state") == "materialized":
-                self._reconcile_freshness(conn, initiative_id, session_id, epoch)
-                materialized = materializer.materialize(
-                    initiative_id=initiative_id,
-                    actor_evidence=f"session-startup:{session_id}",
-                    at=epoch,
+                freshness = self._reconcile_freshness(
+                    conn, initiative_id, session_id, epoch
                 )
+                if _has_dirty_freshness(freshness):
+                    materialized = freshness
+                else:
+                    materialized = materializer.materialize(
+                        initiative_id=initiative_id,
+                        actor_evidence=f"session-startup:{session_id}",
+                        at=epoch,
+                    )
             else:
                 materializer.materialize(
                     initiative_id=initiative_id,
@@ -665,17 +686,22 @@ class SessionStartupAnchorResolver:
                 )
 
             epoch = _resolve_positive_epoch(self._epoch_provider)
-            self._reconcile_freshness(conn, initiative_id, session_id, epoch)
-            try:
-                materialized = self._get_materializer(conn).materialize(
-                    initiative_id=initiative_id,
-                    actor_evidence=f"session-startup-revalidate:{session_id}",
-                    at=epoch,
-                )
-            except Exception as exc:
-                raise SessionStartupAnchorError(
-                    f"materializer: verification failed: {exc}"
-                ) from exc
+            freshness = self._reconcile_freshness(
+                conn, initiative_id, session_id, epoch
+            )
+            if _has_dirty_freshness(freshness):
+                materialized = freshness
+            else:
+                try:
+                    materialized = self._get_materializer(conn).materialize(
+                        initiative_id=initiative_id,
+                        actor_evidence=f"session-startup-revalidate:{session_id}",
+                        at=epoch,
+                    )
+                except Exception as exc:
+                    raise SessionStartupAnchorError(
+                        f"materializer: verification failed: {exc}"
+                    ) from exc
             if not isinstance(materialized, dict):
                 raise SessionStartupAnchorError(
                     "materializer.materialize must return a dict"

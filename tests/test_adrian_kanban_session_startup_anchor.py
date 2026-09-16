@@ -642,6 +642,55 @@ def test_revalidate_root_order_preserves_primary_member_semantics(modules, tmp_p
     assert "binding_membership_changed" in result["reasons"]
 
 
+def test_revalidate_dirty_advanced_head_uses_freshness_view(modules, tmp_path):
+    database = tmp_path / "tracker.db"
+    root = tmp_path / "primary"
+    _seed_materialized_workspace(database, modules["schema"])
+    member_root = str(tmp_path / "member")
+    freshness_result = {
+        "workspace_id": "coord-initiative-1",
+        "binding_version": 1,
+        "member_roots": [member_root],
+        "freshness_actions": [
+            {
+                "repository_identity": "repo-1",
+                "action": "dirty_observed",
+                "recorded_head": "b" * 40,
+                "local_head": "c" * 40,
+                "remote_head": "c" * 40,
+            }
+        ],
+    }
+
+    class RejectingMaterializer(_FakeMaterializer):
+        def materialize(self, **kwargs):
+            pytest.fail("dirty active work must not demand exact sealed-head verification")
+
+    materializer = RejectingMaterializer(freshness_result)
+    resolver = modules["anchor"].SessionStartupAnchorResolver(
+        tracker_database_path=str(database),
+        registry=_registry(modules["workspace"], root),
+        materializer_factory=lambda _conn: materializer,
+        freshness_factory=lambda _conn, _confirm: _FakeFreshness(
+            freshness_result
+        ),
+        active_binding_loader=lambda _session_id: _binding([member_root]),
+        epoch_provider=lambda: 100,
+    )
+
+    result = resolver.revalidate(*_anchored_inputs(root))
+
+    assert result == {
+        "classification": "unchanged",
+        "reasons": [],
+        "accepted_phase": "DEV2",
+        "accepted_segment_id": "S1",
+        "logical_workspace_id": "coord-initiative-1",
+        "writegate_binding_version": "1",
+        "writegate_binding_ref": "42",
+    }
+
+
 @pytest.mark.parametrize(
     ("workspace_field", "value", "message"),
     [

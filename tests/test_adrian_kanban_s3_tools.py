@@ -95,6 +95,17 @@ def test_public_tool_schema_set_exactly_matches_ratified_surface(commands_module
         commands_module.TOOL_SCHEMAS["unexpected"] = {}
 
 
+def test_initiative_tools_are_in_static_kanban_surface(commands_module):
+    from toolsets import resolve_toolset
+
+    # Agent construction can resolve configured toolsets before plugin loading
+    # has enriched the registry.  Initiative tools must therefore be named by
+    # the static kanban surface as well as registered by the plugin.
+    assert commands_module.INITIATIVE_OPERATIONS <= set(
+        resolve_toolset("kanban", include_registry=False)
+    )
+
+
 def test_each_public_schema_is_closed_and_self_describing(commands_module):
     for operation, schema in commands_module.TOOL_SCHEMAS.items():
         assert schema["name"] == operation
