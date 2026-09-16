@@ -1,7 +1,7 @@
 {
   "name": "adrian-kanban",
   "label": "Initiative Tracker",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "api": "plugin_api.py",
   "entry": "dist/index.js",
   "css": "dist/style.css",

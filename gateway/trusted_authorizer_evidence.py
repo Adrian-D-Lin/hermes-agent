@@ -293,10 +293,25 @@ class TrustedAuthorizerEvidence:
 
 
 def mint_current_tailscale_authorizer(*, request_id, issued_at, ttl_seconds):
-    from tui_gateway.transport import current_transport
+    from tui_gateway.transport import FanoutTransport, current_transport
 
     transport = current_transport()
     peer = getattr(transport, "_authenticated_tailscale_peer", None)
+    if isinstance(transport, FanoutTransport):
+        peers = [
+            getattr(member, "_authenticated_tailscale_peer", None)
+            for member in transport.transports()
+        ]
+        if (
+            peers
+            and all(
+                isinstance(candidate, _AuthenticatedTailscalePeerState)
+                and candidate in _authenticated_tailscale_peers
+                for candidate in peers
+            )
+            and len({(candidate.route, candidate.peer_identity) for candidate in peers}) == 1
+        ):
+            peer = peers[0]
     if (
         not isinstance(peer, _AuthenticatedTailscalePeerState)
         or peer not in _authenticated_tailscale_peers

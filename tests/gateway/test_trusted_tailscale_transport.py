@@ -3,7 +3,7 @@ import json
 from types import SimpleNamespace
 
 from gateway import trusted_authorizer_evidence as trusted
-from tui_gateway.transport import bind_transport, reset_transport
+from tui_gateway.transport import FanoutTransport, bind_transport, reset_transport
 from tui_gateway.ws import WSTransport
 from tui_gateway import ws as ws_module
 
@@ -102,6 +102,94 @@ def test_no_bound_authenticated_transport_cannot_mint_authority():
         assert "authenticated Tailscale transport" in str(exc)
     else:
         raise AssertionError("authority unexpectedly minted without a bound transport")
+
+
+def test_same_identity_authenticated_fanout_can_mint_authority(monkeypatch):
+    monkeypatch.setattr(
+        trusted.subprocess,
+        "run",
+        lambda command, **_kwargs: _whois_result(address=command[-1]),
+    )
+    loop = asyncio.new_event_loop()
+    try:
+        transports = []
+        for index, address in enumerate(("100.115.246.102", "100.115.246.103"), 1):
+            peer = trusted._authenticate_tailscale_peer(
+                address,
+                connection_id=f"ws-connection-{index}",
+                authenticated_at=1_000,
+            )
+            transports.append(
+                WSTransport(
+                    SimpleNamespace(),
+                    loop,
+                    peer=f"{address}:54321",
+                    authenticated_tailscale_peer=peer,
+                )
+            )
+        token = bind_transport(FanoutTransport(*transports))
+        try:
+            evidence = trusted.mint_current_tailscale_authorizer(
+                request_id="turn-fanout",
+                issued_at=1_001,
+                ttl_seconds=60,
+            )
+        finally:
+            reset_transport(token)
+    finally:
+        loop.close()
+
+    payload = json.loads(evidence._canonical_for_writegate())
+    assert payload["peer_identity"] == "adrian@example.com"
+    assert payload["request_id"] == "turn-fanout"
+
+
+def test_fanout_rejects_unauthenticated_or_mixed_identity_peers(monkeypatch):
+    def fake_run(command, **_kwargs):
+        address = command[-1]
+        login = "other@example.com" if address.endswith("103") else "adrian@example.com"
+        return _whois_result(login=login, address=address)
+
+    monkeypatch.setattr(trusted.subprocess, "run", fake_run)
+    loop = asyncio.new_event_loop()
+    try:
+        authenticated = []
+        for index, address in enumerate(("100.115.246.102", "100.115.246.103"), 1):
+            peer = trusted._authenticate_tailscale_peer(
+                address,
+                connection_id=f"ws-connection-{index}",
+                authenticated_at=1_000,
+            )
+            authenticated.append(
+                WSTransport(
+                    SimpleNamespace(),
+                    loop,
+                    peer=f"{address}:54321",
+                    authenticated_tailscale_peer=peer,
+                )
+            )
+
+        unauthenticated = WSTransport(SimpleNamespace(), loop)
+        for fanout in (
+            FanoutTransport(authenticated[0], unauthenticated),
+            FanoutTransport(*authenticated),
+        ):
+            token = bind_transport(fanout)
+            try:
+                try:
+                    trusted.mint_current_tailscale_authorizer(
+                        request_id="turn-rejected",
+                        issued_at=1_001,
+                        ttl_seconds=60,
+                    )
+                except ValueError as exc:
+                    assert "authenticated Tailscale transport" in str(exc)
+                else:
+                    raise AssertionError("ambiguous fanout unexpectedly minted authority")
+            finally:
+                reset_transport(token)
+    finally:
+        loop.close()
 
 
 def test_handle_ws_authenticates_and_binds_tailscale_peer(monkeypatch):
