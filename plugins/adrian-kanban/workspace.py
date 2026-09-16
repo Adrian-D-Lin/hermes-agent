@@ -645,19 +645,25 @@ class _GitWorkspaceExecutor:
             return None
         return sha
 
-    def _remote_integration_head(self, registration: _RepositoryRegistration) -> str:
+    def _remote_integration_head(
+        self,
+        registration: _RepositoryRegistration,
+        *,
+        allow_offline: bool = False,
+    ) -> str:
         """Resolve the remote integration-branch head through the trusted
         :class:`RepositoryBindingResolver`, the single authority for
         remote-dependent integration-head boundaries.
 
-        This is a strict online operation: a connectivity failure or
-        missing head is a hard failure, and a cached offline fallback is
-        never accepted.
+        Remote-dependent mutation boundaries use the strict default. Session
+        freshness inspection may explicitly allow the resolver's verified
+        cached tracking ref so an established local workspace remains usable
+        during a transient GitHub outage.
         """
         try:
             result = RepositoryBindingResolver(
                 registration
-            ).resolve_integration_head(allow_offline=False)
+            ).resolve_integration_head(allow_offline=allow_offline)
         except RepositoryBindingError as exc:
             raise _WorkspaceRejected(
                 f"failed to resolve remote integration head for "
@@ -911,7 +917,10 @@ class _GitWorkspaceExecutor:
 
         registration = self.registration_for(member)
         try:
-            remote_head = self._remote_integration_head(registration)
+            remote_head = self._remote_integration_head(
+                registration,
+                allow_offline=True,
+            )
         except _WorkspaceRejected:
             return _MemberFreshness(
                 repository_identity=member.repository_identity,

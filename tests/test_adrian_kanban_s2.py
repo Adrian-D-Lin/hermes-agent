@@ -91,7 +91,7 @@ def _binding(module, **changes):
         "canonical_digest": "sha256:task-payload",
         "session_id": "session-1",
         "workspace_id": "workspace-1",
-        "plugin_version": "0.4.5",
+        "plugin_version": "0.4.6",
         "protocol_version": "2",
         "execution_context": "run-1",
     }
@@ -1667,6 +1667,42 @@ def test_workspace_freshness_exposes_unexplained_local_advancement(
     assert freshness.recorded_is_ancestor_of_local is True
     assert freshness.local_is_ancestor_of_remote is False
     assert freshness.remote_is_ancestor_of_local is True
+    conn.close()
+
+
+def test_workspace_freshness_allows_verified_cached_remote_for_local_session(
+    provider_modules, tmp_path, monkeypatch
+):
+    workspace_mod = provider_modules["workspace"]
+    conn, _, base_sha, plan = _workspace_plan(provider_modules, tmp_path)
+    executor = workspace_mod._GitWorkspaceExecutor()
+    executor.materialize(plan.members[0])
+    member = _materialized_workspace_member(plan.members[0], base_sha)
+    calls = []
+
+    class OfflineResolver:
+        def __init__(self, registration):
+            assert registration is member.registration
+
+        def resolve_integration_head(self, *, allow_offline):
+            calls.append(allow_offline)
+            return type(
+                "OfflineResult",
+                (),
+                {"head_sha": base_sha, "state": "degraded_offline"},
+            )()
+
+    monkeypatch.setattr(
+        workspace_mod,
+        "RepositoryBindingResolver",
+        OfflineResolver,
+    )
+
+    freshness = executor.inspect_freshness(member)
+
+    assert calls == [True]
+    assert freshness.ready is True
+    assert freshness.local_head == freshness.remote_head == base_sha
     conn.close()
 
 
