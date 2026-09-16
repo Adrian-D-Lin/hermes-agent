@@ -104,6 +104,70 @@ def test_decide_read_allowed(reg, mods):
     assert d.allowed
 
 
+def test_decide_allows_read_only_kanban_database_inspection(reg, mods):
+    d = mods.enforcement.decide(
+        tool_name="execute_code",
+        args={
+            "code": (
+                "import sqlite3\n"
+                "db = '/home/progenitor/.hermes/kanban.db'\n"
+                "sqlite3.connect(db).execute('SELECT * FROM tasks').fetchall()"
+            )
+        },
+        session_id="unbound-reader",
+        reg=reg,
+    )
+    assert d.allowed
+
+
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        (
+            "execute_code",
+            {
+                "code": (
+                    "import sqlite3\n"
+                    "db = '/home/progenitor/.hermes/kanban.db'\n"
+                    "sqlite3.connect(db).execute('INSERT INTO tasks VALUES (1)')"
+                )
+            },
+        ),
+        (
+            "execute_code",
+            {
+                "code": (
+                    "import sqlite3\n"
+                    "db = '/home/progenitor/.hermes/kanban/boards/grc/kanban.db'\n"
+                    "sqlite3.connect(db).execute('UPDATE tasks SET status=1')"
+                )
+            },
+        ),
+        (
+            "terminal",
+            {
+                "command": (
+                    "sqlite3 /home/progenitor/.hermes/kanban.db "
+                    "'DELETE FROM tasks WHERE id=1'"
+                )
+            },
+        ),
+    ],
+)
+def test_decide_blocks_direct_kanban_database_mutation(
+    reg, mods, tool_name, args
+):
+    d = mods.enforcement.decide(
+        tool_name=tool_name,
+        args=args,
+        session_id="unbound-writer",
+        reg=reg,
+    )
+    assert not d.allowed
+    assert "direct mutation of a Kanban database" in d.reason
+    assert "kanban_*" in d.remediation
+
+
 # -- decide: governed mutation requires a bound session -----------------------
 
 def test_decide_governed_mutation_requires_binding(reg, mods):

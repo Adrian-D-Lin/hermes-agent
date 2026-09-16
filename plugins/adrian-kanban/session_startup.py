@@ -552,7 +552,21 @@ class SessionStartupController:
             return self._fail_closed(
                 f"Created initiative projection is invalid: {exc}"
             )
-        return self._resolve_and_anchor(fresh_record, project, initiative)
+        completion_notice = (
+            "[Session Startup] Initiative creation is already complete.\n"
+            f"Created Initiative: {draft['title']} "
+            f"({draft['initiative_id']})\n"
+            f"Objective: {draft['objective']}\n"
+            "Continue with the initiative's D1 work under the anchored context. "
+            "Do not create another initiative for the held opening request.\n"
+            "Original opening request:"
+        )
+        return self._resolve_and_anchor(
+            fresh_record,
+            project,
+            initiative,
+            release_preamble=completion_notice,
+        )
 
     def _clear_initiative_creation(
         self, record: Dict[str, Any], project: Dict[str, Any]
@@ -679,8 +693,17 @@ class SessionStartupController:
         return {"action": "respond", "response": "\n".join(lines)}
 
     def _resolve_and_anchor(
-        self, record: Dict[str, Any], project: Dict[str, Any], initiative: Dict[str, Any]
+        self,
+        record: Dict[str, Any],
+        project: Dict[str, Any],
+        initiative: Dict[str, Any],
+        *,
+        release_preamble: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if release_preamble is not None and (
+            not isinstance(release_preamble, str) or not release_preamble.strip()
+        ):
+            return self._fail_closed("Invalid release preamble.")
         try:
             record = self._store.transition_session_startup(
                 session_id=record["session_id"],
@@ -762,9 +785,12 @@ class SessionStartupController:
             writegate_binding_version=writegate_binding_version,
             writegate_binding_ref=writegate_binding_ref,
         )
+        release_message = held_prompt
+        if release_preamble is not None:
+            release_message = release_preamble.strip() + "\n" + held_prompt
         return {
             "action": "rewrite",
-            "model_message": anchor + "\n" + held_prompt,
+            "model_message": anchor + "\n" + release_message,
             "persist_message": held_prompt,
         }
 

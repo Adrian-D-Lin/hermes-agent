@@ -1650,6 +1650,13 @@ def test_controller_new_initiative_collects_only_title_and_objective_then_anchor
     assert release["action"] == "rewrite"
     assert release["persist_message"] == "original held prompt"
     assert "Initiative: i_context_discipline_12345678" in release["model_message"]
+    assert "Initiative creation is already complete" in release["model_message"]
+    assert "Created Initiative: Context discipline" in release["model_message"]
+    assert "Objective: Keep long sessions coherent." in release["model_message"]
+    assert "Do not create another initiative" in release["model_message"]
+    assert release["model_message"].endswith(
+        "Original opening request:\noriginal held prompt"
+    )
     assert record["state"] == "anchored"
     assert record["selected_initiative_id"] == "i_context_discipline_12345678"
     assert record["creation_stage"] is None

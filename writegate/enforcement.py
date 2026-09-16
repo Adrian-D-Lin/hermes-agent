@@ -62,6 +62,25 @@ CONTROL_TOOL = "write_gate"
 # Tools that perform a persistent mutation and are therefore governed.
 GOVERNED_TOOLS = frozenset({"write_file", "patch"})
 
+# The Initiative Tracker database is a control-plane datastore, not a normal
+# workspace file.  Model code must mutate it through the registered Kanban
+# tools so validation, approval and audit records cannot be bypassed.
+DIRECT_CODE_TOOLS = frozenset({"execute_code", "terminal"})
+KANBAN_DATABASE_MARKERS = ("kanban.db", "/kanban/boards/")
+DATABASE_MUTATION_MARKERS = (
+    "insert into",
+    "update ",
+    "delete from",
+    "replace into",
+    "create table",
+    "drop table",
+    "alter table",
+    ".unlink(",
+    "os.remove(",
+    "remove-item",
+    "rm ",
+)
+
 # Protected project-root subdirectories that require a lease even inside a
 # bound worktree (§4 / §5).
 PROTECTED_PREFIXES = ("Canon/", "4-artifacts/", "5-archive/")
@@ -214,6 +233,29 @@ def _terminal_fs_mutations(tool_name: str, args: Any) -> List[str]:
     return targets
 
 
+def _is_direct_kanban_database_mutation(tool_name: str, args: Any) -> bool:
+    """Identify an obvious attempt to mutate a Kanban SQLite store directly.
+
+    This is deliberately narrow: read-only inspection through code remains
+    available, while SQL/file mutation against either the authority database
+    or a legacy per-board database is rejected in favour of model tools.
+    """
+    if tool_name not in DIRECT_CODE_TOOLS or not isinstance(args, dict):
+        return False
+    field = "code" if tool_name == "execute_code" else "command"
+    text = args.get(field)
+    if not isinstance(text, str) or not text.strip():
+        return False
+    lowered = text.casefold().replace("\\", "/")
+    references_kanban_database = any(
+        marker in lowered for marker in KANBAN_DATABASE_MARKERS
+    )
+    mutates_database = any(
+        marker in lowered for marker in DATABASE_MUTATION_MARKERS
+    )
+    return references_kanban_database and mutates_database
+
+
 def _canonical_member_roots(
     member_roots: Sequence[str],
     *,
@@ -260,6 +302,24 @@ def decide(
     # 1. Always-allow path (reads, control tool, exact Kanban ops).
     if is_always_allowed(tool_name):
         return Decision(allowed=True)
+
+    # The Kanban database is host-owned control-plane state.  Direct SQL/file
+    # mutation would bypass the Initiative Tracker's validation and approval
+    # boundary even when the session otherwise has a valid worktree binding.
+    if _is_direct_kanban_database_mutation(tool_name, args):
+        return Decision(
+            allowed=False,
+            reason=(
+                "Write-Gate: direct mutation of a Kanban database is blocked. "
+                "Initiative and task records must be changed through the "
+                "registered Kanban tools."
+            ),
+            remediation=(
+                "Use the matching kanban_* operation. If the required Kanban "
+                "tool is absent, stop and report the missing tool surface; do "
+                "not edit SQLite directly."
+            ),
+        )
 
     # 2. Determine whether this tool performs a governed mutation.
     targets = _targets_from_args(tool_name, args)
