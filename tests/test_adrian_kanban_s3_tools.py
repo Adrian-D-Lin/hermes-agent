@@ -382,6 +382,13 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
                 # supplying an approval keeps it out of the real public
                 # approval workflow tested separately.
                 supplied["approval_id"] = f"approval-{operation}"
+            if operation == "kanban_create_initiative":
+                # The public normalizer validates the exact ledger body
+                # contract before delegating; supply a valid one so this
+                # test remains about delegation, not body validation.
+                supplied["body"] = importlib.import_module(
+                    f"{commands_module.__package__}.initiative_mutations"
+                ).INITIATIVE_LEDGER_BODY_TEMPLATE
         elif operation == "kanban_link":
             supplied.update(parent_id="task-parent", child_id="task-child")
         elif operation in commands_module.ORDINARY_TASK_OPERATIONS:

@@ -426,3 +426,215 @@ def test_denied_public_initiative_create_leaves_no_card(public_create, monkeypat
         assert conn.execute(
             "SELECT state FROM write_gate_kanban_approvals"
         ).fetchone()[0] == "cancelled"
+
+# ---------------------------------------------------------------------------
+# Initiative ledger body contract: pre-approval validation at the public
+# request normalization boundary.
+# ---------------------------------------------------------------------------
+
+
+def _valid_body() -> str:
+    return _BODY.replace("initiative-1", "initiative-public-create")
+
+
+def _strip_body_line(body: str, line: str) -> str:
+    lines = [ln for ln in body.splitlines() if ln.strip() != line]
+    return "\n".join(lines)
+
+
+def _body_with_swapped_order(body: str) -> str:
+    """Return a body where '### Cleared outcomes' precedes '### Objective',
+    so the required headings are all present exactly once but out of order.
+
+    The two sections are not adjacent (### Board and workspace context sits
+    between them), so the splice must preserve that middle content.
+    """
+    lines = body.splitlines()
+    objective_idx = next(i for i, ln in enumerate(lines) if ln.strip() == "### Objective")
+    cleared_idx = next(i for i, ln in enumerate(lines) if ln.strip() == "### Cleared outcomes")
+    assert cleared_idx > objective_idx
+
+    def _section_end(idx: int) -> int:
+        i = idx + 1
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if stripped.startswith("## ") or stripped.startswith("### "):
+                return i
+            i += 1
+        return len(lines)
+
+    objective_end = _section_end(objective_idx)
+    cleared_end = _section_end(cleared_idx)
+    objective_section = lines[objective_idx:objective_end]
+    cleared_section = lines[cleared_idx:cleared_end]
+    middle = lines[objective_end:cleared_idx]
+    rebuilt = (
+        lines[:objective_idx]
+        + cleared_section
+        + middle
+        + objective_section
+        + lines[cleared_end:]
+    )
+    return "\n".join(rebuilt)
+
+
+def test_initiative_create_body_schema_exposes_exact_contract(commands_module):
+    schema = commands_module.TOOL_SCHEMAS["kanban_create_initiative"]
+    body_description = schema["parameters"]["properties"]["body"]["description"]
+
+    # The prose must not call the body free-form.
+    assert "free-form initiative" not in body_description.lower()
+    assert "not free-form" in body_description.lower()
+
+    # The exact marker and every required heading must be visible.
+    assert "# [[INITIATIVE_LEDGER]]" in body_description
+    for heading in (
+        "## Initiative",
+        "### Objective",
+        "### Board and workspace context",
+        "### Authoritative artifacts",
+        "### Cleared outcomes",
+        "### Open items",
+        "### Related task cards",
+        "### Constraints",
+        "### Cold-session continuation",
+    ):
+        assert heading in body_description
+
+    # The stable rejection code must be named so the agent can key on it.
+    assert "INITIATIVE_LEDGER_BODY_INVALID" in body_description
+
+
+def test_malformed_body_missing_marker_rejects_before_approval(public_create):
+    path, normalizer, approval_module = public_create
+    presentations = []
+    approval_module.request_write_gate_approval = (
+        lambda **request: presentations.append(request)
+        or {"approved": True, "decision": "once"}
+    )
+
+    args = _create_args()
+    args["body"] = "no ledger marker at all"
+    result = normalizer.submit("kanban_create_initiative", args, _runtime())
+
+    assert result["result"] == "REJECTED"
+    assert result["state_changed"] is False
+    check = result["failed_checks"][0]
+    assert check["code"] == "INITIATIVE_LEDGER_BODY_INVALID"
+    assert check["target"] == "body"
+    assert check["responsible_actor"] == "session_agent"
+    assert check["retry"] == "same_operation"
+    assert "kanban_create_initiative" in check["remediation"]
+    assert "initiative body must start with the ledger marker" in check["observed"]
+    # The accepted format is the canonical template from the single source.
+    assert check["accepted_format"].startswith("# [[INITIATIVE_LEDGER]]")
+    assert "### Cold-session continuation" in check["accepted_format"]
+
+    # No approval row and no card were created.
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM write_gate_kanban_approvals"
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM adrian_kanban_cards").fetchone()[0] == 0
+    assert presentations == []
+
+
+@pytest.mark.parametrize(
+    "missing_heading",
+    (
+        "## Initiative",
+        "### Objective",
+        "### Board and workspace context",
+        "### Authoritative artifacts",
+        "### Cleared outcomes",
+        "### Open items",
+        "### Related task cards",
+        "### Constraints",
+        "### Cold-session continuation",
+    ),
+)
+def test_malformed_body_missing_heading_rejects_before_approval(
+    public_create, missing_heading
+):
+    path, normalizer, approval_module = public_create
+    presentations = []
+    approval_module.request_write_gate_approval = (
+        lambda **request: presentations.append(request)
+        or {"approved": True, "decision": "once"}
+    )
+
+    args = _create_args()
+    args["body"] = _strip_body_line(_valid_body(), missing_heading)
+    result = normalizer.submit("kanban_create_initiative", args, _runtime())
+
+    assert result["result"] == "REJECTED"
+    assert result["state_changed"] is False
+    check = result["failed_checks"][0]
+    assert check["code"] == "INITIATIVE_LEDGER_BODY_INVALID"
+    assert f"heading {missing_heading} must appear exactly once" in check["observed"]
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM write_gate_kanban_approvals"
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM adrian_kanban_cards").fetchone()[0] == 0
+    assert presentations == []
+
+
+def test_malformed_body_wrong_heading_order_rejects_before_approval(public_create):
+    path, normalizer, approval_module = public_create
+    presentations = []
+    approval_module.request_write_gate_approval = (
+        lambda **request: presentations.append(request)
+        or {"approved": True, "decision": "once"}
+    )
+
+    args = _create_args()
+    args["body"] = _body_with_swapped_order(_valid_body())
+    result = normalizer.submit("kanban_create_initiative", args, _runtime())
+
+    assert result["result"] == "REJECTED"
+    assert result["state_changed"] is False
+    check = result["failed_checks"][0]
+    assert check["code"] == "INITIATIVE_LEDGER_BODY_INVALID"
+    assert "required headings must appear in order" in check["observed"]
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM write_gate_kanban_approvals"
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM adrian_kanban_cards").fetchone()[0] == 0
+    assert presentations == []
+
+
+def test_valid_initiative_body_still_proceeds_through_approval(public_create, monkeypatch):
+    """A valid exact body still proceeds through the existing approval path
+    and is consumed — the new preflight must not change happy-path behavior."""
+    path, normalizer, approval_module = public_create
+    monkeypatch.setattr(
+        approval_module,
+        "request_write_gate_approval",
+        lambda **request: {
+            "approved": True,
+            "decision": "once",
+            "decision_at": "2026-09-17T05:00:00Z",
+            "approval_reference": "desktop-create-approval",
+        },
+    )
+    result = normalizer.submit("kanban_create_initiative", _create_args(), _runtime())
+
+    assert result["result"] == "ACCEPTED", result
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        card = conn.execute(
+            "SELECT card_type, task_id, record_version FROM adrian_kanban_cards "
+            "WHERE initiative_id = 'initiative-public-create'"
+        ).fetchone()
+        approval = conn.execute(
+            "SELECT operation, state FROM write_gate_kanban_approvals"
+        ).fetchone()
+    assert (card["card_type"], card["task_id"], card["record_version"]) == (
+        "initiative",
+        None,
+        0,
+    )
+    assert approval["operation"] == "kanban_create_initiative"
+    assert approval["state"] == "consumed"

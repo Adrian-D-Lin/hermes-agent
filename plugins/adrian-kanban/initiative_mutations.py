@@ -61,13 +61,46 @@ _INITIATIVE_REQUIRED_HEADINGS = (
     "### Cold-session continuation",
 )
 
+INITIATIVE_LEDGER_BODY_TEMPLATE = (
+    "# [[INITIATIVE_LEDGER]]\n"
+    "\n"
+    "## Initiative\n"
+    "\n"
+    "### Objective\n"
+    "(objective text)\n"
+    "\n"
+    "### Board and workspace context\n"
+    "(board and workspace context)\n"
+    "\n"
+    "### Authoritative artifacts\n"
+    "(authoritative artifacts)\n"
+    "\n"
+    "### Cleared outcomes\n"
+    "(cleared outcomes)\n"
+    "\n"
+    "### Open items\n"
+    "(open items)\n"
+    "\n"
+    "### Related task cards\n"
+    "(related task cards)\n"
+    "\n"
+    "### Constraints\n"
+    "(constraints)\n"
+    "\n"
+    "### Cold-session continuation\n"
+    "(cold-session continuation)"
+)
 
-def _validate_initiative_body(body: str) -> None:
+
+def validate_initiative_ledger_body(body: str) -> None:
     """Validate the initiative ledger body contract.
 
+    Canonical validator for the ``kanban_create_initiative`` body contract.
     The body must begin with the exact marker and then declare each required
-    heading exactly once, in this order. A malformed body raises ``ValueError``.
+    heading exactly once, in this order. A malformed body raises
+    ``ValueError`` with the exact failing requirement.
     """
+
     lines = body.splitlines()
     if not lines or lines[0] != _INITIATIVE_LEDGER_MARKER:
         raise ValueError("initiative body must start with the ledger marker")
@@ -85,6 +118,8 @@ def _validate_initiative_body(body: str) -> None:
             seen.append(heading)
     if seen != list(_INITIATIVE_REQUIRED_HEADINGS):
         raise ValueError("required headings must appear in order")
+
+_validate_initiative_body = validate_initiative_ledger_body
 
 
 def _approval_digest(payload: dict[str, Any]) -> str:
@@ -2237,3 +2272,8 @@ def _handle_close_initiative(context: Any) -> dict[str, Any]:
         "closed_at": now,
         "record_version": expected_version + 1,
     }
+
+__all__ = [
+    "INITIATIVE_LEDGER_BODY_TEMPLATE",
+    "validate_initiative_ledger_body",
+]

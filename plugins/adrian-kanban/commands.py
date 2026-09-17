@@ -48,12 +48,14 @@ from .handoffs import (
     validate_candidate_metadata,
 )
 from .initiative_mutations import (
+    INITIATIVE_LEDGER_BODY_TEMPLATE,
     _handle_close_initiative,
     _handle_create_initiative,
     _handle_transition_initiative as _ordinary_handle_transition_initiative,
     _handle_update_initiative,
     _preflight_dev4_workspace_checkpoint_effect,
     _preflight_transition_initiative,
+    validate_initiative_ledger_body,
 )
 from .initiative_override import (
     execute_approved_initiative_transition_override,
@@ -799,7 +801,19 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "body": {
                     "type": "string",
-                    "description": "Free-form initiative body or rationale.",
+                    "description": (
+                        "Initiative ledger body. Not free-form: the first line "
+                        "must be exactly '# [[INITIATIVE_LEDGER]]', followed "
+                        "exactly once, in this order, by the headings "
+                        "'## Initiative', '### Objective', '### Board and "
+                        "workspace context', '### Authoritative artifacts', "
+                        "'### Cleared outcomes', '### Open items', "
+                        "'### Related task cards', '### Constraints', and "
+                        "'### Cold-session continuation'. Each section "
+                        "carries its content below the heading. A malformed "
+                        "body is rejected with INITIATIVE_LEDGER_BODY_INVALID "
+                        "before any approval is prepared."
+                    ),
                 },
                 "approval_id": {
                     "type": "string",
@@ -1156,6 +1170,33 @@ class _ModelToolRequestNormalizer:
             if "board" in payload and payload["board"] != board:
                 raise ValueError("public board mismatch")
             payload["board"] = board
+
+            if operation == "kanban_create_initiative":
+                body = payload.get("body")
+                if not (type(body) is str and body.strip()):
+                    return self._boundary._finish_response(
+                        _rejection_from_checks(
+                            _resolve_attempt_id({"attempt_id": attempt_id}),
+                            operation,
+                            (
+                                _init_body_invalid_check(
+                                    "the body is empty or not a string",
+                                ),
+                            ),
+                        )
+                    )
+                try:
+                    validate_initiative_ledger_body(body)
+                except ValueError as exc:
+                    return self._boundary._finish_response(
+                        _rejection_from_checks(
+                            _resolve_attempt_id({"attempt_id": attempt_id}),
+                            operation,
+                            (
+                                _init_body_invalid_check(str(exc)),
+                            ),
+                        )
+                    )
 
             if operation == "kanban_create" and not payload.get(
                 "lifecycle_contract_v1"
@@ -3608,6 +3649,7 @@ _IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 _IDEMPOTENCY_KEY_REQUIRED = "IDEMPOTENCY_KEY_REQUIRED"
 _PUBLIC_REQUEST_NORMALIZATION_FAILED = "PUBLIC_REQUEST_NORMALIZATION_FAILED"
 _STALE_DERIVED_STATE = "STALE_DERIVED_STATE"
+_INITIATIVE_LEDGER_BODY_INVALID = "INITIATIVE_LEDGER_BODY_INVALID"
 
 _BOUNDARY_SOURCE = "adrian-kanban"
 _BOUNDARY_DESTINATION = "adrian-kanban"
@@ -3700,6 +3742,39 @@ def _rejection(
         )
     )
     return collector.rejection().as_dict()
+
+
+def _init_body_invalid_check(reason: str) -> FailedCheck:
+    """Build the structured INITIATIVE_LEDGER_BODY_INVALID check.
+
+    Emitted at the public request normalization boundary, before any
+    WriteGate approval row is created and before any command is submitted,
+    so a malformed body never reaches the approval flow. The check carries
+    the exact accepted template so the session agent can correct the body
+    and retry without reading implementation internals.
+    """
+    return FailedCheck(
+        code=_INITIATIVE_LEDGER_BODY_INVALID,
+        target="body",
+        expected=(
+            "an initiative ledger body: the first line is exactly "
+            "'# [[INITIATIVE_LEDGER]]', followed exactly once, in this "
+            "order, by the headings '## Initiative', '### Objective', "
+            "'### Board and workspace context', '### Authoritative "
+            "artifacts', '### Cleared outcomes', '### Open items', "
+            "'### Related task cards', '### Constraints', and "
+            "'### Cold-session continuation'"
+        ),
+        observed=reason,
+        accepted_format=INITIATIVE_LEDGER_BODY_TEMPLATE,
+        remediation=(
+            "Correct the body to the exact ledger format shown in "
+            "accepted_format and retry kanban_create_initiative. No "
+            "approval row was created and no initiative state changed."
+        ),
+        responsible_actor="session_agent",
+        retry="same_operation",
+    )
 
 
 def _preflight_object_type_operation_boundaries(
