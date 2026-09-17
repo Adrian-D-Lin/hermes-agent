@@ -33,6 +33,7 @@ def _canonical_digest(payload: dict[str, Any]) -> str:
 
 
 _OPERATION_PRESENTATION = {
+    "kanban_create_initiative": ("kanban-create", "create"),
     "kanban_update_initiative": ("kanban-update", "update"),
     "kanban_transition_initiative": ("kanban-transition", "transition"),
 }
@@ -73,8 +74,15 @@ class InitiativeMutationApprovalCoordinator:
             raise ValueError("payload must not contain approval_id before preparation")
         session_id = _nonblank(session_id, "session_id")
         turn_id = _nonblank(turn_id, "turn_id")
-        initiative_id = _nonblank(payload.get("initiative_id"), "initiative_id")
         board = _nonblank(payload.get("board"), "board")
+        if operation == "kanban_create_initiative":
+            initiative_id = None
+            proposed_creation_id = _nonblank(
+                payload.get("initiative_id"), "initiative_id"
+            )
+        else:
+            initiative_id = _nonblank(payload.get("initiative_id"), "initiative_id")
+            proposed_creation_id = None
         digest = _canonical_digest(payload)
         request_id = f"{request_prefix}:{turn_id}:{digest[:16]}"
         approval_id = f"{request_id}:approval"
@@ -88,12 +96,25 @@ class InitiativeMutationApprovalCoordinator:
             conn.commit()
             row = self._approval_row(conn, request_id)
             host = None
+            if row is not None:
+                expected_version = row["expected_version"]
             if row is None:
-                expected_version = self._initiative_version(
-                    conn,
-                    initiative_id=initiative_id,
-                    board=board,
-                )
+                if operation == "kanban_create_initiative":
+                    existing = conn.execute(
+                        "SELECT 1 FROM adrian_kanban_cards "
+                        "WHERE initiative_id = ? AND board_slug = ? "
+                        "AND card_type = 'initiative' AND task_id IS NULL",
+                        (proposed_creation_id, board),
+                    ).fetchone()
+                    if existing is not None:
+                        raise ValueError("initiative card already exists")
+                    expected_version = 0
+                else:
+                    expected_version = self._initiative_version(
+                        conn,
+                        initiative_id=initiative_id,
+                        board=board,
+                    )
                 authorizer = mint_current_tailscale_authorizer(
                     request_id=request_id,
                     issued_at=now,
@@ -107,7 +128,7 @@ class InitiativeMutationApprovalCoordinator:
                         request_id=request_id,
                         operation=operation,
                         initiative_id=initiative_id,
-                        proposed_creation_id=None,
+                        proposed_creation_id=proposed_creation_id,
                         expected_version=expected_version,
                         canonical_digest=digest,
                         session_id=session_id,
@@ -123,6 +144,8 @@ class InitiativeMutationApprovalCoordinator:
                 approval_id=approval_id,
                 operation=operation,
                 initiative_id=initiative_id,
+                proposed_creation_id=proposed_creation_id,
+                expected_version=expected_version,
                 digest=digest,
                 session_id=session_id,
             )
@@ -141,8 +164,9 @@ class InitiativeMutationApprovalCoordinator:
                     request_id=request_id,
                     command=json.dumps(payload, indent=2, sort_keys=True),
                     description=(
-                        f"Apply this exact Initiative Tracker {operation_label}. No initiative "
-                        "state changes unless this approval is accepted once."
+                        f"Apply this exact Initiative Tracker {operation_label}. "
+                        "No initiative state changes unless this approval is "
+                        "accepted once."
                     ),
                     session_key=session_id,
                     timeout_seconds=300,
@@ -246,21 +270,33 @@ class InitiativeMutationApprovalCoordinator:
         *,
         approval_id: str,
         operation: str,
-        initiative_id: str,
+        initiative_id: str | None,
+        proposed_creation_id: str | None,
+        expected_version: int,
         digest: str,
         session_id: str,
     ) -> None:
         if row is None:
-            raise ValueError("initiative update approval was not persisted")
+            raise ValueError("initiative mutation approval was not persisted")
+        if operation == "kanban_create_initiative":
+            target_fields = {
+                "initiative_id": None,
+                "proposed_creation_id": proposed_creation_id,
+                "expected_version": 0,
+            }
+        else:
+            target_fields = {
+                "initiative_id": initiative_id,
+                "proposed_creation_id": None,
+            }
         expected = {
             "approval_id": approval_id,
             "operation": operation,
-            "initiative_id": initiative_id,
-            "proposed_creation_id": None,
             "canonical_digest": digest,
             "requires_distinct_authorizer": 0,
             "session_id": session_id,
         }
+        expected.update(target_fields)
         for field, value in expected.items():
             if row[field] != value:
                 raise ValueError(

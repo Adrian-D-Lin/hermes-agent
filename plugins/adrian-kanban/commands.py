@@ -124,6 +124,18 @@ RECOGNIZED_OPERATIONS = (
     READ_ONLY_OPERATIONS | ORDINARY_TASK_OPERATIONS | INITIATIVE_OPERATIONS
 )
 
+# Immutable route map: (operation, object_type, identifier_field) -> accepted
+# operation.  The object-boundary preflight consults this map to reject
+# mismatched object/operation pairs before any state change.
+_OBJECT_OPERATION_ROUTE_MAP: MappingProxyType[
+    tuple[str, str, str], str
+] = MappingProxyType({
+    ("kanban_create", "initiative", "task_id"): "kanban_create_initiative",
+    ("kanban_create_initiative", "task", "initiative_id"): "kanban_create",
+    ("kanban_complete", "initiative", "task_id"): "kanban_close_initiative",
+    ("kanban_close_initiative", "task", "initiative_id"): "kanban_complete",
+})
+
 TOOL_SCHEMAS: dict[str, Any] = {
     "kanban_show": {
         "name": "kanban_show",
@@ -211,7 +223,15 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_create": {
         "name": "kanban_create",
-        "description": ("Create a new ordinary kanban task at both identity levels."),
+        "description": (
+            "Create a new ordinary kanban task card on the resolved board. "
+            "This is the ordinary-task creation route. It accepts an "
+            "initiative_id only as the parent initiative context for the new "
+            "task; it does not create, update, or route initiative lifecycle "
+            "state. Every ordinary task created on this route requires an "
+            "active registry-backed lifecycle_contract_v1. Standalone "
+            "initiative work routes to kanban_create_initiative."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -275,6 +295,49 @@ TOOL_SCHEMAS: dict[str, Any] = {
                         "Optional immutable lifecycle handoff declaration."
                     ),
                 },
+                "lifecycle_contract_v1": {
+                    "type": "object",
+                    "description": (
+                        "Bounded lifecycle contract object required for "
+                        "every ordinary task created on this route. Contains "
+                        "version, "
+                        "step, baseline_refs, governing_source_refs, "
+                        "prior_record_refs, and optional segment/segment_"
+                        "workspace/predecessor references."
+                    ),
+                    "properties": {
+                        "version": {
+                            "type": "integer",
+                            "enum": [1],
+                        },
+                        "step": {"type": "string"},
+                        "baseline_refs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "governing_source_refs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "prior_record_refs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "segment_id": {"type": ["string", "null"]},
+                        "segment_workspace_id": {
+                            "type": ["string", "null"],
+                        },
+                        "predecessor_ref": {"type": ["string", "null"]},
+                    },
+                    "required": [
+                        "version",
+                        "step",
+                        "baseline_refs",
+                        "governing_source_refs",
+                        "prior_record_refs",
+                    ],
+                    "additionalProperties": False,
+                },
                 "model": {
                     "type": "string",
                     "description": "Optional model reference.",
@@ -302,6 +365,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 "title",
                 "assignee",
                 "idempotency_key",
+                "lifecycle_contract_v1",
             ],
             "additionalProperties": False,
         },
@@ -714,7 +778,14 @@ TOOL_SCHEMAS: dict[str, Any] = {
     },
     "kanban_create_initiative": {
         "name": "kanban_create_initiative",
-        "description": ("Create a new kanban initiative."),
+        "description": (
+            "Create a new lifecycle-backed kanban initiative card on the "
+            "resolved board. This is the initiative-creation route and the "
+            "route for standalone initiative work. It does not create or "
+            "route ordinary task state. For ordinary task creation, use "
+            "kanban_create with an active lifecycle_contract_v1; every "
+            "ordinary task created on that route requires the contract."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -732,7 +803,11 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "approval_id": {
                     "type": "string",
-                    "description": "Approval reference authorizing creation.",
+                    "description": (
+                        "Optional host-prepared approval reference. Public callers "
+                        "normally omit it so the server presents and records the "
+                        "exact creation approval."
+                    ),
                 },
                 "idempotency_key": {
                     "type": "string",
@@ -751,7 +826,6 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 "initiative_id",
                 "title",
                 "body",
-                "approval_id",
                 "idempotency_key",
             ],
             "additionalProperties": False,
@@ -1083,9 +1157,65 @@ class _ModelToolRequestNormalizer:
                 raise ValueError("public board mismatch")
             payload["board"] = board
 
+            if operation == "kanban_create" and not payload.get(
+                "lifecycle_contract_v1"
+            ):
+                return self._boundary._finish_response(
+                    _rejection_from_checks(
+                        _resolve_attempt_id({"attempt_id": attempt_id}),
+                        operation,
+                        (
+                            FailedCheck(
+                                code="LIFECYCLE_CONTRACT_REQUIRED",
+                                target="lifecycle_contract_v1",
+                                expected=(
+                                    "an active registry-backed "
+                                    "lifecycle_contract_v1 object for "
+                                    "lifecycle-backed task creation"
+                                ),
+                                observed=(
+                                    "lifecycle_contract_v1 was not supplied"
+                                ),
+                                accepted_format=(
+                                    "a lifecycle_contract_v1 object with "
+                                    "version, step, baseline_refs, "
+                                    "governing_source_refs, "
+                                    "prior_record_refs, and optional "
+                                    "segment/segment_workspace/"
+                                    "predecessor_ref fields"
+                                ),
+                                remediation=(
+                                    "Use kanban_create_initiative for "
+                                    "standalone initiative work. For an "
+                                    "ordinary lifecycle task, retry "
+                                    "kanban_create with the active "
+                                    "registry-backed contract."
+                                ),
+                                responsible_actor="session_agent",
+                                retry="same_operation",
+                            ),
+                        ),
+                    )
+                )
+
             target = _target_for_operation(operation, payload)
             if not isinstance(target, str) or not target.strip():
                 raise ValueError("target must be nonblank str")
+
+            # Object-type / operation boundary preflight: reject before any
+            # approval preparation, capability minting, or command submission
+            # when the target identifier refers to the wrong object type.
+            # Opens a read-only connection; no state is changed on rejection.
+            with contextlib.closing(
+                sqlite3.connect(self._boundary.database_path)
+            ) as _preflight_conn:
+                _preflight_conn.row_factory = sqlite3.Row
+                _preflight_object_type_operation_boundaries(
+                    _preflight_conn,
+                    operation,
+                    board,
+                    payload,
+                )
 
             if "gate_override" in payload and operation in (
                 "kanban_transition_initiative",
@@ -1243,6 +1373,7 @@ class _ModelToolRequestNormalizer:
                 )
 
             if operation in (
+                "kanban_create_initiative",
                 "kanban_update_initiative",
                 "kanban_transition_initiative",
             ) and "approval_id" not in payload:
@@ -3569,6 +3700,165 @@ def _rejection(
         )
     )
     return collector.rejection().as_dict()
+
+
+def _preflight_object_type_operation_boundaries(
+    conn: sqlite3.Connection,
+    operation: str,
+    board: str,
+    payload: dict[str, Any],
+) -> None:
+    """Reject an operation whose target identifier refers to the wrong
+    object type on the resolved board.
+
+    This is a lean, deterministic, read-only preflight that queries
+    ``adrian_kanban_cards`` identity rows on the resolved board. It runs
+    after board/target resolution and before any approval preparation or
+    command submission, so no state is changed on rejection.
+
+    Mismatch semantics
+    ------------------
+    * Ordinary-task mutations (including ``kanban_create``) whose
+      ``task_id`` points at an initiative card: reject with the accepted
+      initiative operation.
+    * Initiative mutations (including ``kanban_create_initiative``) whose
+      ``initiative_id`` points at an ordinary task card: reject with the
+      accepted task operation.
+    * ``kanban_link`` validates both endpoints; either endpoint pointing
+      at the wrong object type rejects.
+    * Unknown identifiers are left to normal handler validation.
+
+    Exact counterpart routes (from ``_OBJECT_OPERATION_ROUTE_MAP``):
+    * create <-> create_initiative
+    * complete -> close_initiative for initiative target
+    * close_initiative -> complete for task target
+
+    Other mismatches list the bounded opposite mutation family.
+    """
+    if operation not in RECOGNIZED_OPERATIONS:
+        return
+    if operation in READ_ONLY_OPERATIONS:
+        return
+
+    checks: list[FailedCheck] = []
+
+    def _query_identity(identifier: str) -> str | None:
+        """Return 'task', 'initiative', or None for an identifier on *board*.
+        A task row with task_id = *identifier* → 'task'.
+        An initiative row with initiative_id = *identifier* → 'initiative'.
+        """
+        task_row = conn.execute(
+            "SELECT card_type FROM adrian_kanban_cards "
+            "WHERE task_id = ? AND board_slug = ?",
+            (identifier, board),
+        ).fetchone()
+        if task_row is not None and task_row["card_type"] == "task":
+            return "task"
+        init_row = conn.execute(
+            "SELECT card_type FROM adrian_kanban_cards "
+            "WHERE initiative_id = ? AND task_id IS NULL AND board_slug = ?",
+            (identifier, board),
+        ).fetchone()
+        if init_row is not None and init_row["card_type"] == "initiative":
+            return "initiative"
+        return None
+
+    def _reject_mismatch(
+        identifier_field: str,
+        identifier: str,
+        observed_type: str,
+    ) -> None:
+        """Build and store a FailedCheck for a mismatch, consulting the
+        route map for the exact accepted operation when available."""
+        route_key = (operation, observed_type, identifier_field)
+        accepted_operation = _OBJECT_OPERATION_ROUTE_MAP.get(route_key)
+        if accepted_operation is not None:
+            accepted_format = accepted_operation
+            remediation = (
+                f"The identifier {identifier!r} in field "
+                f"{identifier_field!r} refers to a {observed_type} card on "
+                f"board {board!r}. Operation {operation!r} targets the "
+                f"opposite object type. Use {accepted_operation!r} instead."
+            )
+        else:
+            # Generic fallback for operations not in the exact route map.
+            if observed_type == "initiative":
+                family = (
+                    "kanban_update_initiative, "
+                    "kanban_transition_initiative, "
+                    "kanban_close_initiative"
+                )
+                remediation = (
+                    f"The identifier {identifier!r} in field "
+                    f"{identifier_field!r} refers to an initiative card on "
+                    f"board {board!r}. Operation {operation!r} is an "
+                    f"ordinary-task operation. Use one of: {family}."
+                )
+            else:
+                family = (
+                    "kanban_complete, kanban_block, kanban_unblock, "
+                    "kanban_comment, kanban_heartbeat, kanban_attach, "
+                    "kanban_attach_url, kanban_request_changes, "
+                    "kanban_request_review, kanban_link"
+                )
+                remediation = (
+                    f"The identifier {identifier!r} in field "
+                    f"{identifier_field!r} refers to an ordinary task card "
+                    f"on board {board!r}. Operation {operation!r} is an "
+                    f"initiative operation. Use one of: {family}."
+                )
+            accepted_format = (
+                f"one of the named operations targeting this "
+                f"{observed_type} card"
+            )
+        checks.append(
+            FailedCheck(
+                code="OBJECT_TYPE_OPERATION_MISMATCH",
+                target=identifier_field,
+                expected=(
+                    f"an identifier of the object type that "
+                    f"{operation!r} mutates on board {board!r}"
+                ),
+                observed=f"{identifier!r} is a {observed_type} card",
+                accepted_format=accepted_format,
+                remediation=remediation,
+                responsible_actor="session_agent",
+                retry="return_route",
+            )
+        )
+
+    # --- kanban_link: validate both endpoints ---
+    if operation == "kanban_link":
+        parent_id = payload.get("parent_id")
+        child_id = payload.get("child_id")
+        for field_name, value in (("parent_id", parent_id), ("child_id", child_id)):
+            if not (type(value) is str and value.strip()):
+                continue
+            obs = _query_identity(value.strip())
+            if obs == "initiative":
+                _reject_mismatch(field_name, value.strip(), obs)
+
+    # --- ordinary-task mutations: check task_id ---
+    if (
+        operation in ORDINARY_TASK_OPERATIONS
+        and operation != "kanban_link"
+    ):
+        task_id = payload.get("task_id")
+        if type(task_id) is str and task_id.strip():
+            obs = _query_identity(task_id.strip())
+            if obs == "initiative":
+                _reject_mismatch("task_id", task_id.strip(), obs)
+
+    # --- initiative mutations: check initiative_id ---
+    if operation in INITIATIVE_OPERATIONS:
+        initiative_id = payload.get("initiative_id")
+        if type(initiative_id) is str and initiative_id.strip():
+            obs = _query_identity(initiative_id.strip())
+            if obs == "task":
+                _reject_mismatch("initiative_id", initiative_id.strip(), obs)
+
+    if checks:
+        raise CommandRejected(failed_checks=tuple(checks))
 
 
 def command_boundary(action: str, **fields: Any) -> dict[str, Any]:

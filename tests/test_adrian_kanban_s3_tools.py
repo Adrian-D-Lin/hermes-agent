@@ -346,9 +346,16 @@ def test_registration_is_complete_scoped_and_override_explicit(commands_module):
 
 def test_each_tool_delegates_to_its_own_operation_without_late_binding(
     commands_module,
+    monkeypatch,
 ):
     context = _RecordingContext()
     boundary = _RecordingBoundary()
+    boundary.database_path = ":memory:"
+    monkeypatch.setattr(
+        commands_module,
+        "_preflight_object_type_operation_boundaries",
+        lambda conn, operation, board, payload: None,
+    )
     board_calls = []
 
     def board_resolver(operation, args, runtime_fields):
@@ -367,6 +374,7 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
         if operation in commands_module.INITIATIVE_OPERATIONS:
             supplied["initiative_id"] = "initiative-1"
             if operation in {
+                "kanban_create_initiative",
                 "kanban_update_initiative",
                 "kanban_transition_initiative",
             }:
@@ -378,6 +386,8 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
             supplied.update(parent_id="task-parent", child_id="task-child")
         elif operation in commands_module.ORDINARY_TASK_OPERATIONS:
             supplied["task_id"] = "task-1"
+            if operation == "kanban_create":
+                supplied["lifecycle_contract_v1"] = {"version": 1}
         elif operation in {"kanban_show", "kanban_attachments"}:
             supplied["task_id"] = "task-1"
         if operation not in commands_module.READ_ONLY_OPERATIONS:
