@@ -1,4 +1,4 @@
-"""Host-owned WriteGate approval flow for public initiative updates."""
+"""Host-owned WriteGate approval flow for public initiative mutations."""
 
 from __future__ import annotations
 
@@ -32,8 +32,14 @@ def _canonical_digest(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-class InitiativeUpdateApprovalCoordinator:
-    """Prepare, present, and persist one exact initiative-update approval."""
+_OPERATION_PRESENTATION = {
+    "kanban_update_initiative": ("kanban-update", "update"),
+    "kanban_transition_initiative": ("kanban-transition", "transition"),
+}
+
+
+class InitiativeMutationApprovalCoordinator:
+    """Prepare, present, and persist one exact initiative-mutation approval."""
 
     def __init__(
         self,
@@ -51,11 +57,16 @@ class InitiativeUpdateApprovalCoordinator:
 
     def authorize(
         self,
+        operation: str,
         payload: dict[str, Any],
         *,
         session_id: str,
         turn_id: str,
     ) -> dict[str, Any]:
+        try:
+            request_prefix, operation_label = _OPERATION_PRESENTATION[operation]
+        except (KeyError, TypeError):
+            raise ValueError("unsupported initiative mutation operation") from None
         if not isinstance(payload, dict):
             raise ValueError("payload must be a dict")
         if "approval_id" in payload:
@@ -65,7 +76,7 @@ class InitiativeUpdateApprovalCoordinator:
         initiative_id = _nonblank(payload.get("initiative_id"), "initiative_id")
         board = _nonblank(payload.get("board"), "board")
         digest = _canonical_digest(payload)
-        request_id = f"kanban-update:{turn_id}:{digest[:16]}"
+        request_id = f"{request_prefix}:{turn_id}:{digest[:16]}"
         approval_id = f"{request_id}:approval"
         now = self._now()
 
@@ -94,7 +105,7 @@ class InitiativeUpdateApprovalCoordinator:
                     KanbanInitiativeApprovalPreparation(
                         approval_id=approval_id,
                         request_id=request_id,
-                        operation="kanban_update_initiative",
+                        operation=operation,
                         initiative_id=initiative_id,
                         proposed_creation_id=None,
                         expected_version=expected_version,
@@ -110,6 +121,7 @@ class InitiativeUpdateApprovalCoordinator:
             self._validate_row(
                 row,
                 approval_id=approval_id,
+                operation=operation,
                 initiative_id=initiative_id,
                 digest=digest,
                 session_id=session_id,
@@ -129,7 +141,7 @@ class InitiativeUpdateApprovalCoordinator:
                     request_id=request_id,
                     command=json.dumps(payload, indent=2, sort_keys=True),
                     description=(
-                        "Apply this exact Initiative Tracker update. No initiative "
+                        f"Apply this exact Initiative Tracker {operation_label}. No initiative "
                         "state changes unless this approval is accepted once."
                     ),
                     session_key=session_id,
@@ -233,6 +245,7 @@ class InitiativeUpdateApprovalCoordinator:
         row: Any,
         *,
         approval_id: str,
+        operation: str,
         initiative_id: str,
         digest: str,
         session_id: str,
@@ -241,7 +254,7 @@ class InitiativeUpdateApprovalCoordinator:
             raise ValueError("initiative update approval was not persisted")
         expected = {
             "approval_id": approval_id,
-            "operation": "kanban_update_initiative",
+            "operation": operation,
             "initiative_id": initiative_id,
             "proposed_creation_id": None,
             "canonical_digest": digest,
@@ -251,7 +264,7 @@ class InitiativeUpdateApprovalCoordinator:
         for field, value in expected.items():
             if row[field] != value:
                 raise ValueError(
-                    f"initiative update approval {field} does not match proposal"
+                    f"initiative mutation approval {field} does not match proposal"
                 )
 
     @staticmethod
@@ -269,10 +282,10 @@ class InitiativeUpdateApprovalCoordinator:
         )
         if authorizer._canonical_for_writegate() != row["authorizer_evidence"]:
             raise ValueError(
-                "initiative update approval belongs to a different authenticated "
-                "transport; submit a fresh update request"
+                "initiative mutation approval belongs to a different authenticated "
+                "transport; submit a fresh mutation request"
             )
         return KanbanInitiativeApprovalHost(authorizer)
 
 
-__all__ = ["InitiativeUpdateApprovalCoordinator"]
+__all__ = ["InitiativeMutationApprovalCoordinator"]

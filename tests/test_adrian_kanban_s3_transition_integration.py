@@ -26,6 +26,7 @@ from tests.test_adrian_kanban_s3_dev3_checkpoint import (
     _payload as _dev3_payload,
     _seed_dev3_cycle,
 )
+from tests.test_adrian_kanban_s3_override_approval import evidence
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -221,10 +222,130 @@ def test_transition_tool_exposes_route_specific_close_reference(commands_module)
     assert "phase_close_ref" not in parameters["required"]
     assert parameters["properties"]["phase_close_ref"]["type"] == "string"
     ordinary_route, override_route = parameters["oneOf"]
-    assert set(ordinary_route["required"]) == {"phase_close_ref", "approval_id"}
+    assert ordinary_route["required"] == ["phase_close_ref"]
     assert ordinary_route["not"] == {"required": ["gate_override"]}
     assert override_route["required"] == ["gate_override"]
-    assert override_route["not"] == {"required": ["phase_close_ref", "approval_id"]}
+    assert override_route["not"] == {
+        "anyOf": [
+            {"required": ["phase_close_ref"]},
+            {"required": ["approval_id"]},
+        ]
+    }
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_public_ordinary_transition_obtains_exact_writegate_approval(
+    commands_module, close_case, monkeypatch, approved
+):
+    case = close_case
+    close_payload = {
+        "initiative_id": "initiative-1",
+        "update_kind": "phase_result",
+        "update": case.update,
+        "approval_id": "approval-close",
+        "board": "orchestrator",
+    }
+    approve_close(case.path, close_payload, version=2)
+    closed = submit_close(
+        _boundary(
+            commands_module,
+            case.path,
+            case.provider,
+            phase_result_preparer=lambda *_: _proof(case),
+        ),
+        close_payload,
+        version=2,
+    )
+    assert closed["result"] == "ACCEPTED", closed
+    _seed_reconciliation(
+        case.path,
+        result_id="reconcile-public-close",
+        from_phase="D4",
+        to_phase="DEV1",
+    )
+
+    boundary = commands_module._CommandBoundary(
+        database_path=str(case.path),
+        provider=case.provider,
+        handlers={
+            "kanban_transition_initiative": commands_module._handle_transition_initiative
+        },
+        state_resolver=lambda conn, operation, target, payload: conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards "
+            "WHERE initiative_id=? AND board_slug=?",
+            (target, payload["board"]),
+        ).fetchone()[0],
+        known_profiles={"default"},
+    )
+    normalizer = commands_module._ModelToolRequestNormalizer(
+        boundary,
+        board_resolver=lambda operation, args, runtime: (
+            "orchestrator",
+            None,
+            "default",
+        ),
+    )
+    approval_module = importlib.import_module(
+        f"{commands_module.__package__}.initiative_mutation_approval"
+    )
+    monkeypatch.setattr(
+        approval_module,
+        "mint_current_tailscale_authorizer",
+        lambda *, request_id, issued_at, ttl_seconds: evidence(
+            request_id, issued_at
+        ),
+    )
+    presentations = []
+
+    def decide(**request):
+        presentations.append(request)
+        return {
+            "approved": approved,
+            "decision": "once" if approved else "deny",
+            "decision_at": "2026-09-17T01:00:00Z",
+        }
+
+    monkeypatch.setattr(approval_module, "request_write_gate_approval", decide)
+    result = normalizer.submit(
+        "kanban_transition_initiative",
+        {
+            "initiative_id": "initiative-1",
+            "to_phase": "DEV1",
+            "reconciliation_ref": "reconcile-public-close",
+            "phase_close_ref": "d4-close",
+            "idempotency_key": "public-transition-1",
+        },
+        {
+            "session_id": "session-initiative",
+            "turn_id": "turn-transition-1",
+            "api_request_id": "api-transition-1",
+            "user_task": "Move the initiative only after I approve the exact transition.",
+        },
+    )
+
+    assert result["result"] == ("ACCEPTED" if approved else "REJECTED"), result
+    assert len(presentations) == 1
+    assert '"to_phase": "DEV1"' in presentations[0]["command"]
+    with sqlite3.connect(case.path) as conn:
+        approval = conn.execute(
+            "SELECT operation, expected_version, state "
+            "FROM write_gate_kanban_approvals "
+            "WHERE operation='kanban_transition_initiative'"
+        ).fetchone()
+        phase = conn.execute(
+            "SELECT to_phase FROM initiative_transitions "
+            "WHERE initiative_id='initiative-1' ORDER BY transition_id DESC LIMIT 1"
+        ).fetchone()[0]
+        version = conn.execute(
+            "SELECT record_version FROM adrian_kanban_cards "
+            "WHERE initiative_id='initiative-1'"
+        ).fetchone()[0]
+    assert approval == (
+        "kanban_transition_initiative",
+        3,
+        "consumed" if approved else "cancelled",
+    )
+    assert (phase, version) == (("DEV1", 4) if approved else ("D4", 3))
 
 
 def test_dev2_transition_preflights_then_materializes_before_mutation_transaction(

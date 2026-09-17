@@ -66,7 +66,7 @@ def public_update(commands_module, tmp_path, monkeypatch):
     path, provider = _database(tmp_path, monkeypatch, commands_module)
     _seed_initiative(path)
     approval_module = importlib.import_module(
-        f"{commands_module.__package__}.initiative_update_approval"
+        f"{commands_module.__package__}.initiative_mutation_approval"
     )
     monkeypatch.setattr(
         approval_module,

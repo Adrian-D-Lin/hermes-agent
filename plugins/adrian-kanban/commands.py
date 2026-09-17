@@ -15,7 +15,7 @@ from typing import Any, Callable
 from .attachments import PreparedAttachment, prepare_url_attachment
 from .phase_admission import prepare_phase_result
 from .phase_delivery import PhaseDeliveryError, verify_transition_delivery
-from .initiative_update_approval import InitiativeUpdateApprovalCoordinator
+from .initiative_mutation_approval import InitiativeMutationApprovalCoordinator
 from .repository_reconciliation import (
     PreparedRepositoryReconciliation,
     RepositoryReconciliationError,
@@ -853,7 +853,11 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "approval_id": {
                     "type": "string",
-                    "description": "Approval reference authorizing the transition.",
+                    "description": (
+                        "Optional host-prepared approval reference. Public callers "
+                        "normally omit it so the server presents and records the "
+                        "exact transition approval."
+                    ),
                 },
                 "idempotency_key": {
                     "type": "string",
@@ -894,12 +898,17 @@ TOOL_SCHEMAS: dict[str, Any] = {
             ],
             "oneOf": [
                 {
-                    "required": ["phase_close_ref", "approval_id"],
+                    "required": ["phase_close_ref"],
                     "not": {"required": ["gate_override"]},
                 },
                 {
                     "required": ["gate_override"],
-                    "not": {"required": ["phase_close_ref", "approval_id"]},
+                    "not": {
+                        "anyOf": [
+                            {"required": ["phase_close_ref"]},
+                            {"required": ["approval_id"]},
+                        ]
+                    },
                 },
             ],
             "additionalProperties": False,
@@ -995,11 +1004,11 @@ class _ModelToolRequestNormalizer:
         boundary: Any,
         *,
         board_resolver: Any = None,
-        initiative_update_approval: Any = None,
+        initiative_mutation_approval: Any = None,
     ) -> None:
         self._boundary = boundary
         self._board_resolver = board_resolver
-        self._initiative_update_approval = initiative_update_approval
+        self._initiative_mutation_approval = initiative_mutation_approval
 
     def submit(
         self,
@@ -1233,24 +1242,29 @@ class _ModelToolRequestNormalizer:
                     override_now=int(time.time()),
                 )
 
-            if operation == "kanban_update_initiative" and "approval_id" not in payload:
+            if operation in (
+                "kanban_update_initiative",
+                "kanban_transition_initiative",
+            ) and "approval_id" not in payload:
                 turn_id = runtime.get("turn_id")
                 if not (type(turn_id) is str and turn_id.strip()):
                     raise ValueError("turn_id must be a nonblank str")
                 if not (type(idempotency_key) is str and idempotency_key.strip()):
                     raise ValueError("idempotency_key must be a nonblank str")
-                stage = "initiative_update_preparation"
-                payload = self._boundary.prepare_public_initiative_update(
-                    payload,
-                    actor_profile=actor_profile.strip(),
-                )
-                approval_coordinator = self._initiative_update_approval
+                stage = "initiative_mutation_preparation"
+                if operation == "kanban_update_initiative":
+                    payload = self._boundary.prepare_public_initiative_update(
+                        payload,
+                        actor_profile=actor_profile.strip(),
+                    )
+                approval_coordinator = self._initiative_mutation_approval
                 if approval_coordinator is None:
-                    approval_coordinator = InitiativeUpdateApprovalCoordinator(
+                    approval_coordinator = InitiativeMutationApprovalCoordinator(
                         self._boundary.database_path
                     )
-                stage = "initiative_update_authorization"
+                stage = "initiative_mutation_authorization"
                 authorized = approval_coordinator.authorize(
+                    operation,
                     payload,
                     session_id=session_id.strip(),
                     turn_id=turn_id.strip(),

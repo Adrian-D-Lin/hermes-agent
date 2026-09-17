@@ -194,7 +194,7 @@ def reconciliation_case(commands_module, tmp_path, monkeypatch):
     _seed_initiative(path)
     case = _repository_case(commands_module, tmp_path, monkeypatch, path)
     approval = importlib.import_module(
-        f"{commands_module.__package__}.initiative_update_approval"
+        f"{commands_module.__package__}.initiative_mutation_approval"
     )
     monkeypatch.setattr(
         approval,
