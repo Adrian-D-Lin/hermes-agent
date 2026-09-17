@@ -5,6 +5,7 @@ import binascii
 import contextlib
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -87,6 +88,8 @@ from .workspace import (
     _retire_segment_workspace,
     _resolve_trusted_registry,
 )
+
+logger = logging.getLogger(__name__)
 
 # Public operation taxonomy. These sets are frozen by the ratified Canon
 # operation map and are consumed verbatim by every later S3 slice.
@@ -1005,6 +1008,7 @@ class _ModelToolRequestNormalizer:
         runtime_fields: dict[str, Any],
     ) -> dict[str, Any]:
         attempt_id = None
+        stage = "request_validation"
         try:
             if type(args) is not dict or type(runtime_fields) is not dict:
                 raise ValueError("args and runtime_fields must be dicts")
@@ -1049,6 +1053,7 @@ class _ModelToolRequestNormalizer:
             if not isinstance(session_id, str) or not session_id.strip():
                 raise ValueError("session_id must be nonblank str")
 
+            stage = "route_resolution"
             resolved = self._board_resolver(
                 operation,
                 dict(args),
@@ -1234,6 +1239,7 @@ class _ModelToolRequestNormalizer:
                     raise ValueError("turn_id must be a nonblank str")
                 if not (type(idempotency_key) is str and idempotency_key.strip()):
                     raise ValueError("idempotency_key must be a nonblank str")
+                stage = "initiative_update_preparation"
                 payload = self._boundary.prepare_public_initiative_update(
                     payload,
                     actor_profile=actor_profile.strip(),
@@ -1243,6 +1249,7 @@ class _ModelToolRequestNormalizer:
                     approval_coordinator = InitiativeUpdateApprovalCoordinator(
                         self._boundary.database_path
                     )
+                stage = "initiative_update_authorization"
                 authorized = approval_coordinator.authorize(
                     payload,
                     session_id=session_id.strip(),
@@ -1261,6 +1268,7 @@ class _ModelToolRequestNormalizer:
                 payload["approval_id"] = authorized["approval_id"]
                 attempt_id = authorized["request_id"]
 
+            stage = "command_submission"
             return self._boundary.submit(
                 operation,
                 attempt_id=attempt_id,
@@ -1304,7 +1312,85 @@ class _ModelToolRequestNormalizer:
                     ),
                 )
             )
-        except Exception:
+        except CommandRejected as exc:
+            return self._boundary._finish_response(
+                _rejection_from_checks(
+                    _resolve_attempt_id({"attempt_id": attempt_id}),
+                    operation,
+                    exc.failed_checks,
+                    exc.not_evaluated_checks,
+                )
+            )
+        except ValueError as exc:
+            diagnostic = str(exc)
+            authorizer_failure = "authenticated Tailscale transport" in diagnostic
+            if not authorizer_failure:
+                logger.error(
+                    "public model-tool normalization rejected: operation=%s "
+                    "attempt_id=%s stage=%s error_type=%s",
+                    operation,
+                    attempt_id,
+                    stage,
+                    type(exc).__name__,
+                )
+                return self._boundary._finish_response(
+                    self._boundary._rejection_internal(
+                        _resolve_attempt_id({"attempt_id": attempt_id}),
+                        operation,
+                        _PUBLIC_REQUEST_NORMALIZATION_FAILED,
+                    )
+                )
+            return self._boundary._finish_response(
+                _rejection_from_checks(
+                    _resolve_attempt_id({"attempt_id": attempt_id}),
+                    operation,
+                    (
+                        FailedCheck(
+                            code=(
+                                "AUTHORIZER_TRANSPORT_UNAVAILABLE"
+                                if authorizer_failure
+                                else "PUBLIC_REQUEST_INVALID"
+                            ),
+                            target=(
+                                "authorizer_transport"
+                                if authorizer_failure
+                                else operation
+                            ),
+                            expected=(
+                                "the exact prompt-submitting WebSocket authenticated by Tailscale"
+                                if authorizer_failure
+                                else "a request satisfying the public operation contract"
+                            ),
+                            observed=diagnostic,
+                            accepted_format=(
+                                "a Desktop prompt submitted through the authenticated Tailscale gateway connection"
+                                if authorizer_failure
+                                else "the model-facing tool schema and lifecycle data contract"
+                            ),
+                            remediation=(
+                                "Reconnect Desktop to the configured Tailscale gateway and retry the same operation."
+                                if authorizer_failure
+                                else "Correct the reported request field and retry the same operation."
+                            ),
+                            responsible_actor=(
+                                "system_operator"
+                                if authorizer_failure
+                                else "session_agent"
+                            ),
+                            retry="same_operation",
+                        ),
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.error(
+                "public model-tool normalization failed: operation=%s "
+                "attempt_id=%s stage=%s error_type=%s",
+                operation,
+                attempt_id,
+                stage,
+                type(exc).__name__,
+            )
             return self._boundary._finish_response(
                 self._boundary._rejection_internal(
                     _resolve_attempt_id({"attempt_id": attempt_id}),

@@ -4,7 +4,7 @@ description: >-
   by Hermes task/run persistence primitives.
   When selected, it replaces all 18 public Kanban operations and supplies the
   verified-input pre-tool hook. Native selection leaves it inert.
-version: 0.4.7
+version: 0.4.8
 author: NousResearch
 kind: standalone
 manifest_version: 2

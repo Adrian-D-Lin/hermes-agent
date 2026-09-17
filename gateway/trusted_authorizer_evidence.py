@@ -309,6 +309,26 @@ def mint_current_tailscale_authorizer(*, request_id, issued_at, ttl_seconds):
         else current_transport()
     )
     peer = getattr(transport, "_authenticated_tailscale_peer", None)
+    if not isinstance(transport, FanoutTransport) and not (
+        isinstance(peer, _AuthenticatedTailscalePeerState)
+        and peer in _authenticated_tailscale_peers
+    ):
+        # Connection-time whois is best-effort. Re-verify only the exact,
+        # server-created WebSocket that commissioned this turn; never infer
+        # authority from a session fanout or from model-supplied fields.
+        from tui_gateway.ws import WSTransport
+
+        if isinstance(transport, WSTransport):
+            address = getattr(transport, "_tailscale_peer_address", None)
+            connection_id = getattr(transport, "_tailscale_connection_id", None)
+            refreshed = _authenticate_tailscale_peer(
+                address,
+                connection_id=connection_id,
+                authenticated_at=issued_at,
+            )
+            if refreshed is not None:
+                transport._authenticated_tailscale_peer = refreshed
+                peer = refreshed
     if isinstance(transport, FanoutTransport):
         peers = [
             getattr(member, "_authenticated_tailscale_peer", None)
@@ -328,7 +348,12 @@ def mint_current_tailscale_authorizer(*, request_id, issued_at, ttl_seconds):
         not isinstance(peer, _AuthenticatedTailscalePeerState)
         or peer not in _authenticated_tailscale_peers
     ):
-        raise ValueError("authenticated Tailscale transport not bound")
+        state = (
+            "no exact prompt transport"
+            if transport is None
+            else f"{type(transport).__name__} has no verified Tailscale peer"
+        )
+        raise ValueError(f"authenticated Tailscale transport not bound: {state}")
     return TrustedAuthorizerEvidence._from_authenticated_peer(
         peer,
         request_id=request_id,

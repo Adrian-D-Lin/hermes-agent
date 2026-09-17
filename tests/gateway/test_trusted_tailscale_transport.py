@@ -274,6 +274,41 @@ def test_explicitly_authorityless_turn_cannot_borrow_output_transport(monkeypatc
         loop.close()
 
 
+def test_exact_websocket_reauthenticates_after_transient_connection_auth_failure(monkeypatch):
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return _whois_result(address=command[-1])
+
+    monkeypatch.setattr(trusted.subprocess, "run", fake_run)
+    loop = asyncio.new_event_loop()
+    try:
+        transport = WSTransport(
+            SimpleNamespace(),
+            loop,
+            peer="100.115.246.102:54321",
+            authenticated_tailscale_peer=None,
+            tailscale_peer_address="100.115.246.102",
+            tailscale_connection_id="ws-transient-auth",
+        )
+        authority_token = bind_authorizing_transport(transport)
+        try:
+            evidence = trusted.mint_current_tailscale_authorizer(
+                request_id="turn-retry-whois",
+                issued_at=1_001,
+                ttl_seconds=60,
+            )
+        finally:
+            reset_authorizing_transport(authority_token)
+    finally:
+        loop.close()
+
+    payload = json.loads(evidence._canonical_for_writegate())
+    assert calls == [["tailscale", "whois", "--json", "100.115.246.102"]]
+    assert payload["connection_id"] == "ws-transient-auth"
+
+
 def test_handle_ws_authenticates_and_binds_tailscale_peer(monkeypatch):
     authenticated_peer = object()
     captured = {}

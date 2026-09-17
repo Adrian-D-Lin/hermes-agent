@@ -97,6 +97,8 @@ class WSTransport:
         peer: str = "unknown",
         auth_identity: dict | None = None,
         authenticated_tailscale_peer: Any = None,
+        tailscale_peer_address: str | None = None,
+        tailscale_connection_id: str | None = None,
     ) -> None:
         self._ws = ws
         self._loop = loop
@@ -106,6 +108,11 @@ class WSTransport:
         #: and for the ``user_id`` the agent is built with (``server._session_auth_user_id``).
         self.auth_identity = auth_identity
         self._authenticated_tailscale_peer = authenticated_tailscale_peer
+        # Server-derived connection facts retained for a fail-closed whois
+        # recheck if connection-time Tailscale authentication was transiently
+        # unavailable. Neither value is accepted from an RPC payload.
+        self._tailscale_peer_address = tailscale_peer_address
+        self._tailscale_connection_id = tailscale_connection_id
         self._closed = False
         # Token-coalescing buffer. The lock guards the buffer + "armed" flag against worker threads
         # calling write(); the timer handle is only ever touched on the loop thread.
@@ -300,6 +307,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
         authenticated_tailscale_peer = None
+        tailscale_connection_id = uuid.uuid4().hex
         client = getattr(ws, "client", None)
         peer_host = getattr(client, "host", None)
         if isinstance(peer_host, str):
@@ -307,17 +315,24 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 authenticated_tailscale_peer = await asyncio.to_thread(
                     trusted._authenticate_tailscale_peer,
                     peer_host,
-                    connection_id=uuid.uuid4().hex,
+                    connection_id=tailscale_connection_id,
                     authenticated_at=int(time.time()),
                 )
             except Exception:
                 authenticated_tailscale_peer = None
+        _log.info(
+            "ws tailscale authority peer=%s authenticated=%s",
+            peer,
+            authenticated_tailscale_peer is not None,
+        )
         transport = WSTransport(
             ws,
             asyncio.get_running_loop(),
             peer=peer,
             auth_identity=auth_identity,
             authenticated_tailscale_peer=authenticated_tailscale_peer,
+            tailscale_peer_address=peer_host if isinstance(peer_host, str) else None,
+            tailscale_connection_id=tailscale_connection_id,
         )
         # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
         skin_payload = await asyncio.to_thread(server.resolve_skin)
