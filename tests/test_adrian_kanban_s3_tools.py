@@ -55,6 +55,15 @@ class _RecordingContext:
 class _RecordingBoundary:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
+        # Mirrors the production _CommandBoundary surface.
+        self._known_profiles = frozenset(
+            {
+                "default",
+                "independent-reviewer",
+                "test-authority-reviewer",
+                "builder-tester",
+            }
+        )
 
     def _finish_response(self, response):
         return response
@@ -394,7 +403,57 @@ def test_each_tool_delegates_to_its_own_operation_without_late_binding(
         elif operation in commands_module.ORDINARY_TASK_OPERATIONS:
             supplied["task_id"] = "task-1"
             if operation == "kanban_create":
-                supplied["lifecycle_contract_v1"] = {"version": 1}
+                # This generic delegation test uses a recording
+                # boundary; supply the full lifecycle contract,
+                # goal_mode, handoff declaration, manifest, and
+                # body so the preflight passes and the test
+                # remains about delegation, not contract
+                # validation.
+                supplied["lifecycle_contract_v1"] = {
+                    "version": 1,
+                    "step": "D2",
+                    "baseline_refs": ["Canon/design-lifecycle.md"],
+                    "governing_source_refs": ["2-design/review.md"],
+                    "prior_record_refs": [],
+                }
+                supplied["body"] = (
+                    "initiative_id: initiative-1\n"
+                    "step: D2\n"
+                )
+                supplied["goal_mode"] = True
+                supplied["handoff_requirements_v1"] = {
+                    "version": 1,
+                    "reviewer": "default",
+                    "fields": {
+                        "conclusion": {
+                            "type": "enum",
+                            "values": ["DRY", "NOT_DRY"],
+                        }
+                    },
+                }
+                supplied["task_input_manifest_v1"] = {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "workspace_path": "Canon/design-lifecycle.md",
+                            "sha256": "a" * 64,
+                            "source_kind": "git",
+                        },
+                        {
+                            "workspace_path": "2-design/review.md",
+                            "sha256": "b" * 64,
+                            "source_kind": "snapshot_attachment",
+                        },
+                    ],
+                    "context_ref": {},
+                    "snapshots": {
+                        "2-design/review.md": {
+                            "filename": "review.md",
+                            "content_type": "text/markdown",
+                            "content_base64": "aGVsbG8=",
+                        }
+                    },
+                }
         elif operation in {"kanban_show", "kanban_attachments"}:
             supplied["task_id"] = "task-1"
         if operation not in commands_module.READ_ONLY_OPERATIONS:

@@ -58,6 +58,15 @@ def _make_boundary(tmp_path):
         def __init__(self, database_path: str) -> None:
             self.database_path = database_path
             self.calls: list[tuple[str, dict]] = []
+            # Mirrors the production _CommandBoundary surface.
+            self._known_profiles = frozenset(
+                {
+                    "default",
+                    "independent-reviewer",
+                    "test-authority-reviewer",
+                    "builder-tester",
+                }
+            )
 
         def _finish_response(self, response):
             return response
@@ -161,6 +170,13 @@ def test_native_manifest_dict_passes_normalization(commands_module, tmp_path):
         "title": "Test task",
         "assignee": "builder",
         "idempotency_key": "key-test",
+        "body": "initiative_id: init-1\nstep: D2",
+        "goal_mode": True,
+        "handoff_requirements_v1": {
+            "version": 1,
+            "reviewer": "default",
+            "fields": {"conclusion": {"type": "text"}},
+        },
         "lifecycle_contract_v1": {
             "version": 1,
             "step": "D2",

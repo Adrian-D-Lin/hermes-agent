@@ -255,7 +255,17 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "body": {
                     "type": "string",
-                    "description": "Free-form task body or rationale.",
+                    "description": (
+                        "Required. Not free-form: the body must contain the "
+                        "exact anchor lines 'initiative_id: <initiative_id>' "
+                        "and 'step: <step>' as whole lines, where <initiative_id> "
+                        "and <step> are the exact values of the matching "
+                        "lifecycle_contract_v1 fields. When the contract "
+                        "carries a segment_id, the body must also contain the "
+                        "exact line 'segment_id: <segment_id>'. Missing or "
+                        "inexact anchor lines are rejected at the public "
+                        "request boundary."
+                    ),
                 },
                 "parents": {
                     "type": "array",
@@ -285,7 +295,14 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 },
                 "goal_mode": {
                     "type": "boolean",
-                    "description": "Optional goal mode.",
+                    "enum": [True],
+                    "description": (
+                        "Required. Must be true: every kanban_create on this "
+                        "route is goal-mode execution. Submit the literal "
+                        "boolean true; omitting the key, sending false, or "
+                        "sending any other value is rejected at the public "
+                        "request boundary."
+                    ),
                 },
                 "goal_max_turns": {
                     "type": "integer",
@@ -294,8 +311,69 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 "handoff_requirements_v1": {
                     "type": "object",
                     "description": (
-                        "Optional immutable lifecycle handoff declaration."
+                        "Required immutable lifecycle handoff DECLARATION for "
+                        "every kanban_create on this route. It declares which "
+                        "output fields the assigned reviewer must produce when "
+                        "reviewing the card; it is NOT the completed review "
+                        "output. Sending the completed output (for example a "
+                        "review_pass_log / angle_coverage / findings / "
+                        "conclusion object) is wrong and is rejected at the "
+                        "public request boundary. Top-level keys are exactly "
+                        "version, reviewer, and fields: version must be the "
+                        "integer 1; reviewer must be a known execution profile "
+                        "(default, builder-tester, test-authority-reviewer, "
+                        "independent-reviewer); fields is a nonempty object "
+                        "whose values are field declarations. Each field "
+                        "declaration uses the canonical permitted keys: "
+                        "type (text, boolean, list, or enum); list may also "
+                        "carry min_items (non-negative integer); enum must "
+                        "carry values (nonempty list of nonblank strings). "
+                        "The field-type-specific key combinations are "
+                        "canonicalized at runtime: type-only declarations "
+                        "for text/boolean, type plus optional min_items for "
+                        "list, and type plus values for enum; every other "
+                        "combination or key is rejected."
                     ),
+                    "properties": {
+                        "version": {
+                            "type": "integer",
+                            "enum": [1],
+                        },
+                        "reviewer": {
+                            "type": "string",
+                        },
+                        "fields": {
+                            "type": "object",
+                            "minProperties": 1,
+                            "additionalProperties": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "text",
+                                            "boolean",
+                                            "list",
+                                            "enum",
+                                        ],
+                                    },
+                                    "min_items": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                    },
+                                    "values": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "minItems": 1,
+                                    },
+                                },
+                                "required": ["type"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["version", "reviewer", "fields"],
+                    "additionalProperties": False,
                 },
                 "lifecycle_contract_v1": {
                     "type": "object",
@@ -404,6 +482,9 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 "idempotency_key",
                 "lifecycle_contract_v1",
                 "task_input_manifest_v1",
+                "body",
+                "goal_mode",
+                "handoff_requirements_v1",
             ],
             "additionalProperties": False,
         },
@@ -1292,6 +1373,30 @@ class _ModelToolRequestNormalizer:
                     operation,
                     board,
                     payload,
+                )
+
+            # Public-normalizer lifecycle-anchor preflight: surface specific
+            # structured rejections for the known kanban_create public
+            # contract errors (goal_mode, handoff declaration, body anchor
+            # lines) before any approval preparation or command submission.
+            # Runs after the object-type boundary so a wrong-family target
+            # still routes to the accepted counterpart operation first.
+            # Scoped to kanban_create: the lifecycle contract, goal_mode,
+            # and handoff declaration are required fields only on this
+            # route; initiative and ordinary-task routes do not use them.
+            anchor_checks = None
+            if operation == "kanban_create":
+                anchor_checks = _kanban_create_lifecycle_anchor_checks(
+                    payload,
+                    self._boundary._known_profiles,
+                )
+            if anchor_checks:
+                return self._boundary._finish_response(
+                    _rejection_from_checks(
+                        _resolve_attempt_id({"attempt_id": attempt_id}),
+                        operation,
+                        anchor_checks,
+                    )
                 )
 
             if "gate_override" in payload and operation in (
@@ -3778,6 +3883,231 @@ def _rejection(
         )
     )
     return collector.rejection().as_dict()
+
+
+_HANDOFF_DECLARATION_FORMAT = (
+    "a handoff declaration object with exactly keys version (integer 1), "
+    "reviewer (a known execution profile), and fields (nonempty object; each "
+    "field declaration has type text/boolean/list/enum, list may carry "
+    "min_items, enum must carry values)"
+)
+
+
+def _kanban_create_lifecycle_anchor_checks(
+    payload: dict[str, Any],
+    known_profiles: frozenset[str],
+) -> tuple[FailedCheck, ...] | None:
+    """Public-normalizer preflight for kanban_create lifecycle dispatches.
+
+    Runs before any boundary submission and surfaces specific structured
+    rejections for the known public-contract errors: a goal_mode that is
+    not the literal true, an invalid handoff declaration, and missing or
+    inexact mandatory body anchor lines. The handoff declaration is
+    validated by the canonical normalize_handoff_requirements; this
+    preflight inspects only the already-supplied raw contract values needed
+    to derive the exact body anchor lines and leaves all other contract
+    validation to the canonical handler. Returns None when the payload is
+    clean at this boundary.
+    """
+    checks: list[FailedCheck] = []
+
+    goal_mode = payload.get("goal_mode")
+    if goal_mode is not True:
+        checks.append(
+            FailedCheck(
+                code="GOAL_MODE_REQUIRED",
+                target="goal_mode",
+                expected=(
+                    "the boolean true: every kanban_create on this route is "
+                    "goal-mode execution"
+                ),
+                observed=(
+                    "goal_mode was omitted"
+                    if goal_mode is None
+                    else f"goal_mode was {goal_mode!r}"
+                ),
+                accepted_format="the literal boolean true",
+                remediation=(
+                    "Set goal_mode to true and retry kanban_create. No card "
+                    "or contract state was created."
+                ),
+                responsible_actor="session_agent",
+                retry="same_operation",
+            )
+        )
+
+    raw_handoff = payload.get("handoff_requirements_v1")
+    if raw_handoff is None:
+        checks.append(
+            FailedCheck(
+                code="HANDOFF_REQUIREMENTS_REQUIRED",
+                target="handoff_requirements_v1",
+                expected=(
+                    "a handoff declaration object: it declares the output "
+                    "fields the reviewer must produce; it is not the "
+                    "completed review output"
+                ),
+                observed="handoff_requirements_v1 was not supplied",
+                accepted_format=_HANDOFF_DECLARATION_FORMAT,
+                remediation=(
+                    "Supply the handoff declaration object and retry "
+                    "kanban_create. Do not send the completed review "
+                    "output."
+                ),
+                responsible_actor="session_agent",
+                retry="same_operation",
+            )
+        )
+    else:
+        try:
+            normalize_handoff_requirements(raw_handoff, known_profiles)
+        except HandoffValidationRejected as exc:
+            findings = "; ".join(
+                f"{finding.field}: {finding.reason}"
+                for finding in exc.findings
+            )
+            checks.append(
+                FailedCheck(
+                    code="HANDOFF_REQUIREMENTS_INVALID",
+                    target="handoff_requirements_v1",
+                    expected=(
+                        "a handoff declaration object; it declares the "
+                        "output fields the reviewer must produce, not the "
+                        "completed review output"
+                    ),
+                    observed=findings,
+                    accepted_format=_HANDOFF_DECLARATION_FORMAT,
+                    remediation=(
+                        "Send a handoff declaration (version, reviewer, "
+                        "fields) rather than completed review output, and "
+                        "retry kanban_create. No card or contract state was "
+                        "created."
+                    ),
+                    responsible_actor="session_agent",
+                    retry="same_operation",
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            checks.append(
+                FailedCheck(
+                    code="HANDOFF_REQUIREMENTS_INVALID",
+                    target="handoff_requirements_v1",
+                    expected=(
+                        "a handoff declaration object; it declares the "
+                        "output fields the reviewer must produce, not the "
+                        "completed review output"
+                    ),
+                    observed=str(exc),
+                    accepted_format=_HANDOFF_DECLARATION_FORMAT,
+                    remediation=(
+                        "Send a handoff declaration (version, reviewer, "
+                        "fields) rather than completed review output, and "
+                        "retry kanban_create. No card or contract state was "
+                        "created."
+                    ),
+                    responsible_actor="session_agent",
+                    retry="same_operation",
+                )
+            )
+
+    raw_contract = payload.get("lifecycle_contract_v1")
+    if type(raw_contract) is not dict:
+        return tuple(checks) if checks else None
+
+    step = raw_contract.get("step")
+    if type(step) is not str or not step.strip() or step != step.strip():
+        return tuple(checks) if checks else None
+
+    initiative_id = payload.get("initiative_id")
+    if type(initiative_id) is not str or not initiative_id.strip():
+        return tuple(checks) if checks else None
+    # Match _handle_create, which strips initiative_id before use.
+    initiative_id = initiative_id.strip()
+
+    # Body anchor prerequisites: inspect only the already-supplied raw values
+    # needed to derive the exact anchor lines. A malformed segment_id (or any
+    # other malformed contract value) is left to the canonical handler, which
+    # retains full contract validation authority; this preflight does not
+    # duplicate contract validation or lifecycle expansion. The prerequisite
+    # for segment_id is the same as the handler's: valid nonblank and already
+    # trimmed. Surrounding whitespace is malformed and is not
+    # preflight-normalized.
+    segment_id = raw_contract.get("segment_id")
+    if segment_id is not None and (
+        type(segment_id) is not str or not segment_id.strip()
+        or segment_id != segment_id.strip()
+    ):
+        return tuple(checks) if checks else None
+
+    required_lines = [
+        f"initiative_id: {initiative_id}",
+        f"step: {step}",
+    ]
+    if segment_id is not None:
+        required_lines.append(f"segment_id: {segment_id}")
+    body = payload.get("body")
+    if type(body) is not str:
+        missing = [
+            f"body must contain the exact line: {line}"
+            for line in required_lines
+        ]
+        missing.append("body must be a string")
+        checks.append(
+            FailedCheck(
+                code="KANBAN_CREATE_BODY_ANCHOR_LINES_MISSING",
+                target="body",
+                expected=(
+                    "a string body containing the exact anchor lines "
+                    "'initiative_id: <initiative_id>' and 'step: <step>' "
+                    "as whole lines, plus 'segment_id: <segment_id>' when "
+                    "the contract carries a segment_id"
+                ),
+                observed="; ".join(missing),
+                accepted_format=(
+                    "the exact anchor lines derived from the supplied "
+                    "lifecycle_contract_v1 initiative/step/segment values"
+                ),
+                remediation=(
+                    "Add the exact anchor lines to the body and retry "
+                    "kanban_create. No card or contract state was created."
+                ),
+                responsible_actor="session_agent",
+                retry="same_operation",
+            )
+        )
+        return tuple(checks)
+
+    body_lines = set(body.splitlines())
+    missing_lines = [line for line in required_lines if line not in body_lines]
+    if missing_lines:
+        checks.append(
+            FailedCheck(
+                code="KANBAN_CREATE_BODY_ANCHOR_LINES_MISSING",
+                target="body",
+                expected=(
+                    "a string body containing the exact anchor lines "
+                    "'initiative_id: <initiative_id>' and 'step: <step>' "
+                    "as whole lines, plus 'segment_id: <segment_id>' when "
+                    "the contract carries a segment_id"
+                ),
+                observed="; ".join(
+                    f"body must contain the exact line: {line}"
+                    for line in missing_lines
+                ),
+                accepted_format=(
+                    "the exact anchor lines derived from the supplied "
+                    "lifecycle_contract_v1 initiative/step/segment values"
+                ),
+                remediation=(
+                    "Add the exact anchor lines to the body and retry "
+                    "kanban_create. No card or contract state was created."
+                ),
+                responsible_actor="session_agent",
+                retry="same_operation",
+            )
+        )
+
+    return tuple(checks) if checks else None
 
 
 def _init_body_invalid_check(reason: str) -> FailedCheck:
