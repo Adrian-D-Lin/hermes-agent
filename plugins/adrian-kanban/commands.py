@@ -340,6 +340,41 @@ TOOL_SCHEMAS: dict[str, Any] = {
                     ],
                     "additionalProperties": False,
                 },
+                "task_input_manifest_v1": {
+                    "type": "object",
+                    "description": (
+                        "Task input manifest object required for every "
+                        "ordinary task created on this route. Contains "
+                        "exactly: version (must be 1), entries (nonempty "
+                        "list; each entry is either a git_commit entry with "
+                        "workspace_path, sha256, source_kind, source_locator "
+                        "or a snapshot_attachment entry with workspace_path, "
+                        "sha256, source_kind), context_ref (dict whose keys "
+                        "exactly match entry workspace_path values and map to "
+                        "nonblank guidance strings), and snapshots (dict "
+                        "containing exactly one payload per "
+                        "snapshot_attachment entry path; each payload has "
+                        "filename, content_type, content_base64). The "
+                        "Python preparer is the authoritative deep "
+                        "validator."
+                    ),
+                    "properties": {
+                        "version": {
+                            "type": "integer",
+                            "enum": [1],
+                        },
+                        "entries": {"type": "array"},
+                        "context_ref": {"type": "object"},
+                        "snapshots": {"type": "object"},
+                    },
+                    "required": [
+                        "version",
+                        "entries",
+                        "context_ref",
+                        "snapshots",
+                    ],
+                    "additionalProperties": False,
+                },
                 "model": {
                     "type": "string",
                     "description": "Optional model reference.",
@@ -368,6 +403,7 @@ TOOL_SCHEMAS: dict[str, Any] = {
                 "assignee",
                 "idempotency_key",
                 "lifecycle_contract_v1",
+                "task_input_manifest_v1",
             ],
             "additionalProperties": False,
         },
